@@ -25,7 +25,10 @@ use foundry_evm_core::{
 };
 use foundry_evm_coverage::HitMaps;
 use foundry_evm_networks::{NetworkConfigs, arbitrum};
-use foundry_evm_traces::{SparsedTraceArena, TraceRequirements};
+use foundry_evm_traces::{
+    CpuClock, CpuRecorderError, CpuTraceMetrics, CpuTraceRecorder, SparsedTraceArena,
+    SystemThreadCpuClock, TraceRequirements, format_opcode_step,
+};
 use revm::{
     Inspector,
     context::{
@@ -37,13 +40,14 @@ use revm::{
     interpreter::{
         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, FrameInput, Gas,
         InstructionResult, Interpreter, InterpreterResult,
-        bytecode::opcode as op,
+        bytecode::opcode::{self as op, OpCode},
         interpreter_types::{InputsTr, Jumps},
         return_ok,
     },
     primitives::KECCAK_EMPTY,
     state::{Account, AccountStatus},
 };
+use revm_inspectors::tracing::types::DecodedTraceStep;
 use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -72,6 +76,10 @@ pub struct InspectorStackBuilder<BLOCK: Clone> {
     pub fuzzer: Option<Fuzzer>,
     /// Whether to enable tracing and revert diagnostics.
     pub trace_requirements: TraceRequirements,
+    /// Whether to collect per-call thread CPU timing diagnostics.
+    pub cpu_trace: bool,
+    /// Opcodes whose execution should include thread CPU timing diagnostics.
+    pub opcode_cpu_trace: Vec<OpCode>,
     /// Whether logs should be collected.
     /// - None for no log collection.
     /// - Some(true) for realtime console.log-ing.
@@ -104,6 +112,8 @@ impl<BLOCK: Clone> Default for InspectorStackBuilder<BLOCK> {
             cheatcodes: None,
             fuzzer: None,
             trace_requirements: TraceRequirements::none(),
+            cpu_trace: false,
+            opcode_cpu_trace: Vec::new(),
             logs: None,
             line_coverage: None,
             print: None,
@@ -200,6 +210,24 @@ impl<BLOCK: Clone> InspectorStackBuilder<BLOCK> {
         self
     }
 
+    /// Set whether to collect per-call thread CPU timing diagnostics.
+    #[inline]
+    pub const fn cpu_trace(mut self, yes: bool) -> Self {
+        self.cpu_trace = yes;
+        if yes {
+            self.trace_requirements =
+                self.trace_requirements.merge(TraceRequirements::none().with_calls(true));
+        }
+        self
+    }
+
+    /// Set the opcodes whose rendered trace rows should include thread CPU timing diagnostics.
+    #[inline]
+    pub fn opcode_cpu_trace(mut self, opcodes: Vec<OpCode>) -> Self {
+        self.opcode_cpu_trace = opcodes;
+        self
+    }
+
     /// Set whether to enable the call isolation.
     /// For description of call isolation, see [`InspectorStack::enable_isolation`].
     #[inline]
@@ -232,6 +260,8 @@ impl<BLOCK: Clone> InspectorStackBuilder<BLOCK> {
             cheatcodes,
             fuzzer,
             trace_requirements,
+            cpu_trace,
+            opcode_cpu_trace,
             logs,
             line_coverage,
             print,
@@ -268,6 +298,8 @@ impl<BLOCK: Clone> InspectorStackBuilder<BLOCK> {
         stack.collect_logs(logs);
         stack.print(print.unwrap_or(false));
         stack.tracing_requirements(trace_requirements);
+        stack.cpu_trace(cpu_trace);
+        stack.opcode_cpu_trace(opcode_cpu_trace);
 
         stack.enable_isolation(enable_isolation);
         stack.networks(networks);
@@ -385,6 +417,166 @@ struct PendingCallTrace {
     executed_address: Option<Address>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingOpcodeCpu {
+    trace_idx: usize,
+    step_idx: usize,
+    start_ns: u64,
+}
+
+fn trace_create_node<CTX>(
+    tracer: &mut TracingInspector,
+    context: &mut CTX,
+    inputs: &mut CreateInputs,
+) -> (Option<CreateOutcome>, Option<usize>)
+where
+    CTX: ContextTr,
+    CTX::Journal: revm::inspector::JournalExt,
+{
+    let before_len = tracer.traces().nodes().len();
+    let root_before = (context.journal_ref().depth() == 0 && before_len == 1)
+        .then(|| tracer.traces().nodes()[0].clone());
+    let output = tracer.create(context, inputs);
+    let nodes = tracer.traces().nodes();
+    let trace_idx = if nodes.len().checked_sub(before_len) == Some(1) {
+        Some(before_len)
+    } else if nodes.len() == 1 && root_before.as_ref().is_some_and(|root| root != &nodes[0]) {
+        Some(0)
+    } else {
+        None
+    };
+    (output, trace_idx)
+}
+
+fn make_cpu_trace_recorder<C>(
+    enabled: bool,
+    clock: impl FnOnce() -> C,
+) -> Option<CpuTraceRecorder<C>> {
+    enabled.then(|| CpuTraceRecorder::new(clock()))
+}
+
+fn record_cpu_enter<C: CpuClock>(
+    recorder: &mut Option<CpuTraceRecorder<C>>,
+    error: &mut Option<Arc<CpuRecorderError>>,
+    node: usize,
+) {
+    if error.is_some() {
+        return;
+    }
+    if let Some(Err(err)) = recorder.as_mut().map(|recorder| recorder.enter(node)) {
+        *recorder = None;
+        *error = Some(Arc::new(err));
+    }
+}
+
+fn record_cpu_exit<C: CpuClock>(
+    recorder: &mut Option<CpuTraceRecorder<C>>,
+    error: &mut Option<Arc<CpuRecorderError>>,
+) {
+    if error.is_some() {
+        return;
+    }
+    if let Some(Err(err)) = recorder.as_mut().map(CpuTraceRecorder::exit) {
+        *recorder = None;
+        *error = Some(Arc::new(err));
+    }
+}
+
+fn record_cpu_enter_for_trace<C: CpuClock>(
+    recorder: &mut Option<CpuTraceRecorder<C>>,
+    error: &mut Option<Arc<CpuRecorderError>>,
+    node: Option<usize>,
+) {
+    if let Some(node) = node {
+        record_cpu_enter(recorder, error, node);
+    }
+}
+
+fn record_cpu_exit_for_trace<C: CpuClock>(
+    recorder: &mut Option<CpuTraceRecorder<C>>,
+    error: &mut Option<Arc<CpuRecorderError>>,
+    node: Option<usize>,
+) {
+    if node.is_some() {
+        record_cpu_exit(recorder, error);
+    }
+}
+
+fn record_opcode_cpu_enter(inner: &mut InspectorStackInner, opcode: u8) {
+    if inner.cpu_error.is_some()
+        || !inner.opcode_cpu_trace.iter().any(|selected| selected.get() == opcode)
+    {
+        return;
+    }
+    let Some(trace_idx) = inner.cpu_profiler.as_ref().and_then(CpuTraceRecorder::active_node)
+    else {
+        return;
+    };
+    let Some(step_idx) = inner
+        .tracer
+        .as_ref()
+        .and_then(|tracer| tracer.traces().nodes().get(trace_idx))
+        .and_then(|node| node.trace.steps.len().checked_sub(1))
+    else {
+        return;
+    };
+    let Some(recorder) = inner.cpu_profiler.as_mut() else { return };
+    match recorder.sample_now() {
+        Ok(start_ns) => {
+            inner.pending_opcode_cpu = Some(PendingOpcodeCpu { trace_idx, step_idx, start_ns });
+        }
+        Err(err) => {
+            inner.cpu_profiler = None;
+            inner.cpu_error = Some(Arc::new(err));
+        }
+    }
+}
+
+fn record_opcode_cpu_exit(inner: &mut InspectorStackInner) -> Option<(usize, usize, u64)> {
+    let pending = inner.pending_opcode_cpu.take()?;
+    if inner.cpu_error.is_some() {
+        return None;
+    }
+    let recorder = inner.cpu_profiler.as_mut()?;
+    match recorder.sample_now() {
+        Ok(end_ns) => {
+            Some((pending.trace_idx, pending.step_idx, end_ns.saturating_sub(pending.start_ns)))
+        }
+        Err(err) => {
+            inner.cpu_profiler = None;
+            inner.cpu_error = Some(Arc::new(err));
+            None
+        }
+    }
+}
+
+fn finish_opcode_cpu_trace(
+    pending: Option<PendingOpcodeCpu>,
+    error: Option<Arc<CpuRecorderError>>,
+) -> Result<(), Arc<CpuRecorderError>> {
+    if let Some(error) = error {
+        return Err(error);
+    }
+    if pending.is_some() {
+        return Err(Arc::new(CpuRecorderError::UnfinishedOpcodeStep));
+    }
+    Ok(())
+}
+
+fn finish_cpu_trace<C: CpuClock>(
+    recorder: Option<CpuTraceRecorder<C>>,
+    error: Option<Arc<CpuRecorderError>>,
+) -> Result<CpuTraceMetrics, Arc<CpuRecorderError>> {
+    if let Some(error) = error {
+        return Err(error);
+    }
+    recorder
+        .map(CpuTraceRecorder::finish)
+        .transpose()
+        .map_err(Arc::new)
+        .map(Option::unwrap_or_default)
+}
+
 /// All used inspectors besides [Cheatcodes].
 ///
 /// See [`InspectorStack`].
@@ -406,6 +598,16 @@ pub struct InspectorStackInner {
     pub script_execution_inspector: Option<Box<ScriptExecutionInspector>>,
     pub tempo_labels: Option<Box<TempoLabels>>,
     pub tracer: Option<Box<TracingInspector>>,
+    /// Active per-call CPU recorder, present only when CPU tracing was requested.
+    pub cpu_profiler: Option<CpuTraceRecorder<SystemThreadCpuClock>>,
+    /// First CPU recorder failure. Once set, no later clock samples are attempted.
+    pub cpu_error: Option<Arc<CpuRecorderError>>,
+    /// Opcodes whose rendered trace rows include execution CPU timing.
+    opcode_cpu_trace: Vec<OpCode>,
+    /// Opcode step currently being timed between `step` and `step_end`.
+    pending_opcode_cpu: Option<PendingOpcodeCpu>,
+    /// Trace nodes started by active CREATE hooks, including failed starts without a node.
+    pending_create_traces: Vec<Option<usize>>,
 
     // FoundryInspectorExt and other internal data.
     /// Whether to collect sancov edge coverage from instrumented native crates.
@@ -757,6 +959,23 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
         self.refresh_static_opcode_dispatch();
     }
 
+    /// Set whether to collect per-call thread CPU timing diagnostics.
+    #[inline]
+    pub fn cpu_trace(&mut self, yes: bool) {
+        self.inner.cpu_profiler = make_cpu_trace_recorder(yes, SystemThreadCpuClock::default);
+        self.inner.cpu_error = None;
+        if yes && self.inner.tracer.is_none() {
+            self.tracing_requirements(TraceRequirements::none().with_calls(true));
+        }
+    }
+
+    /// Set the opcodes whose rendered trace rows should include execution CPU timing.
+    #[inline]
+    pub fn opcode_cpu_trace(&mut self, opcodes: Vec<OpCode>) {
+        self.inner.opcode_cpu_trace = opcodes;
+        self.inner.pending_opcode_cpu = None;
+    }
+
     /// Set whether to enable script execution inspector.
     #[inline]
     pub fn script(&mut self, script_address: Address) {
@@ -771,7 +990,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
     }
 
     /// Collects all the data gathered during inspection into a single struct.
-    pub fn collect(self) -> InspectorData<FEN> {
+    pub fn collect(self) -> Result<InspectorData<FEN>, Arc<CpuRecorderError>> {
         let Self {
             mut cheatcodes,
             inner:
@@ -782,6 +1001,9 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
                     log_collector,
                     tempo_labels,
                     tracer,
+                    cpu_profiler,
+                    cpu_error,
+                    pending_opcode_cpu,
                     revert_diag,
                     reverter,
                     ..
@@ -790,6 +1012,8 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
 
         let trace_diagnostics =
             revert_diag.map(|revert_diag| revert_diag.into_diagnostics()).unwrap_or_default();
+        finish_opcode_cpu_trace(pending_opcode_cpu, cpu_error.clone())?;
+        let cpu = finish_cpu_trace(cpu_profiler, cpu_error)?;
 
         let traces = tracer.map(|tracer| tracer.into_traces()).map(|arena| {
             let ignored = cheatcodes
@@ -806,7 +1030,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
                 })
                 .unwrap_or_default();
 
-            SparsedTraceArena { arena, ignored, diagnostics: trace_diagnostics }
+            SparsedTraceArena { arena, ignored, diagnostics: trace_diagnostics, cpu }
         });
 
         let (edge_coverage, evm_cmp_values) = edge_coverage
@@ -816,7 +1040,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
             })
             .unwrap_or_default();
 
-        InspectorData {
+        Ok(InspectorData {
             logs: log_collector.and_then(|logs| logs.into_captured_logs()).unwrap_or_default(),
             labels: {
                 let mut labels = cheatcodes.as_ref().map(|c| c.labels.clone()).unwrap_or_default();
@@ -832,7 +1056,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
             cheatcodes,
             chisel_state: chisel_state.and_then(|state| state.state),
             reverter,
-        }
+        })
     }
 }
 
@@ -897,9 +1121,21 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         }
 
         let result = outcome.result.result;
+        if let Some(inspector) = &mut self.tracer {
+            let previous_output = outcome.output().clone();
+            inspector.call_end(ecx, inputs, outcome);
+            record_cpu_exit(&mut self.inner.cpu_profiler, &mut self.inner.cpu_error);
+
+            let different = outcome.result.result != result
+                || (outcome.result.result == InstructionResult::Revert
+                    && outcome.output() != &previous_output);
+            if different {
+                return;
+            }
+        }
         call_inspectors!(
             #[ret]
-            [&mut self.tracer, &mut self.cheatcodes, &mut self.printer, &mut self.revert_diag],
+            [&mut self.cheatcodes, &mut self.printer, &mut self.revert_diag],
             |inspector| {
                 let previous_output = outcome.output().clone();
                 inspector.call_end(ecx, inputs, outcome);
@@ -924,11 +1160,43 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         ecx: &mut FoundryContextFor<'_, FEN>,
         call: &CreateInputs,
         outcome: &mut CreateOutcome,
+        trace_idx: Option<usize>,
     ) {
         let result = outcome.result.result;
         call_inspectors!(
             #[ret]
-            [&mut self.line_coverage, &mut self.tracer, &mut self.cheatcodes, &mut self.printer],
+            [&mut self.line_coverage],
+            |inspector| {
+                let previous_output = outcome.output().clone();
+                inspector.create_end(ecx, call, outcome);
+
+                let different = outcome.result.result != result
+                    || (outcome.result.result == InstructionResult::Revert
+                        && outcome.output() != &previous_output);
+                different.then_some(())
+            },
+        );
+        if trace_idx.is_some()
+            && let Some(inspector) = &mut self.tracer
+        {
+            let previous_output = outcome.output().clone();
+            inspector.create_end(ecx, call, outcome);
+            record_cpu_exit_for_trace(
+                &mut self.inner.cpu_profiler,
+                &mut self.inner.cpu_error,
+                trace_idx,
+            );
+
+            let different = outcome.result.result != result
+                || (outcome.result.result == InstructionResult::Revert
+                    && outcome.output() != &previous_output);
+            if different {
+                return;
+            }
+        }
+        call_inspectors!(
+            #[ret]
+            [&mut self.cheatcodes, &mut self.printer],
             |inspector| {
                 let previous_output = outcome.output().clone();
                 inspector.create_end(ecx, call, outcome);
@@ -1293,6 +1561,11 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
                 cheats.step(interpreter, ecx);
             }
         }
+
+        if !self.inner.opcode_cpu_trace.is_empty() {
+            crate::utils::cold_path();
+            record_opcode_cpu_enter(self.inner, interpreter.bytecode.opcode());
+        }
     }
 
     #[inline(always)]
@@ -1301,6 +1574,13 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         interpreter: &mut Interpreter,
         ecx: &mut FoundryContextFor<'_, FEN>,
     ) {
+        let opcode_cpu = if self.inner.opcode_cpu_trace.is_empty() {
+            None
+        } else {
+            crate::utils::cold_path();
+            record_opcode_cpu_exit(self.inner)
+        };
+
         if self.has_static_step_end_inspectors {
             call_inspectors!(
                 [
@@ -1325,6 +1605,18 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         {
             crate::utils::cold_path();
             cheats.step_end(interpreter, ecx);
+        }
+
+        if let Some((trace_idx, step_idx, cpu_ns)) = opcode_cpu
+            && let Some(step) = self
+                .inner
+                .tracer
+                .as_mut()
+                .and_then(|tracer| tracer.traces_mut().nodes_mut().get_mut(trace_idx))
+                .and_then(|node| node.trace.steps.get_mut(step_idx))
+        {
+            step.decoded =
+                Some(Box::new(DecodedTraceStep::Line(format_opcode_step(step, Some(cpu_ns)))));
         }
     }
 }
@@ -1549,6 +1841,7 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
                 let output = tracer.call(ecx, call);
                 (output, tracer.traces().nodes().len() - 1)
             };
+            record_cpu_enter(&mut self.inner.cpu_profiler, &mut self.inner.cpu_error, trace_idx);
             self.pending_call_traces.push(PendingCallTrace { trace_idx, executed_address: None });
             if let Some(revert_diag) = self.revert_diag.as_deref_mut() {
                 revert_diag.set_trace_node(trace_idx);
@@ -1738,10 +2031,17 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
             crate::utils::cold_path();
             let (output, trace_idx) = {
                 let tracer = self.tracer.as_deref_mut().unwrap();
-                let output = tracer.create(ecx, create);
-                (output, tracer.traces().nodes().len() - 1)
+                trace_create_node(tracer, ecx, create)
             };
-            if let Some(revert_diag) = self.revert_diag.as_deref_mut() {
+            self.inner.pending_create_traces.push(trace_idx);
+            record_cpu_enter_for_trace(
+                &mut self.inner.cpu_profiler,
+                &mut self.inner.cpu_error,
+                trace_idx,
+            );
+            if let Some(trace_idx) = trace_idx
+                && let Some(revert_diag) = self.revert_diag.as_deref_mut()
+            {
                 revert_diag.set_trace_node(trace_idx);
             }
             if output.is_some() {
@@ -1755,7 +2055,7 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
             |inspector| inspector.create(ecx, create).map(Some),
         );
 
-        let trace_idx = self.tracer.as_ref().map(|tracer| tracer.traces().nodes().len() - 1);
+        let trace_idx = self.inner.pending_create_traces.last().copied().flatten();
         let mut cheatcode_outcome = None;
         if let Some(cheatcodes) = self.cheatcodes.as_deref_mut() {
             cheatcode_outcome = cheatcodes.create(ecx, create);
@@ -1841,7 +2141,8 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
             self.inner.top_level_frame_failed_before_rewrite |= !outcome.result.result.is_ok();
         }
 
-        self.do_create_end(ecx, call, outcome);
+        let trace_idx = self.inner.pending_create_traces.pop().flatten();
+        self.do_create_end(ecx, call, outcome, trace_idx);
 
         if let Some(revert_diag) = self.revert_diag.as_deref_mut() {
             revert_diag.frame_end();
@@ -2129,9 +2430,237 @@ fn compute_batch_create_salt(process_salt: u64, chain_id: u64, nonce: u64, count
 mod tests {
     use super::{
         Address, Fuzzer, InspectorStack, InspectorStackInner, OpcodeStepDispatch, RevertDiagnostic,
-        TraceRequirements, compute_batch_create_salt,
+        TraceRequirements, compute_batch_create_salt, finish_cpu_trace, make_cpu_trace_recorder,
+        record_cpu_enter, record_cpu_enter_for_trace, record_cpu_exit, record_cpu_exit_for_trace,
+        trace_create_node,
     };
-    use foundry_evm_core::evm::EthEvmNetwork;
+    use foundry_evm_core::{backend::DatabaseError, evm::EthEvmNetwork};
+    use foundry_evm_traces::{CpuClock, CpuClockError, CpuRecorderError, CpuTraceRecorder};
+    use revm::{
+        Context, Database, MainContext, bytecode::Bytecode, context::ContextTr,
+        context_interface::CreateScheme, database::EmptyDB, interpreter::CreateInputs,
+        primitives::B256, state::AccountInfo,
+    };
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    struct PanicClock;
+
+    impl CpuClock for PanicClock {
+        fn now_ns(&mut self) -> Result<u64, CpuClockError> {
+            panic!("disabled CPU tracing read the clock")
+        }
+    }
+
+    struct SequenceClock {
+        timestamps: VecDeque<Result<u64, CpuClockError>>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl SequenceClock {
+        fn new(timestamps: impl IntoIterator<Item = Result<u64, CpuClockError>>) -> Self {
+            Self { timestamps: timestamps.into_iter().collect(), reads: Arc::default() }
+        }
+    }
+
+    impl CpuClock for SequenceClock {
+        fn now_ns(&mut self) -> Result<u64, CpuClockError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.timestamps.pop_front().unwrap_or_else(|| panic!("unexpected CPU clock read"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailBasicDb {
+        caller: Address,
+    }
+
+    impl Database for FailBasicDb {
+        type Error = DatabaseError;
+
+        fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            if address != self.caller {
+                return Ok(Some(AccountInfo::default()));
+            }
+            Err(DatabaseError::GetAccount(
+                address,
+                Arc::new(eyre::eyre!("injected caller preload failure")),
+            ))
+        }
+
+        fn code_by_hash(&mut self, _: B256) -> Result<Bytecode, Self::Error> {
+            unreachable!()
+        }
+
+        fn storage(
+            &mut self,
+            _: Address,
+            _: alloy_primitives::U256,
+        ) -> Result<alloy_primitives::U256, Self::Error> {
+            unreachable!()
+        }
+
+        fn block_hash(&mut self, _: u64) -> Result<B256, Self::Error> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn tracer_create_preload_error_does_not_claim_previous_arena_node() {
+        let caller = Address::repeat_byte(0x44);
+        let mut context = Context::mainnet().with_db(FailBasicDb { caller });
+        let mut tracer = revm_inspectors::tracing::TracingInspector::default();
+        let mut root_create = CreateInputs::new(
+            Address::repeat_byte(0x33),
+            CreateScheme::Create,
+            alloy_primitives::U256::ZERO,
+            alloy_primitives::Bytes::from_static(&[0x00]),
+            100_000,
+            0,
+        );
+        assert_eq!(trace_create_node(&mut tracer, &mut context, &mut root_create).1, Some(0));
+        let _checkpoint = revm::context::JournalTr::checkpoint(context.journal_mut());
+        let arena_before = tracer.traces().clone();
+        let mut create = CreateInputs::new(
+            caller,
+            CreateScheme::Create,
+            alloy_primitives::U256::ZERO,
+            alloy_primitives::Bytes::from_static(&[0x00]),
+            100_000,
+            0,
+        );
+
+        let (output, trace_idx) = trace_create_node(&mut tracer, &mut context, &mut create);
+
+        assert!(output.is_none());
+        assert_eq!(trace_idx, None);
+        assert_eq!(tracer.traces(), &arena_before);
+        let clock = SequenceClock::new([Ok(1), Ok(2)]);
+        let reads = clock.reads.clone();
+        let mut recorder = make_cpu_trace_recorder(true, || clock);
+        let mut cpu_error = None;
+        record_cpu_enter_for_trace(&mut recorder, &mut cpu_error, trace_idx);
+        record_cpu_exit_for_trace(&mut recorder, &mut cpu_error, trace_idx);
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        assert!(cpu_error.is_none());
+        assert!(finish_cpu_trace(recorder, cpu_error).unwrap().is_empty());
+        assert!(matches!(
+            revm::context::JournalTr::load_account(context.journal_mut(), caller),
+            Err(DatabaseError::GetAccount(address, _)) if address == caller
+        ));
+    }
+
+    #[test]
+    fn tracer_root_create_in_place_mutation_starts_node_zero() {
+        let caller = Address::repeat_byte(0x55);
+        let mut context = Context::mainnet().with_db(EmptyDB::default());
+        let mut tracer = revm_inspectors::tracing::TracingInspector::default();
+        let arena_before = tracer.traces().clone();
+        let mut create = CreateInputs::new(
+            caller,
+            CreateScheme::Create,
+            alloy_primitives::U256::ZERO,
+            alloy_primitives::Bytes::from_static(&[0x00]),
+            100_000,
+            0,
+        );
+
+        let (output, trace_idx) = trace_create_node(&mut tracer, &mut context, &mut create);
+
+        assert!(output.is_none());
+        assert_eq!(trace_idx, Some(0));
+        assert_ne!(tracer.traces(), &arena_before);
+    }
+
+    #[test]
+    fn inspector_cpu_disabled_does_not_instantiate_or_read_clock() {
+        let mut recorder: Option<CpuTraceRecorder<PanicClock>> =
+            make_cpu_trace_recorder(false, || panic!("clock was instantiated"));
+        let mut error = None;
+
+        record_cpu_enter(&mut recorder, &mut error, 0);
+        record_cpu_enter(&mut recorder, &mut error, 1);
+        record_cpu_exit(&mut recorder, &mut error);
+        record_cpu_exit(&mut recorder, &mut error);
+
+        assert!(finish_cpu_trace(recorder, error).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inspector_cpu_maps_nested_frame_lifecycle_to_trace_nodes() {
+        let clock = SequenceClock::new([Ok(100), Ok(120), Ok(150), Ok(160), Ok(180), Ok(200)]);
+        let mut recorder = make_cpu_trace_recorder(true, || clock);
+        let mut error = None;
+
+        record_cpu_enter(&mut recorder, &mut error, 0);
+        record_cpu_enter(&mut recorder, &mut error, 1);
+        record_cpu_exit(&mut recorder, &mut error);
+        record_cpu_enter(&mut recorder, &mut error, 2);
+        record_cpu_exit(&mut recorder, &mut error);
+        record_cpu_exit(&mut recorder, &mut error);
+
+        let cpu = finish_cpu_trace(recorder, error).unwrap();
+        assert_eq!(cpu.keys().copied().collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(cpu[&0].inclusive_ns, 100);
+        assert_eq!(cpu[&0].self_ns, 50);
+        assert_eq!(cpu[&1].inclusive_ns, 30);
+        assert_eq!(cpu[&2].inclusive_ns, 20);
+    }
+
+    #[test]
+    fn inspector_cpu_first_clock_error_stops_reads_and_returns_no_partial_map() {
+        let clock = SequenceClock::new([Err(CpuClockError::Exhausted)]);
+        let reads = clock.reads.clone();
+        let mut recorder = make_cpu_trace_recorder(true, || clock);
+        let mut error = None;
+
+        record_cpu_enter(&mut recorder, &mut error, 0);
+        record_cpu_enter(&mut recorder, &mut error, 1);
+        record_cpu_exit(&mut recorder, &mut error);
+
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            finish_cpu_trace(recorder, error),
+            Err(error)
+                if matches!(error.as_ref(), CpuRecorderError::Clock(CpuClockError::Exhausted))
+        ));
+    }
+
+    #[test]
+    fn inspector_cpu_structural_error_stops_reads_and_returns_no_partial_map() {
+        let clock = SequenceClock::new([Ok(100)]);
+        let reads = clock.reads.clone();
+        let mut recorder = make_cpu_trace_recorder(true, || clock);
+        let mut error = None;
+
+        record_cpu_exit(&mut recorder, &mut error);
+        record_cpu_exit(&mut recorder, &mut error);
+
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            finish_cpu_trace(recorder, error),
+            Err(error) if matches!(error.as_ref(), CpuRecorderError::Profiler(_))
+        ));
+    }
+
+    #[test]
+    fn inspector_cpu_finalization_rejects_unfinished_frames_without_partial_map() {
+        let clock = SequenceClock::new([Ok(100)]);
+        let mut recorder = make_cpu_trace_recorder(true, || clock);
+        let mut error = None;
+
+        record_cpu_enter(&mut recorder, &mut error, 0);
+
+        assert!(matches!(
+            finish_cpu_trace(recorder, error),
+            Err(error) if matches!(error.as_ref(), CpuRecorderError::Profiler(_))
+        ));
+    }
 
     #[test]
     fn opcode_dispatch_defaults_to_no_static_inspectors() {

@@ -44,12 +44,20 @@ pub mod identifier;
 use identifier::LocalTraceIdentifier;
 
 mod decoder;
-pub use decoder::{CallTraceDecoder, CallTraceDecoderBuilder};
+pub use decoder::{CallTraceDecoder, CallTraceDecoderBuilder, format_opcode_step};
 
 pub mod debug;
 pub use debug::DebugTraceIdentifier;
 
 pub mod folded_stack_trace;
+
+mod cpu;
+mod writer;
+pub use cpu::{
+    CallTraceCpuMetrics, CpuClock, CpuClockError, CpuProfilerError, CpuRecorderError,
+    CpuTraceMetrics, CpuTraceRecorder, FrameCpuProfiler, SystemThreadCpuClock,
+};
+pub use writer::{FoundryTraceWriter, FoundryTraceWriterConfig};
 
 pub mod backtrace;
 pub mod speedscope;
@@ -90,6 +98,9 @@ pub struct SparsedTraceArena {
     /// Presentation-only revert diagnostics, keyed by trace node index.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub diagnostics: HashMap<usize, RevertDiagnostic>,
+    /// Engine-neutral CPU timing diagnostics, keyed by trace node index.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cpu: CpuTraceMetrics,
 }
 
 impl Serialize for SparsedTraceArena {
@@ -103,9 +114,11 @@ impl Serialize for SparsedTraceArena {
             arena: &'a CallTraceArena,
             #[serde(skip_serializing_if = "HashMap::is_empty")]
             ignored: &'a HashMap<(usize, usize), (usize, usize)>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            cpu: &'a CpuTraceMetrics,
         }
 
-        ResolvedArena { arena: &self.resolve_diagnostics(), ignored: &self.ignored }
+        ResolvedArena { arena: &self.resolve_diagnostics(), ignored: &self.ignored, cpu: &self.cpu }
             .serialize(serializer)
     }
 }
@@ -263,6 +276,7 @@ pub fn prune_trace_depth(arena: &mut CallTraceArena, depth: usize) {
 
 /// Returns a serializable trace arena containing only nodes visible at `depth`.
 pub fn trace_arena_at_depth(arena: &SparsedTraceArena, depth: usize) -> SparsedTraceArena {
+    let cpu = arena.cpu.clone();
     let mut arena = arena.resolve_arena().into_owned();
     let nodes = arena.nodes_mut();
     let mut reachable = vec![false; nodes.len()];
@@ -318,7 +332,11 @@ pub fn trace_arena_at_depth(arena: &SparsedTraceArena, depth: usize) -> SparsedT
         }
     }
 
-    SparsedTraceArena { arena, ignored: Default::default(), diagnostics: Default::default() }
+    let cpu = cpu
+        .into_iter()
+        .filter_map(|(old_idx, metric)| remapped.get(old_idx)?.map(|new_idx| (new_idx, metric)))
+        .collect();
+    SparsedTraceArena { arena, ignored: Default::default(), diagnostics: Default::default(), cpu }
 }
 
 /// Render a collection of call traces to a string optionally including contract creation bytecodes
@@ -358,14 +376,23 @@ pub fn render_trace_arena_inner(
         }
     }
 
-    let mut w = TraceWriter::new(Vec::<u8>::new())
-        .color_cheatcodes(true)
-        .use_colors(convert_color_choice(shell::color_choice()))
-        .write_bytecodes(with_bytecodes)
-        .with_storage_changes(with_storage_changes);
-    w.write_arena(resolved.as_ref()).expect("Failed to write traces");
-    let mut rendered =
-        String::from_utf8(w.into_writer()).expect("trace writer wrote invalid UTF-8");
+    let mut rendered = if arena.cpu.is_empty() {
+        let mut writer = TraceWriter::new(Vec::<u8>::new())
+            .color_cheatcodes(true)
+            .use_colors(convert_color_choice(shell::color_choice()))
+            .write_bytecodes(with_bytecodes)
+            .with_storage_changes(with_storage_changes);
+        writer.write_arena(resolved.as_ref()).expect("Failed to write traces");
+        String::from_utf8(writer.into_writer()).expect("trace writer wrote invalid UTF-8")
+    } else {
+        let mut writer = FoundryTraceWriter::new(Vec::<u8>::new())
+            .color_cheatcodes(true)
+            .use_colors(convert_color_choice(shell::color_choice()))
+            .write_bytecodes(with_bytecodes)
+            .with_storage_changes(with_storage_changes);
+        writer.write_arena(resolved.as_ref(), Some(&arena.cpu)).expect("Failed to write traces");
+        String::from_utf8(writer.into_writer()).expect("trace writer wrote invalid UTF-8")
+    };
     if let Some(tempo_changes) = tempo_changes {
         if !rendered.ends_with('\n') {
             rendered.push('\n');
@@ -707,6 +734,7 @@ mod tests {
             arena,
             ignored: Default::default(),
             diagnostics: Default::default(),
+            cpu: Default::default(),
         };
 
         let arena = trace_arena_at_depth(&arena, 1);
@@ -772,6 +800,7 @@ mod tests {
                 arena,
                 ignored: Default::default(),
                 diagnostics: Default::default(),
+                cpu: Default::default(),
             },
             false,
             true,
@@ -790,6 +819,7 @@ mod tests {
                 0,
                 RevertDiagnostic::CallToNonContract(alloy_primitives::Address::ZERO),
             )]),
+            cpu: Default::default(),
         };
 
         let resolved = traces.resolve_arena();
@@ -817,6 +847,7 @@ mod tests {
                 0,
                 RevertDiagnostic::CallToNonContract(alloy_primitives::Address::ZERO),
             )]),
+            cpu: Default::default(),
         };
 
         let serialized = ron::to_string(&traces).unwrap();
@@ -827,6 +858,7 @@ mod tests {
         );
         assert_eq!(deserialized.ignored, traces.ignored);
         assert!(deserialized.diagnostics.is_empty());
+        assert!(deserialized.cpu.is_empty());
         assert_eq!(
             deserialized.arena.nodes()[0].trace.decoded.as_ref().unwrap().return_data.as_deref(),
             Some("call to non-contract address 0x0000000000000000000000000000000000000000")
@@ -840,6 +872,35 @@ mod tests {
             Some("call to non-contract address 0x0000000000000000000000000000000000000000")
         );
         assert!(render_trace_arena(&deserialized).contains("call to non-contract address"));
+    }
+
+    #[test]
+    fn empty_cpu_metrics_preserve_pre_change_json_bytes() {
+        let arena = CallTraceArena::default();
+        let traces = SparsedTraceArena {
+            arena: arena.clone(),
+            ignored: Default::default(),
+            diagnostics: Default::default(),
+            cpu: Default::default(),
+        };
+
+        assert_eq!(serde_json::to_vec(&traces).unwrap(), serde_json::to_vec(&arena).unwrap());
+    }
+
+    #[test]
+    fn cpu_metrics_serialize_in_node_index_order() {
+        let traces = SparsedTraceArena {
+            arena: CallTraceArena::default(),
+            ignored: Default::default(),
+            diagnostics: Default::default(),
+            cpu: BTreeMap::from([
+                (7, CallTraceCpuMetrics::default()),
+                (2, CallTraceCpuMetrics::default()),
+            ]),
+        };
+
+        let serialized = serde_json::to_string(&traces).unwrap();
+        assert!(serialized.find("\"2\"").unwrap() < serialized.find("\"7\"").unwrap());
     }
 
     #[test]

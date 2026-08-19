@@ -1,5 +1,6 @@
 use crate::{
     CallTrace, CallTraceArena, CallTraceNode, DecodedCallData, DecodedTraceStep,
+    cpu::format_duration,
     debug::DebugTraceIdentifier,
     identifier::{IdentifiedAddress, LocalTraceIdentifier, SignaturesIdentifier, TraceIdentifier},
 };
@@ -37,7 +38,7 @@ use itertools::Itertools;
 #[cfg(feature = "monad")]
 use monad_revm::{reserve_balance::abi::RESERVE_BALANCE_ADDRESS, staking::STAKING_ADDRESS};
 use revm::{bytecode::opcode::OpCode, interpreter::InstructionResult};
-use revm_inspectors::tracing::types::{DecodedCallLog, DecodedCallTrace};
+use revm_inspectors::tracing::types::{CallTraceStep, DecodedCallLog, DecodedCallTrace};
 
 use std::{collections::BTreeMap, sync::OnceLock};
 use tempo_contracts::precompiles::{
@@ -63,6 +64,32 @@ use monad::{IMonadStaking, IMonadStakingSyscalls, IReserveBalance};
 #[cfg(not(feature = "monad"))]
 type MonadHardfork = ();
 type AddressEvents = HashMap<Address, BTreeMap<(B256, usize), Vec<Event>>>;
+
+/// Formats a selected opcode trace step, optionally including measured thread CPU time.
+pub fn format_opcode_step(step: &CallTraceStep, cpu_ns: Option<u64>) -> String {
+    let prefix = if let Some(cpu_ns) = cpu_ns {
+        format!("{} gas | {} cpu", step.gas_cost, format_duration(cpu_ns))
+    } else {
+        step.gas_cost.to_string()
+    };
+
+    match &step.storage_change {
+        Some(change) if step.op == OpCode::SSTORE => {
+            if let Some(had_value) = change.had_value {
+                format!(
+                    "[{prefix}] {} 0x{:x}: 0x{:x} → 0x{:x}",
+                    step.op, change.key, had_value, change.value
+                )
+            } else {
+                format!("[{prefix}] {} 0x{:x} → (0x{:x})", step.op, change.key, change.value)
+            }
+        }
+        Some(change) => {
+            format!("[{prefix}] {} 0x{:x} → (0x{:x})", step.op, change.key, change.value)
+        }
+        None => format!("[{prefix}] {}", step.op),
+    }
+}
 
 /// Build a new [CallTraceDecoder].
 #[derive(Default)]
@@ -821,30 +848,7 @@ impl CallTraceDecoder {
                     }
                     for opcode in &self.opcodes {
                         if step.op == *opcode {
-                            let res = match &step.storage_change {
-                                Some(change) if step.op == OpCode::SSTORE => {
-                                    if let Some(had_value) = change.had_value {
-                                        format!(
-                                            "[{}] {} 0x{:x}: 0x{:x} → 0x{:x}",
-                                            step.gas_cost,
-                                            opcode,
-                                            change.key,
-                                            had_value,
-                                            change.value
-                                        )
-                                    } else {
-                                        format!(
-                                            "[{}] {} 0x{:x} → (0x{:x})",
-                                            step.gas_cost, opcode, change.key, change.value
-                                        )
-                                    }
-                                }
-                                Some(change) => format!(
-                                    "[{}] {} 0x{:x} → (0x{:x})",
-                                    step.gas_cost, opcode, change.key, change.value
-                                ),
-                                None => format!("[{}] {}", step.gas_cost, opcode),
-                            };
+                            let res = format_opcode_step(step, None);
 
                             step.decoded = Some(Box::new(DecodedTraceStep::Line(res)));
                             break;

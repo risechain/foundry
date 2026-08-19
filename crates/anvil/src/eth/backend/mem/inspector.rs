@@ -273,8 +273,12 @@ fn print_traces(tracer: TracingInspector, decoder: Arc<CallTraceDecoder>) {
         })
     });
 
-    let traces =
-        SparsedTraceArena { arena, ignored: Default::default(), diagnostics: Default::default() };
+    let traces = SparsedTraceArena {
+        arena,
+        ignored: Default::default(),
+        diagnostics: Default::default(),
+        cpu: Default::default(),
+    };
     let trace = render_trace_arena_inner(&traces, false, true);
     node_info!(Traces = %format!("\n{}", trace));
 }
