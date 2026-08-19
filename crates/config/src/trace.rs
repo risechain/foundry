@@ -21,6 +21,8 @@ pub struct TracingConfig {
     pub trace_depth: Option<usize>,
     /// Whether to identify internal functions in traces.
     pub decode_internal: bool,
+    /// Whether to collect per-call thread CPU timing diagnostics.
+    pub cpu: bool,
     /// Cumulative Sourcify/Etherscan metadata lookup budget, in seconds.
     /// Zero disables all external trace identification, including OpenChain.
     pub external_identification_timeout: u64,
@@ -35,7 +37,20 @@ impl Default for TracingConfig {
             compact_labels: false,
             trace_depth: None,
             decode_internal: false,
+            cpu: false,
             external_identification_timeout: 5,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_cpu_field_defaults_to_disabled() {
+        let tracing: TracingConfig = serde_json::from_str("{}").unwrap();
+
+        assert!(!tracing.cpu);
     }
 }

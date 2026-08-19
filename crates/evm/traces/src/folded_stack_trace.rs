@@ -1,4 +1,6 @@
+use crate::CpuTraceMetrics;
 use alloy_primitives::hex::ToHexExt;
+use eyre::{Result, eyre};
 use revm_inspectors::tracing::{
     CallTraceArena,
     types::{CallTraceNode, CallTraceStep, DecodedTraceStep, TraceMemberOrder},
@@ -11,6 +13,47 @@ pub fn build(arena: &CallTraceArena, isolate: bool) -> Vec<String> {
         fst.process_call_node(arena.nodes(), 0);
     }
     fst.build()
+}
+
+/// Builds a folded stack trace weighted by per-call self CPU time in nanoseconds.
+pub fn build_cpu(arena: &CallTraceArena, cpu: &CpuTraceMetrics) -> Result<Vec<String>> {
+    let mut fst = CpuFoldedStackTraceBuilder::default();
+    if !arena.nodes().is_empty() {
+        fst.process_call_node(arena.nodes(), cpu, 0)?;
+    }
+    Ok(fst.build())
+}
+
+#[derive(Default)]
+struct CpuFoldedStackTraceBuilder {
+    fst: FoldedStackTraceBuilder,
+}
+
+impl CpuFoldedStackTraceBuilder {
+    fn build(self) -> Vec<String> {
+        self.fst.build_without_subtraction()
+    }
+
+    fn process_call_node(
+        &mut self,
+        nodes: &[CallTraceNode],
+        cpu: &CpuTraceMetrics,
+        idx: usize,
+    ) -> Result<()> {
+        let node = &nodes[idx];
+        let metrics =
+            cpu.get(&idx).ok_or_else(|| eyre!("missing CPU timing for trace node {idx}"))?;
+        self.fst.enter(call_frame_name(node), metrics.self_ns);
+
+        for order in &node.ordering {
+            if let TraceMemberOrder::Call(child_idx) = order {
+                self.process_call_node(nodes, cpu, node.children[*child_idx])?;
+            }
+        }
+
+        self.fst.exit();
+        Ok(())
+    }
 }
 
 /// Wrapper for building a folded stack trace using EVM call trace node.
@@ -38,41 +81,13 @@ impl EvmFoldedStackTraceBuilder {
     pub fn process_call_node(&mut self, nodes: &[CallTraceNode], idx: usize) {
         let node = &nodes[idx];
 
-        let func_name = if node.trace.kind.is_any_create() {
-            let contract_name = node
-                .trace
-                .decoded
-                .as_ref()
-                .and_then(|dc| dc.label.as_deref())
-                .unwrap_or("Contract");
-            format!("new {contract_name}")
-        } else {
-            let selector = node
-                .selector()
-                .map(|selector| selector.encode_hex_with_prefix())
-                .unwrap_or_else(|| "fallback".to_string());
-            let signature = node
-                .trace
-                .decoded
-                .as_ref()
-                .and_then(|dc| dc.call_data.as_ref())
-                .map(|dc| &dc.signature)
-                .unwrap_or(&selector);
-
-            if let Some(label) = node.trace.decoded.as_ref().and_then(|dc| dc.label.as_ref()) {
-                format!("{label}.{signature}")
-            } else {
-                signature.clone()
-            }
-        };
-
         let mut gas_used = node.trace.gas_used;
         let max_refund_adjust_depth = if self.isolate { 1 } else { 0 };
         if node.trace.depth <= max_refund_adjust_depth {
             gas_used += node.trace.gas_refund_counter;
         }
 
-        self.fst.enter(func_name, gas_used);
+        self.fst.enter(call_frame_name(node), gas_used);
 
         // Track internal function step exits to do in this call context.
         let mut step_exits = vec![];
@@ -132,6 +147,32 @@ impl EvmFoldedStackTraceBuilder {
         for _ in 0..num_exits {
             self.fst.exit();
         }
+    }
+}
+
+fn call_frame_name(node: &CallTraceNode) -> String {
+    if node.trace.kind.is_any_create() {
+        let contract_name =
+            node.trace.decoded.as_ref().and_then(|dc| dc.label.as_deref()).unwrap_or("Contract");
+        return format!("new {contract_name}");
+    }
+
+    let selector = node
+        .selector()
+        .map(|selector| selector.encode_hex_with_prefix())
+        .unwrap_or_else(|| "fallback".to_string());
+    let signature = node
+        .trace
+        .decoded
+        .as_ref()
+        .and_then(|dc| dc.call_data.as_ref())
+        .map(|dc| &dc.signature)
+        .unwrap_or(&selector);
+
+    if let Some(label) = node.trace.decoded.as_ref().and_then(|dc| dc.label.as_ref()) {
+        format!("{label}.{signature}")
+    } else {
+        signature.clone()
     }
 }
 
@@ -230,12 +271,26 @@ impl FoldedStackTraceBuilder {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        CallKind, CallTrace, CallTraceCpuMetrics, CpuTraceMetrics, DecodedCallData,
+        DecodedCallTrace,
+    };
     use alloy_primitives::{Bytes, U256};
     use revm::{bytecode::opcode::OpCode, interpreter::InstructionResult};
     use revm_inspectors::tracing::{
         CallTraceArena,
-        types::{CallTraceStep, DecodedInternalCall, DecodedTraceStep, TraceMemberOrder},
+        types::{
+            CallTraceNode, CallTraceStep, DecodedInternalCall, DecodedTraceStep, TraceMemberOrder,
+        },
     };
+
+    fn decoded_call(label: &str, signature: &str) -> Option<Box<DecodedCallTrace>> {
+        Some(Box::new(DecodedCallTrace {
+            label: Some(label.to_string()),
+            call_data: Some(DecodedCallData { signature: signature.to_string(), args: vec![] }),
+            return_data: None,
+        }))
+    }
 
     fn trace_step(gas_remaining: u64) -> CallTraceStep {
         CallTraceStep {
@@ -378,6 +433,46 @@ mod tests {
         assert_eq!(
             super::build(&arena, false),
             vec!["fallback 70", "fallback;DebugVarsTest::foo(uint256) 30",]
+        );
+    }
+
+    #[test]
+    fn cpu_folded_stack_trace_uses_frame_timings_instead_of_gas() {
+        let mut arena = CallTraceArena::default();
+        {
+            let root = &mut arena.nodes_mut()[0];
+            root.trace = CallTrace {
+                kind: CallKind::Call,
+                gas_used: 99,
+                decoded: decoded_call("Parent", "run()"),
+                ..Default::default()
+            };
+            root.children = vec![1];
+            root.ordering = vec![TraceMemberOrder::Call(0)];
+        }
+        arena.nodes_mut().push(CallTraceNode {
+            parent: Some(0),
+            idx: 1,
+            trace: CallTrace {
+                depth: 1,
+                kind: CallKind::Call,
+                gas_used: 88,
+                decoded: decoded_call("Child", "work()"),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let cpu = CpuTraceMetrics::from([
+            (
+                0,
+                CallTraceCpuMetrics { inclusive_ns: 1_000, self_ns: 600, root_percent_bps: 10_000 },
+            ),
+            (1, CallTraceCpuMetrics { inclusive_ns: 400, self_ns: 400, root_percent_bps: 4_000 }),
+        ]);
+
+        assert_eq!(
+            super::build_cpu(&arena, &cpu).unwrap(),
+            vec!["Parent.run() 600", "Parent.run();Child.work() 400"]
         );
     }
 }

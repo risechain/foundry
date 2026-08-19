@@ -3979,6 +3979,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "417bef24afe1460300965a25ff4a24b8b45ad011948302ec221e8a0a81eb2c79"
 
 [[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "cpubits"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6161,7 +6171,10 @@ dependencies = [
  "alloy-json-abi",
  "alloy-primitives",
  "alloy-sol-types",
+ "anstyle",
  "async-trait",
+ "colorchoice",
+ "cpu-time",
  "eyre",
  "foundry-block-explorers",
  "foundry-common",

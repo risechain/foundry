@@ -17,6 +17,7 @@ use std::{io::Write, path::PathBuf, str::FromStr};
 
 mod brutalize;
 mod core;
+mod cpu_trace;
 mod fuzz;
 mod invariant;
 mod logs;
