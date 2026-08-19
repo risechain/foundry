@@ -93,7 +93,6 @@ const TRACING_KEYS: &[&str] = &[
     "compact_labels",
     "trace_depth",
     "decode_internal",
-    "cpu",
     "external_identification_timeout",
 ];
 

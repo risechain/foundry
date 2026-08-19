@@ -647,6 +647,10 @@ pub struct TestArgs {
     #[command(flatten)]
     tracing: TracingArgs,
 
+    /// Collect per-call thread CPU timing diagnostics.
+    #[arg(long, help_heading = "Trace options")]
+    cpu_trace: bool,
+
     /// Dumps all debugger steps to file.
     #[arg(
         long,
@@ -2060,7 +2064,6 @@ impl TestArgs {
 
         // Enable internal tracing for more informative flamegraph/profile.
         config.tracing = self.tracing.resolve(&config.tracing, evm_opts.verbosity);
-        config.tracing.cpu |= self.cpu_flamechart;
         let json_trace_depth = config.tracing.trace_depth;
         let decode_internal_enabled = config.tracing.decode_internal
             || trace_output.is_some_and(|kind| !matches!(kind, TraceOutputKind::CpuFlamechart));
@@ -2651,7 +2654,8 @@ impl TestArgs {
             .set_debug(execution.should_debug)
             .set_decode_internal(execution.decode_internal)
             .set_record_all_steps(self.evm_profile.is_some())
-            .set_opcode_cpu_trace(if config.tracing.cpu {
+            .set_cpu_trace(self.cpu_trace || self.cpu_flamechart)
+            .set_opcode_cpu_trace(if self.cpu_trace || self.cpu_flamechart {
                 self.opcodes.clone()
             } else {
                 Vec::new()
