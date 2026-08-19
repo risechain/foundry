@@ -11,11 +11,6 @@ use serde::Serialize;
 #[derive(Clone, Debug, Default, Serialize, Parser)]
 #[command(about = None, long_about = None)]
 pub struct TracingArgs {
-    /// Collect per-call thread CPU timing diagnostics.
-    #[arg(long, help_heading = "Trace options")]
-    #[serde(skip)]
-    pub cpu_trace: bool,
-
     /// Identify internal functions in traces.
     ///
     /// This will trace internal functions and decode stack parameters.
@@ -70,7 +65,6 @@ impl TracingArgs {
         tracing.compact_labels |= self.compact_labels;
         tracing.trace_depth = self.trace_depth.or(tracing.trace_depth);
         tracing.decode_internal |= self.decode_internal;
-        tracing.cpu |= self.cpu_trace;
         if self.disable_external_identification {
             tracing.external_identification_timeout = 0;
         }
@@ -111,11 +105,9 @@ mod tests {
             compact_labels: false,
             trace_depth: Some(1),
             decode_internal: false,
-            cpu: false,
             external_identification_timeout: 10,
         };
         let args = TracingArgs {
-            cpu_trace: false,
             decode_internal: true,
             trace_depth: Some(2),
             disable_labels: true,
@@ -158,12 +150,5 @@ mod tests {
         let args = TracingArgs { decode_internal: true, ..Default::default() };
 
         assert!(!args.resolve_call_tracer(&config, 0).decode_internal);
-    }
-
-    #[test]
-    fn cpu_trace_cli_enables_call_tracing() {
-        let args = TracingArgs::try_parse_from(["forge", "--cpu-trace"]).unwrap();
-
-        assert!(args.resolve(&TracingConfig::default(), 0).cpu);
     }
 }

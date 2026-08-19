@@ -8654,6 +8654,19 @@ For more information, try '--help'.
 "#]]);
 });
 
+casttest!(cast_call_rejects_forge_cpu_trace_flag, |_prj, cmd| {
+    cmd.args(["call", "--cpu-trace"]).assert_failure().stderr_eq(str![[r#"
+error: unexpected argument '--cpu-trace' found
+
+  tip: to pass '--cpu-trace' as a value, use '-- --cpu-trace'
+
+Usage: cast[..] call [OPTIONS] [TO] [SIG] [ARGS]... [COMMAND]
+
+For more information, try '--help'.
+
+"#]]);
+});
+
 // Test cast estimate with negative numbers
 casttest!(cast_estimate_negative_numbers, |_prj, cmd| {
     let rpc = next_rpc_endpoint(NamedChain::Sepolia);

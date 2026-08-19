@@ -508,22 +508,11 @@ fn record_opcode_cpu_enter(inner: &mut InspectorStackInner, opcode: u8) {
     {
         return;
     }
-    let Some(trace_idx) = inner.cpu_profiler.as_ref().and_then(CpuTraceRecorder::active_node)
-    else {
-        return;
-    };
-    let Some(step_idx) = inner
-        .tracer
-        .as_ref()
-        .and_then(|tracer| tracer.traces().nodes().get(trace_idx))
-        .and_then(|node| node.trace.steps.len().checked_sub(1))
-    else {
-        return;
-    };
+    let Some((trace_idx, step_idx)) = active_opcode_step(inner) else { return };
     let Some(recorder) = inner.cpu_profiler.as_mut() else { return };
     match recorder.sample_now() {
         Ok(start_ns) => {
-            inner.pending_opcode_cpu = Some(PendingOpcodeCpu { trace_idx, step_idx, start_ns });
+            inner.pending_opcode_cpu.push(PendingOpcodeCpu { trace_idx, step_idx, start_ns });
         }
         Err(err) => {
             inner.cpu_profiler = None;
@@ -532,11 +521,26 @@ fn record_opcode_cpu_enter(inner: &mut InspectorStackInner, opcode: u8) {
     }
 }
 
+fn active_opcode_step(inner: &InspectorStackInner) -> Option<(usize, usize)> {
+    let trace_idx = inner.cpu_profiler.as_ref()?.active_node()?;
+    let step_idx = inner
+        .tracer
+        .as_ref()
+        .and_then(|tracer| tracer.traces().nodes().get(trace_idx))
+        .and_then(|node| node.trace.steps.len().checked_sub(1))?;
+    Some((trace_idx, step_idx))
+}
+
 fn record_opcode_cpu_exit(inner: &mut InspectorStackInner) -> Option<(usize, usize, u64)> {
-    let pending = inner.pending_opcode_cpu.take()?;
     if inner.cpu_error.is_some() {
         return None;
     }
+    let (trace_idx, step_idx) = active_opcode_step(inner)?;
+    let pending = *inner.pending_opcode_cpu.last()?;
+    if (pending.trace_idx, pending.step_idx) != (trace_idx, step_idx) {
+        return None;
+    }
+    inner.pending_opcode_cpu.pop();
     let recorder = inner.cpu_profiler.as_mut()?;
     match recorder.sample_now() {
         Ok(end_ns) => {
@@ -551,13 +555,13 @@ fn record_opcode_cpu_exit(inner: &mut InspectorStackInner) -> Option<(usize, usi
 }
 
 fn finish_opcode_cpu_trace(
-    pending: Option<PendingOpcodeCpu>,
+    pending: Vec<PendingOpcodeCpu>,
     error: Option<Arc<CpuRecorderError>>,
 ) -> Result<(), Arc<CpuRecorderError>> {
     if let Some(error) = error {
         return Err(error);
     }
-    if pending.is_some() {
+    if !pending.is_empty() {
         return Err(Arc::new(CpuRecorderError::UnfinishedOpcodeStep));
     }
     Ok(())
@@ -604,8 +608,8 @@ pub struct InspectorStackInner {
     pub cpu_error: Option<Arc<CpuRecorderError>>,
     /// Opcodes whose rendered trace rows include execution CPU timing.
     opcode_cpu_trace: Vec<OpCode>,
-    /// Opcode step currently being timed between `step` and `step_end`.
-    pending_opcode_cpu: Option<PendingOpcodeCpu>,
+    /// Opcode steps currently being timed between `step` and `step_end`, by interpreter frame.
+    pending_opcode_cpu: Vec<PendingOpcodeCpu>,
     /// Trace nodes started by active CREATE hooks, including failed starts without a node.
     pending_create_traces: Vec<Option<usize>>,
 
@@ -973,7 +977,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
     #[inline]
     pub fn opcode_cpu_trace(&mut self, opcodes: Vec<OpCode>) {
         self.inner.opcode_cpu_trace = opcodes;
-        self.inner.pending_opcode_cpu = None;
+        self.inner.pending_opcode_cpu.clear();
     }
 
     /// Set whether to enable script execution inspector.
@@ -2429,13 +2433,15 @@ fn compute_batch_create_salt(process_salt: u64, chain_id: u64, nonce: u64, count
 #[cfg(test)]
 mod tests {
     use super::{
-        Address, Fuzzer, InspectorStack, InspectorStackInner, OpcodeStepDispatch, RevertDiagnostic,
-        TraceRequirements, compute_batch_create_salt, finish_cpu_trace, make_cpu_trace_recorder,
-        record_cpu_enter, record_cpu_enter_for_trace, record_cpu_exit, record_cpu_exit_for_trace,
-        trace_create_node,
+        Address, Fuzzer, InspectorStack, InspectorStackInner, OpcodeStepDispatch, PendingOpcodeCpu,
+        RevertDiagnostic, TraceRequirements, compute_batch_create_salt, finish_cpu_trace,
+        make_cpu_trace_recorder, record_cpu_enter, record_cpu_enter_for_trace, record_cpu_exit,
+        record_cpu_exit_for_trace, record_opcode_cpu_exit, trace_create_node,
     };
     use foundry_evm_core::{backend::DatabaseError, evm::EthEvmNetwork};
-    use foundry_evm_traces::{CpuClock, CpuClockError, CpuRecorderError, CpuTraceRecorder};
+    use foundry_evm_traces::{
+        CpuClock, CpuClockError, CpuRecorderError, CpuTraceRecorder, SystemThreadCpuClock,
+    };
     use revm::{
         Context, Database, MainContext, bytecode::Bytecode, context::ContextTr,
         context_interface::CreateScheme, database::EmptyDB, interpreter::CreateInputs,
@@ -2660,6 +2666,19 @@ mod tests {
             finish_cpu_trace(recorder, error),
             Err(error) if matches!(error.as_ref(), CpuRecorderError::Profiler(_))
         ));
+    }
+
+    #[test]
+    fn opcode_cpu_exit_does_not_consume_parent_measurement_in_child_frame() {
+        let mut stack = InspectorStackInner::default();
+        let mut recorder = CpuTraceRecorder::new(SystemThreadCpuClock);
+        recorder.enter(0).unwrap();
+        recorder.enter(1).unwrap();
+        stack.cpu_profiler = Some(recorder);
+        stack.pending_opcode_cpu.push(PendingOpcodeCpu { trace_idx: 0, step_idx: 7, start_ns: 0 });
+
+        assert!(record_opcode_cpu_exit(&mut stack).is_none());
+        assert_eq!(stack.pending_opcode_cpu.len(), 1);
     }
 
     #[test]
