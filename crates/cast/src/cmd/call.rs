@@ -669,6 +669,7 @@ impl CallArgs {
                 &provider,
                 context_block_number,
                 &context_tx,
+                networks,
             )
             .await?;
 

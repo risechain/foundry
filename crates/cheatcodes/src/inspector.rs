@@ -39,7 +39,7 @@ use foundry_common::{
     },
 };
 #[cfg(feature = "monad")]
-use foundry_evm_core::evm::TransactionStateFor;
+use foundry_evm_core::FoundryJournal;
 use foundry_evm_core::{
     Breakpoints, EvmEnv, FoundryTransaction, InspectorExt,
     abi::Vm::stopExpectSafeMemoryCall,
@@ -57,6 +57,8 @@ use foundry_evm_traces::{
 };
 use foundry_wallets::wallet_multi::MultiWallet;
 use itertools::Itertools;
+#[cfg(feature = "monad")]
+use monad_revm::reserve_balance::tracker::ReserveBalanceTracker;
 use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
 use rand::Rng;
 use revm::{
@@ -189,34 +191,33 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for TransparentCheatcodesEx
         let factory = FEN::EvmFactory::default();
         let chain_context = ecx.chain().clone();
         #[cfg(feature = "monad")]
-        let state = factory.capture_transaction_state(ecx);
+        let state = ecx.journal().capture_reserve_balance();
         let mut nested_chain_context = None;
         #[cfg(feature = "monad")]
-        let mut transaction_state = None;
+        let mut reserve_balance = None;
         with_cloned_context(ecx, |db, evm_env, journaled_state| {
             let mut evm = factory.create_foundry_nested_evm(db, evm_env, chain_context, cheats);
             *evm.journal_inner_mut() = journaled_state;
             #[cfg(feature = "monad")]
             {
-                evm.restore_transaction_state(state);
+                evm.journal_mut().restore_reserve_balance(state);
+                evm.refresh_chain_dependent_state();
             }
             f(&mut *evm)?;
             nested_chain_context = Some(evm.chain_mut().clone());
             #[cfg(feature = "monad")]
             {
-                transaction_state = Some(evm.capture_transaction_state());
+                reserve_balance = Some(evm.journal_mut().capture_reserve_balance());
             }
             let sub_inner = evm.journal_inner_mut().clone();
             let sub_evm_env = evm.to_evm_env();
             Ok((sub_evm_env, sub_inner))
         })?;
         *ecx.chain_mut() = nested_chain_context.expect("nested EVM chain context was captured");
-        ecx.refresh_chain_dependent_state();
         #[cfg(feature = "monad")]
-        factory.restore_transaction_state(
-            ecx,
-            transaction_state.expect("nested EVM state was captured"),
-        );
+        ecx.journal_mut()
+            .restore_reserve_balance(reserve_balance.expect("nested EVM state was captured"));
+        ecx.refresh_chain_dependent_state();
         Ok(())
     }
 
@@ -802,6 +803,12 @@ pub struct Cheatcodes<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     /// Test-scoped context holding data that needs to be reset every test run
     pub test_context: TestContext,
 
+    /// Revert payloads minted by the `skip` cheatcode during the current test call.
+    ///
+    /// A top-level revert is only classified as a skip when its data byte-equals one of these
+    /// payloads, so user-crafted `FOUNDRY::SKIP` revert data never skips a test on its own.
+    pub skip_payloads: Vec<Bytes>,
+
     /// Whether to commit FS changes such as file creations, writes and deletes.
     /// Used to prevent duplicate changes file executing non-committing calls.
     pub fs_commit: bool,
@@ -897,10 +904,10 @@ pub struct Cheatcodes<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     /// Per-state-snapshot copies of [`Self::fork_block_number_override`].
     pub fork_block_number_override_snapshots: HashMap<U256, Option<u64>>,
 
-    /// Transaction-position context and family-owned execution state captured atomically alongside
-    /// state snapshots.
+    /// Transaction-position context and Monad's reserve-balance-tracker state captured atomically
+    /// alongside state snapshots.
     #[cfg(feature = "monad")]
-    pub context_snapshots: HashMap<U256, (ChainFor<FEN>, TransactionStateFor<FEN>)>,
+    pub context_snapshots: HashMap<U256, (ChainFor<FEN>, ReserveBalanceTracker)>,
 
     /// Whether we are currently executing inside an isolation context, i.e.
     /// the synthetic inner transaction wrapped by
@@ -962,6 +969,7 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
             broadcastable_transactions: Default::default(),
             access_list: Default::default(),
             test_context: Default::default(),
+            skip_payloads: Default::default(),
             serialized_jsons: Default::default(),
             eth_deals: Default::default(),
             gas_metering: Default::default(),
@@ -1447,7 +1455,10 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
         }
 
         #[cfg(feature = "monad")]
-        if is_monad_cheatcode_call::<FEN>(call.target_address) {
+        if is_monad_cheatcode_call(
+            self.config.evm_opts.networks.extra_cheatcode_addresses(),
+            call.target_address,
+        ) {
             let checkpoint = ecx.journal_mut().checkpoint();
             return match self.apply_monad_cheatcode(ecx, call) {
                 Ok(retdata) => {
@@ -2353,7 +2364,11 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>> for Cheatcode
         let cheatcode_call = call.target_address == CHEATCODE_ADDRESS
             || call.target_address == HARDHAT_CONSOLE_ADDRESS;
         #[cfg(feature = "monad")]
-        let cheatcode_call = cheatcode_call || is_monad_cheatcode_call::<FEN>(call.target_address);
+        let cheatcode_call = cheatcode_call
+            || is_monad_cheatcode_call(
+                self.config.evm_opts.networks.extra_cheatcode_addresses(),
+                call.target_address,
+            );
         let curr_depth = ecx.journal().depth();
 
         self.finish_created_accounts_frame(

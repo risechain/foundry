@@ -50,7 +50,7 @@ use foundry_compilers::{
     utils::source_files_iter,
 };
 use foundry_config::{
-    Config, FoundryHardfork, InlineConfig, InvariantDepthMode, InvariantWorkers, figment,
+    Config, InlineConfig, InvariantDepthMode, InvariantWorkers, figment,
     figment::{
         Metadata, Profile, Provider,
         value::{Dict, Map, Value},
@@ -63,13 +63,15 @@ use foundry_debugger::{Debugger, DebuggerLayout};
 use foundry_evm::core::evm::MonadEvmNetwork;
 #[cfg(feature = "optimism")]
 use foundry_evm::core::evm::OpEvmNetwork;
+#[cfg(feature = "monad")]
+use foundry_evm::hardforks::MonadHardfork;
 use foundry_evm::{
     core::evm::{
-        BlockEnvFor, EthEvmNetwork, FoundryEvmFactory, FoundryEvmNetwork, SpecFor, TempoEvmNetwork,
-        TxEnvFor,
+        BlockEnvFor, EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TxEnvFor,
     },
     executors::ShowmapDomain,
     fuzz::{BaseCounterExample, BasicTxDetails, CounterExample},
+    hardforks::{ExecutionSpec, TempoHardfork},
     opts::EvmOpts,
     traces::{
         backtrace::BacktraceBuilder, identifier::TraceIdentifiers, prune_trace_depth,
@@ -3013,19 +3015,12 @@ impl TestArgs {
             .with_known_contracts(&known_contracts)
             .with_networks(networks)
             .with_chain_id(remote_chain.map(|c| c.id()))
-            .with_tempo_hardfork(resolved_hardfork.and_then(|hardfork| match hardfork {
-                FoundryHardfork::Tempo(hardfork) => Some(hardfork),
-                _ => None,
-            }));
+            .with_tempo_hardfork(resolved_hardfork.and_then(TempoHardfork::from_foundry_hardfork));
         #[cfg(feature = "monad")]
         {
-            builder =
-                builder.with_monad_hardfork(resolved_hardfork.and_then(
-                    |hardfork| match hardfork {
-                        FoundryHardfork::Monad(hardfork) => Some(hardfork),
-                        _ => None,
-                    },
-                ));
+            builder = builder.with_monad_hardfork(
+                resolved_hardfork.and_then(MonadHardfork::from_foundry_hardfork),
+            );
         }
         // Signatures are of no value for gas reports.
         if !self.gas_report {
@@ -3045,7 +3040,7 @@ impl TestArgs {
                 config.gas_reports.clone(),
                 config.gas_reports_ignore.clone(),
                 config.gas_reports_include_tests,
-                FEN::EvmFactory::EXTRA_CHEATCODE_ADDRESSES.iter().copied(),
+                config.networks.extra_cheatcode_addresses().iter().copied(),
             )
         });
 
