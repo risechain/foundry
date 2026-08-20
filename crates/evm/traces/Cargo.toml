@@ -41,7 +41,10 @@ monad-revm = { workspace = true, optional = true }
 base-common-precompiles = { workspace = true, optional = true, features = ["std"] }
 
 async-trait.workspace = true
+anstyle.workspace = true
 ciborium.workspace = true
+colorchoice = "1.0"
+cpu-time.workspace = true
 eyre.workspace = true
 futures.workspace = true
 itertools.workspace = true

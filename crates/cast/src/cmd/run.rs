@@ -448,6 +448,7 @@ impl RunArgs {
             ignored: Default::default(),
             diagnostics: Default::default(),
             debug_steps: None,
+            cpu: Default::default(),
         };
         let result = TraceResult {
             success: receipt.status(),

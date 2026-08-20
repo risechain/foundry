@@ -1840,6 +1840,7 @@ mod tests {
                     ignored: Default::default(),
                     diagnostics: Default::default(),
                     debug_steps: None,
+                    cpu: Default::default(),
                 },
             )],
             ..Default::default()
@@ -1883,6 +1884,7 @@ mod tests {
                     ignored: Default::default(),
                     diagnostics: Default::default(),
                     debug_steps: None,
+                    cpu: Default::default(),
                 },
             )],
             ..Default::default()

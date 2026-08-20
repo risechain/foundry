@@ -264,6 +264,7 @@ pub enum EvmProfileFormat {
 enum TraceOutputKind {
     Flamegraph,
     Flamechart,
+    CpuFlamechart,
     EvmProfile(EvmProfileFormat),
 }
 
@@ -272,6 +273,7 @@ impl TraceOutputKind {
         match self {
             Self::Flamegraph => "flamegraph",
             Self::Flamechart => "flamechart",
+            Self::CpuFlamechart => "CPU flamechart",
             Self::EvmProfile(_) => "EVM profile",
         }
     }
@@ -509,7 +511,7 @@ pub struct TestArgs {
     ///
     /// If the matching test is a fuzz test, then it will open the debugger on the first failure
     /// case. If the fuzz test does not fail, it will open the debugger on the last fuzz case.
-    #[arg(long, conflicts_with_all = ["flamegraph", "flamechart", "evm_profile", "decode_internal", "rerun"])]
+    #[arg(long, conflicts_with_all = ["flamegraph", "flamechart", "cpu_flamechart", "evm_profile", "decode_internal", "rerun"])]
     debug: bool,
 
     /// Generate a flamegraph for a single test. Implies `--decode-internal`.
@@ -519,7 +521,7 @@ pub struct TestArgs {
     #[arg(
         long,
         group = "trace_output",
-        conflicts_with_all = ["flamechart", "evm_profile", "json", "junit", "list"]
+        conflicts_with_all = ["flamechart", "cpu_flamechart", "evm_profile", "json", "junit", "list"]
     )]
     flamegraph: bool,
 
@@ -530,9 +532,20 @@ pub struct TestArgs {
     #[arg(
         long,
         group = "trace_output",
-        conflicts_with_all = ["flamegraph", "evm_profile", "json", "junit", "list"]
+        conflicts_with_all = ["flamegraph", "cpu_flamechart", "evm_profile", "json", "junit", "list"]
     )]
     flamechart: bool,
+
+    /// Generate a CPU flamechart for a single test.
+    ///
+    /// The chart is weighted by self thread CPU time for each call frame. Internal functions and
+    /// individual opcode steps are not timed separately.
+    #[arg(
+        long,
+        group = "trace_output",
+        conflicts_with_all = ["flamegraph", "flamechart", "evm_profile", "json", "junit", "list"]
+    )]
+    cpu_flamechart: bool,
 
     /// Generate an execution profile for a single test.
     ///
@@ -546,7 +559,7 @@ pub struct TestArgs {
         default_missing_value = "speedscope",
         value_enum,
         group = "trace_output",
-        conflicts_with_all = ["flamegraph", "flamechart", "json", "junit", "list"]
+        conflicts_with_all = ["flamegraph", "flamechart", "cpu_flamechart", "json", "junit", "list"]
     )]
     evm_profile: Option<EvmProfileFormat>,
 
@@ -558,6 +571,10 @@ pub struct TestArgs {
 
     #[command(flatten)]
     tracing: TracingArgs,
+
+    /// Collect per-call thread CPU timing diagnostics.
+    #[arg(long, help_heading = "Trace options")]
+    cpu_trace: bool,
 
     /// Writes a SolDB trace and source bundle to a directory.
     ///
@@ -804,6 +821,7 @@ pub struct TestArgs {
             "debug",
             "flamegraph",
             "flamechart",
+            "cpu_flamechart",
             "rerun",
             "fuzz_input_file",
             "showmap_out",
@@ -983,7 +1001,8 @@ pub struct TestArgs {
     ///
     /// Accepts a comma-separated list of opcode names, e.g.
     /// `--opcodes SLOAD,MLOAD,SSTORE`. Names are in uppercase.
-    /// Requires `-vvvvv` to render.
+    /// Requires `-vvvvv` to render. When combined with `--cpu-trace`, selected opcode rows include
+    /// measured thread CPU time.
     #[arg(long, value_parser = parse_opcode, value_delimiter(','), conflicts_with_all = ["json", "junit", "list", "debug"])]
     pub opcodes: Vec<OpCode>,
 
@@ -1003,7 +1022,7 @@ pub struct TestArgs {
         value_name = "DIR",
         value_hint = ValueHint::DirPath,
         help_heading = "Showmap replay",
-        conflicts_with_all = ["debug", "flamegraph", "flamechart", "evm_profile", "rerun", "fuzz_input_file", "gas_report"],
+        conflicts_with_all = ["debug", "flamegraph", "flamechart", "cpu_flamechart", "evm_profile", "rerun", "fuzz_input_file", "gas_report"],
     )]
     pub showmap_out: Option<PathBuf>,
 
@@ -1151,6 +1170,7 @@ impl TestArgs {
             (self.debug, "--debug"),
             (self.flamegraph, "--flamegraph"),
             (self.flamechart, "--flamechart"),
+            (self.cpu_flamechart, "--cpu-flamechart"),
             (self.evm_profile.is_some(), "--evm-profile"),
             (self.junit, "--junit"),
             (self.json_file.is_some(), "--json-file"),
@@ -1178,6 +1198,7 @@ impl TestArgs {
             (self.debug, "--debug"),
             (self.flamegraph, "--flamegraph"),
             (self.flamechart, "--flamechart"),
+            (self.cpu_flamechart, "--cpu-flamechart"),
             (self.evm_profile.is_some(), "--evm-profile"),
             (self.showmap_out.is_some(), "--showmap-out"),
             (self.brutalize, "--brutalize"),
@@ -1882,6 +1903,8 @@ impl TestArgs {
             Some(TraceOutputKind::Flamegraph)
         } else if self.flamechart {
             Some(TraceOutputKind::Flamechart)
+        } else if self.cpu_flamechart {
+            Some(TraceOutputKind::CpuFlamechart)
         } else {
             self.evm_profile.map(TraceOutputKind::EvmProfile)
         };
@@ -1895,7 +1918,10 @@ impl TestArgs {
         // upgraded to full tracing in `run_tests_inner` when exactly one test matches.
         config.tracing = self.tracing.resolve(&config.tracing, evm_opts.verbosity);
         let json_trace_depth = config.tracing.trace_depth;
-        execution.decode_internal = if config.tracing.decode_internal || trace_output.is_some() {
+        // The CPU flamechart reads call-level timings and does not need internal tracing.
+        let decode_internal_enabled = config.tracing.decode_internal
+            || trace_output.is_some_and(|kind| !matches!(kind, TraceOutputKind::CpuFlamechart));
+        execution.decode_internal = if decode_internal_enabled {
             InternalTraceMode::Simple
         } else {
             InternalTraceMode::None
@@ -2111,7 +2137,9 @@ impl TestArgs {
         let label = trace_output.label();
         let no_tests = match trace_output {
             TraceOutputKind::EvmProfile(_) => "cannot generate EVM profile: no tests were executed",
-            TraceOutputKind::Flamegraph | TraceOutputKind::Flamechart => "no tests were executed",
+            TraceOutputKind::Flamegraph
+            | TraceOutputKind::Flamechart
+            | TraceOutputKind::CpuFlamechart => "no tests were executed",
         };
         if outcome.tests().next().is_none() {
             bail!("{no_tests}");
@@ -2144,17 +2172,27 @@ impl TestArgs {
         decode_trace_arena(arena, &decoder).await;
 
         match trace_output {
-            TraceOutputKind::Flamegraph | TraceOutputKind::Flamechart => {
-                let mut folded_stack_trace = folded_stack_trace::build(arena);
-                let flame_chart = trace_output == TraceOutputKind::Flamechart;
+            TraceOutputKind::Flamegraph
+            | TraceOutputKind::Flamechart
+            | TraceOutputKind::CpuFlamechart => {
+                let cpu = trace_output == TraceOutputKind::CpuFlamechart;
+                let mut folded_stack_trace = if cpu {
+                    folded_stack_trace::build_cpu(&arena.arena, &arena.cpu).wrap_err_with(|| {
+                        format!("cannot generate CPU flamechart for {contract}::{test_name}")
+                    })?
+                } else {
+                    folded_stack_trace::build(arena)
+                };
+                let flame_chart = trace_output != TraceOutputKind::Flamegraph;
                 if flame_chart {
                     folded_stack_trace.reverse();
                 }
-                let file_name = format!("cache/{label}_{contract}_{test_name}.svg");
+                let file_prefix = if cpu { "cpu_flamechart" } else { label };
+                let file_name = format!("cache/{file_prefix}_{contract}_{test_name}.svg");
                 let file = std::fs::File::create(&file_name).wrap_err("failed to create file")?;
                 let mut options = inferno::flamegraph::Options::default();
                 options.title = format!("{label} {contract}::{test_name}");
-                options.count_name = "gas".to_string();
+                options.count_name = if cpu { "cpu nanoseconds" } else { "gas" }.to_string();
                 options.flame_chart = flame_chart;
                 inferno::flamegraph::from_lines(
                     &mut options,
@@ -2201,6 +2239,12 @@ impl TestArgs {
             .set_debug(self.debug)
             .set_decode_internal(execution.decode_internal)
             .set_record_all_steps(self.evm_profile.is_some())
+            .set_cpu_trace(self.cpu_trace || self.cpu_flamechart)
+            .set_opcode_cpu_trace(if self.cpu_trace || self.cpu_flamechart {
+                self.opcodes.clone()
+            } else {
+                Vec::new()
+            })
             .initial_balance(evm_opts.initial_balance)
             .sender(evm_opts.sender)
             .enable_isolation(evm_opts.isolate)
@@ -2412,12 +2456,18 @@ impl TestArgs {
         }
 
         if num_filtered != 1
-            && (self.debug || self.flamegraph || self.flamechart || self.evm_profile.is_some())
+            && (self.debug
+                || self.flamegraph
+                || self.flamechart
+                || self.cpu_flamechart
+                || self.evm_profile.is_some())
         {
             let action = if self.flamegraph {
                 "generate a flamegraph"
             } else if self.flamechart {
                 "generate a flamechart"
+            } else if self.cpu_flamechart {
+                "generate a CPU flamechart"
             } else if self.evm_profile.is_some() {
                 "generate an EVM profile"
             } else {
@@ -2559,6 +2609,7 @@ impl TestArgs {
             || self.debug
             || self.flamegraph
             || self.flamechart
+            || self.cpu_flamechart
             || self.evm_profile.is_some();
 
         let mut any_test_failed = false;

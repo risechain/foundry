@@ -41,6 +41,7 @@ use foundry_evm_networks::NetworkVariant;
 
 use foundry_linking::{DetailedLinkOutput, LinkOutput, Linker, LinkerError, Resolver};
 use rayon::prelude::*;
+use revm::bytecode::opcode::OpCode;
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
@@ -462,6 +463,10 @@ pub struct TestRunnerConfig<FEN: FoundryEvmNetwork> {
     pub decode_internal: InternalTraceMode,
     /// Whether to record every opcode step without debugger snapshots.
     pub record_all_steps: bool,
+    /// Whether to collect per-call thread CPU timing diagnostics.
+    pub cpu_trace: bool,
+    /// Opcodes whose rendered trace rows should include thread CPU timing.
+    pub opcode_cpu_trace: Vec<OpCode>,
     /// Whether to enable call isolation.
     pub isolation: bool,
     /// Whether to exit early on test failure or if test run interrupted.
@@ -528,6 +533,8 @@ impl<FEN: FoundryEvmNetwork> TestRunnerConfig<FEN> {
             cheatcodes.core.config = Arc::new(config);
         }
         inspector.tracing_requirements(self.trace_requirements());
+        inspector.cpu_trace(self.cpu_trace);
+        inspector.opcode_cpu_trace(self.opcode_cpu_trace.clone());
         inspector.collect_line_coverage(self.line_coverage);
         inspector.enable_isolation(self.isolation);
         executor.set_spec_id(self.spec_id);
@@ -558,6 +565,8 @@ impl<FEN: FoundryEvmNetwork> TestRunnerConfig<FEN> {
                     .logs(self.config.live_logs)
                     .cheatcodes(cheats_config)
                     .trace_requirements(self.trace_requirements())
+                    .cpu_trace(self.cpu_trace)
+                    .opcode_cpu_trace(self.opcode_cpu_trace.clone())
                     .line_coverage(self.line_coverage)
                     .enable_isolation(self.isolation)
                     .create2_deployer(self.evm_opts.create2_deployer)
@@ -574,6 +583,7 @@ impl<FEN: FoundryEvmNetwork> TestRunnerConfig<FEN> {
             .with_debug_recording(self.debug)
             .with_decode_internal(self.decode_internal)
             .with_all_steps(self.record_all_steps)
+            .with_calls(self.cpu_trace)
             .with_verbosity(self.config.tracing.verbosity.max(self.evm_opts.verbosity))
     }
 }
@@ -599,6 +609,10 @@ pub struct MultiContractRunnerBuilder {
     pub decode_internal: InternalTraceMode,
     /// Whether to record every opcode step without debugger snapshots.
     pub record_all_steps: bool,
+    /// Whether to collect per-call thread CPU timing diagnostics.
+    pub cpu_trace: bool,
+    /// Opcodes whose rendered trace rows should include thread CPU timing.
+    pub opcode_cpu_trace: Vec<OpCode>,
     /// Whether to enable call isolation
     pub isolation: bool,
     /// Whether to exit early on test failure.
@@ -643,6 +657,8 @@ impl MultiContractRunnerBuilder {
             isolation: false,
             decode_internal: Default::default(),
             record_all_steps: false,
+            cpu_trace: false,
+            opcode_cpu_trace: Default::default(),
             fail_fast: false,
             multi_network: Default::default(),
             showmap: None,
@@ -714,6 +730,16 @@ impl MultiContractRunnerBuilder {
 
     pub const fn set_record_all_steps(mut self, enable: bool) -> Self {
         self.record_all_steps = enable;
+        self
+    }
+
+    pub const fn set_cpu_trace(mut self, enable: bool) -> Self {
+        self.cpu_trace = enable;
+        self
+    }
+
+    pub fn set_opcode_cpu_trace(mut self, opcodes: Vec<OpCode>) -> Self {
+        self.opcode_cpu_trace = opcodes;
         self
     }
 
@@ -954,6 +980,8 @@ impl MultiContractRunnerBuilder {
                 debug: self.debug,
                 decode_internal: self.decode_internal,
                 record_all_steps: self.record_all_steps,
+                cpu_trace: self.cpu_trace,
+                opcode_cpu_trace: self.opcode_cpu_trace,
                 inline_config,
                 isolation: self.isolation,
                 early_exit: EarlyExit::new(self.fail_fast),

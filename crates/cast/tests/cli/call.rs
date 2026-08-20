@@ -1323,3 +1323,17 @@ Error: --create cannot be combined with --curl
 "#]]);
     }
 }
+
+#[casttest]
+fn cast_call_rejects_forge_cpu_trace_flag(cmd: _) {
+    cmd.args(["call", "--cpu-trace"]).assert_failure().stderr_eq(str![[r#"
+error: unexpected argument '--cpu-trace' found
+
+  tip: to pass '--cpu-trace' as a value, use '-- --cpu-trace'
+
+Usage: cast[..] call [OPTIONS] [TO] [SIG] [ARGS]... [COMMAND]
+
+For more information, try '--help'.
+
+"#]]);
+}

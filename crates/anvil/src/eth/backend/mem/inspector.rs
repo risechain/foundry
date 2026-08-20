@@ -279,6 +279,7 @@ fn print_traces(tracer: TracingInspector, decoder: Arc<CallTraceDecoder>) {
         ignored: Default::default(),
         diagnostics: Default::default(),
         debug_steps: None,
+        cpu: Default::default(),
     };
     let trace = render_trace_arena_inner(&traces, false, true);
     node_info!(Traces = %format!("\n{}", trace));
