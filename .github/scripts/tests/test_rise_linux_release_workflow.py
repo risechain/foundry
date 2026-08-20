@@ -4,6 +4,10 @@ import unittest
 
 ROOT = pathlib.Path(__file__).parents[3]
 WORKFLOW = ROOT / ".github" / "workflows" / "rise-linux-release.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+MONAD_WORKFLOW = ROOT / ".github" / "workflows" / "monad.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+DOCKER_WORKFLOW = ROOT / ".github" / "workflows" / "docker-publish.yml"
 
 
 class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
@@ -26,6 +30,19 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("branches: [master]", workflow)
         self.assertIn('tags: ["rise-v*"]', workflow)
         self.assertIn("workflow_dispatch:", workflow)
+
+    def test_fork_ci_excludes_unused_monad_jobs(self):
+        ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertNotIn("uses: ./.github/workflows/monad.yml", ci_workflow)
+        self.assertNotIn("      - monad\n", ci_workflow)
+        self.assertFalse(MONAD_WORKFLOW.exists())
+
+    def test_fork_release_builds_exclude_unused_monad_feature(self):
+        for workflow_path in (WORKFLOW, RELEASE_WORKFLOW, DOCKER_WORKFLOW):
+            with self.subTest(workflow=workflow_path.name):
+                workflow = workflow_path.read_text(encoding="utf-8")
+                self.assertNotIn(",monad", workflow)
 
     def test_validates_cpu_trace_and_builds_dist_binaries(self):
         workflow = self.workflow()
