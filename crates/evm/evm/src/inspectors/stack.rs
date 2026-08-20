@@ -13,11 +13,11 @@ use foundry_common::{compile::Analysis, sh_warn};
 use foundry_config::FuzzCorpusConfig;
 use foundry_evm_core::{
     FoundryBlock, FoundryTransaction, InspectorExt,
-    backend::{ContextUpdate, DatabaseError, DatabaseExt, JournaledState},
+    backend::{ContextUpdateFor, DatabaseError, DatabaseExt, JournaledState},
     constants::DEFAULT_CREATE2_DEPLOYER_CODEHASH,
     env::FoundryContextExt,
     evm::{
-        BlockEnvFor, ChainContextFor, EthEvmNetwork, EvmEnvFor, FoundryContextFor,
+        BlockEnvFor, ChainFor, EthEvmNetwork, EvmEnvFor, EvmFactoryFor, FoundryContextFor,
         FoundryEvmFactory, FoundryEvmNetwork, TxEnvFor, get_create2_factory_call_inputs,
         with_cloned_context,
     },
@@ -675,13 +675,9 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
     ) -> Result<(), EVMError<DatabaseError>> {
         let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner: self };
         let factory = FEN::EvmFactory::default();
-        #[cfg(feature = "monad")]
-        let chain_context = factory.capture_chain_context(ecx);
-        #[cfg(not(feature = "monad"))]
-        let chain_context = Default::default();
+        let chain_context = ecx.chain().clone();
         #[cfg(feature = "monad")]
         let state = factory.capture_transaction_state(ecx);
-        #[cfg(feature = "monad")]
         let mut nested_chain_context = None;
         #[cfg(feature = "monad")]
         let mut transaction_state = None;
@@ -694,10 +690,7 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
                 evm.restore_transaction_state(state);
             }
             f(&mut *evm)?;
-            #[cfg(feature = "monad")]
-            {
-                nested_chain_context = Some(evm.capture_chain_context());
-            }
+            nested_chain_context = Some(evm.chain_mut().clone());
             #[cfg(feature = "monad")]
             {
                 transaction_state = Some(evm.capture_transaction_state());
@@ -706,11 +699,8 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
             let sub_evm_env = evm.to_evm_env();
             Ok((sub_evm_env, sub_inner))
         })?;
-        #[cfg(feature = "monad")]
-        factory.apply_context_transition(
-            ecx,
-            Some(&nested_chain_context.expect("nested EVM chain context was captured")),
-        );
+        *ecx.chain_mut() = nested_chain_context.expect("nested EVM chain context was captured");
+        ecx.refresh_chain_dependent_state();
         #[cfg(feature = "monad")]
         factory.restore_transaction_state(
             ecx,
@@ -724,7 +714,7 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
         cheats: &mut Cheatcodes<FEN>,
         db: &mut <FoundryContextFor<'_, FEN> as ContextTr>::Db,
         evm_env: EvmEnvFor<FEN>,
-        chain_context: ChainContextFor<FEN>,
+        chain_context: ChainFor<FEN>,
         f: NestedEvmClosureFor<'_, FEN>,
     ) -> Result<EvmEnvFor<FEN>, EVMError<DatabaseError>> {
         let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner: self };
@@ -744,7 +734,7 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
         ecx: &mut FoundryContextFor<'_, FEN>,
         fork_id: Option<U256>,
         transaction: B256,
-    ) -> eyre::Result<ContextUpdate<ChainContextFor<FEN>>> {
+    ) -> eyre::Result<ContextUpdateFor<EvmFactoryFor<FEN>>> {
         let evm_env = ecx.evm_clone();
         let outer_tx_env = ecx.tx_clone();
         let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner: self };
@@ -1297,10 +1287,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         let evm_env = ecx.evm_clone();
         let tx_env = ecx.tx_clone();
         let factory = FEN::EvmFactory::default();
-        #[cfg(feature = "monad")]
-        let chain_context = factory.capture_chain_context(ecx);
-        #[cfg(not(feature = "monad"))]
-        let chain_context = Default::default();
+        let chain_context = ecx.chain().clone();
 
         let isolated_state = {
             let journal = ecx.journal_inner();
@@ -1327,7 +1314,6 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         let state = factory.capture_transaction_state(ecx);
         #[cfg(feature = "monad")]
         let mut transaction_state = None;
-        #[cfg(feature = "monad")]
         let mut nested_chain_context = None;
         let res = self.with_inspector(|mut inspector| {
             let (res, nested_env) = {
@@ -1343,9 +1329,9 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
                 // Set depth to 1 to make sure traces are collected correctly.
                 evm.journal_inner_mut().depth = 1;
                 let res = evm.transact_raw(tx_env);
+                nested_chain_context = Some(evm.chain_mut().clone());
                 #[cfg(feature = "monad")]
                 {
-                    nested_chain_context = Some(evm.capture_chain_context());
                     transaction_state = Some(evm.capture_transaction_state());
                 }
                 (res, evm.to_evm_env())
@@ -1360,11 +1346,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
 
             res
         });
-        #[cfg(feature = "monad")]
-        factory.apply_context_transition(
-            ecx,
-            Some(&nested_chain_context.expect("nested EVM chain context was captured")),
-        );
+        *ecx.chain_mut() = nested_chain_context.expect("nested EVM chain context was captured");
 
         self.in_inner_context = false;
         self.inner_context_data = None;
@@ -1384,8 +1366,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
                 ecx,
                 transaction_state.expect("isolated transaction state was captured"),
             );
-            #[cfg(feature = "monad")]
-            FEN::EvmFactory::default().apply_context_transition(ecx, None);
+            ecx.refresh_chain_dependent_state();
             // Should we match, encode and propagate error as a revert reason?
             let result =
                 InterpreterResult { result: InstructionResult::Revert, output: Bytes::new(), gas };
@@ -1444,8 +1425,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
             }
         };
         if rolled_back {
-            #[cfg(feature = "monad")]
-            FEN::EvmFactory::default().apply_context_transition(ecx, None);
+            ecx.refresh_chain_dependent_state();
         }
         (InterpreterResult { result, output, gas }, address, was_precompile_called)
     }
@@ -1510,8 +1490,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
             *ecx.journal_mut().evm_state_mut() = std::mem::take(&mut self.top_frame_journal);
         }
 
-        #[cfg(feature = "monad")]
-        FEN::EvmFactory::default().apply_context_transition(ecx, None);
+        ecx.refresh_chain_dependent_state();
     }
 
     // We take extra care in optimizing `step` and `step_end`, as they're are likely the most
