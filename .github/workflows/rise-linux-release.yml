@@ -1,0 +1,209 @@
+---
+name: Rise Linux release
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  RUST_PROFILE: dist
+  RUST_FEATURES: aws-kms,gcp-kms,turnkey,cli,asm-keccak,js-tracer,monad,optimism
+  SVM_TARGET_PLATFORM: "linux-amd64"
+  TARGET: x86_64-unknown-linux-gnu
+  OUT_DIR: target/x86_64-unknown-linux-gnu/dist
+
+'on':
+  push:
+    branches: [master]
+    tags: ["rise-v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: rise-linux-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION_NAME: ${{ startsWith(github.ref, 'refs/tags/rise-v') && github.ref_name || format('rise-{0}', github.sha) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.96
+          targets: ${{ env.TARGET }}
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-bin: false
+
+      - name: Validate Rise release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$VERSION_NAME" == rise-v* ]] && \
+            [[ ! "$VERSION_NAME" =~ ^rise-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-cpu\.([1-9][0-9]*))?$ ]]; then
+            echo "Invalid Rise release tag: $VERSION_NAME" >&2
+            exit 1
+          fi
+
+      - name: Test CPU tracing
+        run: "cargo test --locked -p forge --test cli test_cmd::cpu_trace:: -- --nocapture"
+
+      - name: Build Linux binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_NAME=dev
+          if [[ "$VERSION_NAME" == rise-v* ]]; then
+            TAG_NAME="${VERSION_NAME#rise-}"
+          fi
+          export TAG_NAME
+          flags=(
+            --locked
+            --target "$TARGET"
+            --profile "$RUST_PROFILE"
+            --bins
+            --no-default-features
+            --features "$RUST_FEATURES"
+            --features jemalloc
+          )
+          cargo build "${flags[@]}"
+
+      - name: Inspect Linux binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in forge cast anvil chisel solar; do
+            bin="$OUT_DIR/$name"
+            test -x "$bin"
+            file "$bin"
+            "$bin" --version
+          done
+
+      - name: Archive Linux binaries
+        id: artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="foundry_${VERSION_NAME}_linux_amd64.tar.gz"
+          checksum="foundry_${VERSION_NAME}_linux_amd64.sha256"
+          tar -czf "$archive" -C "$OUT_DIR" forge cast anvil chisel solar
+          sha256sum "$archive" > "$checksum"
+          cat "$checksum"
+          {
+            printf 'archive=%s\n' "$archive"
+            printf 'checksum=%s\n' "$checksum"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload Linux archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: foundry-linux-amd64
+          path: |
+            ${{ steps.artifacts.outputs.archive }}
+            ${{ steps.artifacts.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/rise-v')
+    runs-on: ubuntu-latest
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^rise-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-cpu\.([1-9][0-9]*))?$ ]]; then
+            echo "Invalid Rise release tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - name: Download Linux archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: foundry-linux-amd64
+          path: .release
+
+      - name: Verify Linux archive checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .release
+          sha256sum --check foundry_*.sha256
+
+      - name: Attest Linux archive
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: .release/*.tar.gz
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archives=(.release/*.tar.gz)
+          checksums=(.release/*.sha256)
+          if (( ${#archives[@]} != 1 || ${#checksums[@]} != 1 )); then
+            echo "Expected exactly one archive and checksum." >&2
+            exit 1
+          fi
+          archive="${archives[0]}"
+          checksum="${checksums[0]}"
+          archive_name="${archive##*/}"
+          checksum_name="${checksum##*/}"
+
+          prerelease=false
+          release_args=(
+            --draft
+            --verify-tag
+            --title "$GITHUB_REF_NAME"
+            --notes "Rise Foundry Linux AMD64 build for $GITHUB_REF_NAME."
+          )
+          if [[ "$GITHUB_REF_NAME" == *-cpu.* ]]; then
+            prerelease=true
+            release_args+=(--prerelease)
+          fi
+
+          if release_state=$(gh release view "$GITHUB_REF_NAME" \
+            --json isDraft,isPrerelease \
+            --jq '[.isDraft, .isPrerelease] | @tsv' 2>/dev/null); then
+            IFS=$'\t' read -r is_draft existing_prerelease <<< "$release_state"
+            if [[ "$existing_prerelease" != "$prerelease" ]]; then
+              echo "Existing release prerelease status does not match its tag." >&2
+              exit 1
+            fi
+
+            if [[ "$is_draft" != true ]]; then
+              remote_dir=$(mktemp -d)
+              trap 'rm -rf "$remote_dir"' EXIT
+              gh release download "$GITHUB_REF_NAME" \
+                --pattern "$archive_name" \
+                --pattern "$checksum_name" \
+                --dir "$remote_dir"
+              cmp --silent "$archive" "$remote_dir/$archive_name"
+              cmp --silent "$checksum" "$remote_dir/$checksum_name"
+              echo "Release $GITHUB_REF_NAME already contains these artifacts."
+              exit 0
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" "${release_args[@]}"
+          fi
+
+          gh release upload "$GITHUB_REF_NAME" "$archive" "$checksum" --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false
