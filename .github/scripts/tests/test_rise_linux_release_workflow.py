@@ -30,6 +30,10 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
     def test_validates_cpu_trace_and_builds_dist_binaries(self):
         workflow = self.workflow()
 
+        self.assertIn(
+            "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
+            workflow,
+        )
         self.assertIn("toolchain: 1.96", workflow)
         self.assertIn("test_cmd::cpu_trace::", workflow)
         self.assertIn(
@@ -44,6 +48,11 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("--bins", workflow)
         self.assertIn("--no-default-features", workflow)
         self.assertIn('SVM_TARGET_PLATFORM: "linux-amd64"', workflow)
+
+    def test_release_build_does_not_restore_mutable_cache(self):
+        workflow = self.workflow()
+
+        self.assertNotIn("Swatinem/rust-cache@", workflow)
 
     def test_packages_versioned_archive_and_checksum(self):
         workflow = self.workflow()
