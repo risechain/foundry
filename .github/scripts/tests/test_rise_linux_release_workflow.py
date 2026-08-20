@@ -8,6 +8,7 @@ CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 MONAD_WORKFLOW = ROOT / ".github" / "workflows" / "monad.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 DOCKER_WORKFLOW = ROOT / ".github" / "workflows" / "docker-publish.yml"
+MAKEFILE = ROOT / "Makefile"
 
 
 class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
@@ -38,11 +39,14 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
         self.assertNotIn("      - monad\n", ci_workflow)
         self.assertFalse(MONAD_WORKFLOW.exists())
 
-    def test_fork_release_builds_exclude_unused_monad_feature(self):
-        for workflow_path in (WORKFLOW, RELEASE_WORKFLOW, DOCKER_WORKFLOW):
-            with self.subTest(workflow=workflow_path.name):
-                workflow = workflow_path.read_text(encoding="utf-8")
-                self.assertNotIn(",monad", workflow)
+    def test_packaged_builds_exclude_unused_monad_feature(self):
+        for build_path in (WORKFLOW, RELEASE_WORKFLOW, DOCKER_WORKFLOW, MAKEFILE):
+            with self.subTest(build=build_path.name):
+                build_config = build_path.read_text(encoding="utf-8")
+                self.assertNotRegex(
+                    build_config,
+                    r"(?m)^(?:\s*RUST_FEATURES:|\s*FEATURES \?=).*\bmonad\b",
+                )
 
     def test_validates_cpu_trace_and_builds_dist_binaries(self):
         workflow = self.workflow()
