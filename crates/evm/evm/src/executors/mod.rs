@@ -42,7 +42,7 @@ use foundry_evm_core::{
 };
 use foundry_evm_coverage::HitMaps;
 use foundry_evm_fuzz::ObservedCall;
-use foundry_evm_traces::{SparsedTraceArena, TraceRequirements};
+use foundry_evm_traces::{CpuRecorderError, SparsedTraceArena, TraceRequirements};
 use revm::{
     bytecode::Bytecode,
     context::{Block, Cfg, Transaction},
@@ -1183,6 +1183,9 @@ pub enum EvmError<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     /// Error caused which occurred due to calling the `skip` cheatcode.
     #[error("{0}")]
     Skip(SkipReason),
+    /// Error while collecting requested per-call thread CPU diagnostics.
+    #[error("--cpu-trace failed: {0}")]
+    CpuTrace(#[source] Arc<CpuRecorderError>),
     /// Any other error.
     #[error("{0}")]
     Eyre(
@@ -1588,7 +1591,7 @@ fn convert_executed_result<FEN: FoundryEvmNetwork>(
         cheatcodes,
         chisel_state,
         reverter,
-    } = inspector.collect();
+    } = inspector.collect().map_err(EvmError::<FEN>::CpuTrace)?;
     let fork_block_number = cheatcodes
         .as_ref()
         .and_then(|cheats| cheats.fork_block_number_override)
@@ -2072,6 +2075,125 @@ mod tests {
         executor.set_trace_requirements(TraceRequirements::none());
         let untraced = executor.transact_raw(CALLER, target, Bytes::new(), U256::ZERO).unwrap();
         assert!(untraced.traces.is_none());
+    }
+
+    #[test]
+    fn inspector_cpu_maps_real_nested_call_revert_and_create_nodes_without_opcode_steps() {
+        let backend = Backend::<EthEvmNetwork>::spawn(None).unwrap();
+        let mut executor = ExecutorBuilder::default()
+            .inspectors(|stack| stack.cpu_trace(true))
+            .gas_limit(1 << 20)
+            .build(
+                EvmEnvFor::<EthEvmNetwork>::default(),
+                TxEnvFor::<EthEvmNetwork>::default(),
+                backend,
+            );
+        executor.evm_env_mut().cfg_env.disable_nonce_check = true;
+
+        let target = Address::repeat_byte(0x11);
+        let succeeds = Address::repeat_byte(0x22);
+        let reverts = Address::repeat_byte(0x33);
+        executor.set_code(succeeds, Bytecode::new_raw(Bytes::from_static(&[0x00]))).unwrap();
+        executor
+            .set_code(reverts, Bytecode::new_raw(Bytes::from_static(&[0x5f, 0x5f, 0xfd])))
+            .unwrap();
+
+        // Store reverting initcode at memory[29..32], call a successful contract, call a
+        // reverting contract, then attempt the reverting CREATE. The outer call still succeeds.
+        let mut code = vec![0x62, 0x5f, 0x5f, 0xfd, 0x5f, 0x52];
+        for callee in [succeeds, reverts] {
+            code.extend_from_slice(&[0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x73]);
+            code.extend_from_slice(callee.as_slice());
+            code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+        }
+        code.extend_from_slice(&[0x60, 0x03, 0x60, 0x1d, 0x5f, 0xf0, 0x50, 0x00]);
+        executor.set_code(target, Bytecode::new_raw(code.into())).unwrap();
+
+        let result = executor.transact_raw(CALLER, target, Bytes::new(), U256::ZERO).unwrap();
+        let traces = result.traces.unwrap();
+        let nodes = traces.nodes();
+
+        assert!(!result.reverted);
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(nodes[0].trace.address, target);
+        assert_eq!(nodes[1].trace.address, succeeds);
+        assert!(nodes[1].trace.success);
+        assert_eq!(nodes[2].trace.address, reverts);
+        assert!(!nodes[2].trace.success);
+        assert!(nodes[3].trace.kind.is_any_create());
+        assert!(!nodes[3].trace.success);
+        assert_eq!(traces.cpu.keys().copied().collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert!(nodes.iter().all(|node| node.trace.steps.is_empty()));
+    }
+
+    #[test]
+    fn inspector_cpu_retains_root_create_node_zero() {
+        let backend = Backend::<EthEvmNetwork>::spawn(None).unwrap();
+        let mut executor = ExecutorBuilder::default()
+            .inspectors(|stack| stack.cpu_trace(true))
+            .gas_limit(1 << 20)
+            .build(
+                EvmEnvFor::<EthEvmNetwork>::default(),
+                TxEnvFor::<EthEvmNetwork>::default(),
+                backend,
+            );
+
+        let result =
+            executor.deploy(CALLER, Bytes::from_static(&[0x00]), U256::ZERO, None).unwrap();
+        let traces = result.traces.as_ref().unwrap();
+
+        assert_eq!(traces.nodes().len(), 1);
+        assert!(traces.nodes()[0].trace.kind.is_any_create());
+        assert_eq!(traces.cpu.keys().copied().collect::<Vec<_>>(), [0]);
+    }
+
+    #[test]
+    fn inspector_cpu_structural_failure_surfaces_after_completed_execution_with_flag_hint() {
+        let backend = Backend::<EthEvmNetwork>::spawn(None).unwrap();
+        let mut executor = ExecutorBuilder::default()
+            .inspectors(|stack| stack.cpu_trace(true))
+            .gas_limit(1 << 20)
+            .build(
+                EvmEnvFor::<EthEvmNetwork>::default(),
+                TxEnvFor::<EthEvmNetwork>::default(),
+                backend,
+            );
+        let target = Address::repeat_byte(0x11);
+        executor.set_code(target, Bytecode::new_raw(Bytes::from_static(&[0x00]))).unwrap();
+        executor.inspector_mut().inner.cpu_profiler.as_mut().unwrap().enter(99).unwrap();
+
+        let error = executor.transact_raw(CALLER, target, Bytes::new(), U256::ZERO).unwrap_err();
+        let cpu_error = error
+            .downcast_ref::<EvmError<EthEvmNetwork>>()
+            .unwrap_or_else(|| panic!("expected EvmError, got {error:?}"));
+
+        assert!(matches!(
+            cpu_error,
+            EvmError::CpuTrace(error)
+                if matches!(error.as_ref(), CpuRecorderError::Profiler(_))
+        ));
+        assert!(cpu_error.to_string().contains("--cpu-trace"));
+    }
+
+    #[test]
+    fn fatal_evm_error_takes_precedence_over_cpu_finalization_failure() {
+        let backend = Backend::<EthEvmNetwork>::spawn(None).unwrap();
+        let mut executor =
+            ExecutorBuilder::default().inspectors(|stack| stack.cpu_trace(true)).build(
+                EvmEnvFor::<EthEvmNetwork>::default(),
+                TxEnvFor::<EthEvmNetwork>::default(),
+                backend,
+            );
+        executor.inspector_mut().inner.cpu_profiler.as_mut().unwrap().enter(99).unwrap();
+
+        let error = executor
+            .transact_raw(CALLER, Address::repeat_byte(0x11), Bytes::new(), U256::ZERO)
+            .unwrap_err();
+
+        if let Some(evm_error) = error.downcast_ref::<EvmError<EthEvmNetwork>>() {
+            panic!("expected fatal backend error, got {evm_error:?}");
+        }
+        assert!(!error.to_string().contains("--cpu-trace"));
     }
 
     #[test]

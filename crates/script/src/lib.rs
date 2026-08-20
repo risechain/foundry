@@ -1646,6 +1646,7 @@ mod tests {
                     arena,
                     ignored: Default::default(),
                     diagnostics: Default::default(),
+                    cpu: Default::default(),
                 },
             )],
             ..Default::default()
@@ -1688,6 +1689,7 @@ mod tests {
                     arena,
                     ignored: Default::default(),
                     diagnostics: Default::default(),
+                    cpu: Default::default(),
                 },
             )],
             ..Default::default()
