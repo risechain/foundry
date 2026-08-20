@@ -11,10 +11,10 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
         self.assertTrue(WORKFLOW.is_file(), f"missing workflow: {WORKFLOW}")
         return WORKFLOW.read_text(encoding="utf-8")
 
-    def test_uses_only_github_hosted_linux_runner(self):
+    def test_builds_on_compatible_github_hosted_linux_runner(self):
         workflow = self.workflow()
 
-        self.assertIn("runs-on: ubuntu-latest", workflow)
+        self.assertIn("build:\n    runs-on: ubuntu-22.04", workflow)
         self.assertNotIn("depot-", workflow)
         self.assertNotIn("self-hosted", workflow)
 
@@ -96,8 +96,8 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("--clobber", workflow)
         self.assertIn('gh release edit "$GITHUB_REF_NAME" --draft=false', workflow)
         self.assertIn('gh release download "$GITHUB_REF_NAME"', workflow)
-        self.assertIn('cmp --silent "$archive" "$remote_dir/$archive_name"', workflow)
-        self.assertIn('cmp --silent "$checksum" "$remote_dir/$checksum_name"', workflow)
+        self.assertIn('sha256sum --check "$checksum_name"', workflow)
+        self.assertNotIn("cmp --silent", workflow)
 
     def test_rejects_malformed_rise_tag_before_compilation(self):
         workflow = self.workflow()
