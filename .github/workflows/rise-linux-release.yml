@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
     env:
@@ -193,8 +193,10 @@ jobs:
                 --pattern "$archive_name" \
                 --pattern "$checksum_name" \
                 --dir "$remote_dir"
-              cmp --silent "$archive" "$remote_dir/$archive_name"
-              cmp --silent "$checksum" "$remote_dir/$checksum_name"
+              (
+                cd "$remote_dir"
+                sha256sum --check "$checksum_name"
+              )
               echo "Release $GITHUB_REF_NAME already contains these artifacts."
               exit 0
             fi
