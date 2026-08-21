@@ -1886,15 +1886,14 @@ fn inner_stop_cpu_snapshot<FEN: FoundryEvmNetwork>(
     group: Option<String>,
     name: Option<String>,
 ) -> Result {
-    let (group, name) = group
-        .zip(name)
-        .or_else(|| {
-            ccx.state
-                .cpu_metering
-                .active_name()
-                .map(|(group, name)| (group.to_string(), name.to_string()))
-        })
+    let (active_group, active_name) = ccx
+        .state
+        .cpu_metering
+        .active_name()
+        .map(|(group, name)| (group.to_string(), name.to_string()))
         .ok_or_else(|| fmt_err!("no active CPU snapshot; call `startSnapshotCpu` first"))?;
+    let group = group.unwrap_or(active_group);
+    let name = name.unwrap_or(active_name);
     let value = ccx.state.cpu_metering.stop(&group, &name).map_err(|error| fmt_err!("{error}"))?;
 
     ccx.state.cpu_snapshots.entry(group).or_default().insert(name, value.to_string());

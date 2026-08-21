@@ -27,6 +27,13 @@ contract CpuSnapshotsTest is Test {
         vm.stopSnapshotCpu();
     }
 
+    function testCpuSnapshotRejectsMismatchedImplicitGroupName() public {
+        vm.startSnapshotCpu("expected");
+        (bool success,) = address(vm).call(abi.encodeWithSignature("stopSnapshotCpu(string)", "unexpected"));
+        assertTrue(!success);
+        vm.stopSnapshotCpu();
+    }
+
     function testCpuSnapshotRejectsStopWithoutStart() public {
         (bool success,) = address(vm).call(abi.encodeWithSignature("stopSnapshotCpu()"));
         assertTrue(!success);
