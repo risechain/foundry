@@ -3447,6 +3447,15 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             result.gas_by_case.push((raw_call_result.gas_used, raw_call_result.stipend));
             result.logs.extend(raw_call_result.logs.clone());
             result.labels.extend(raw_call_result.labels.clone());
+            if let Some(cheatcodes) = &raw_call_result.cheatcodes {
+                for (group, snapshots) in &cheatcodes.cpu_snapshots {
+                    result
+                        .cpu_snapshots
+                        .entry(group.clone())
+                        .or_default()
+                        .extend(snapshots.clone());
+                }
+            }
             HitMaps::merge_opt(&mut result.line_coverage, raw_call_result.line_coverage.clone());
 
             let is_success =

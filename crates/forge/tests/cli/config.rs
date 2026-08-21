@@ -2889,6 +2889,12 @@ interface Vm {
 contract CpuSnapshotOverloadTest is DSTest {
     Vm constant vm = Vm(HEVM_ADDRESS);
 
+    function fixtureValue() public pure returns (uint256[] memory values) {
+        values = new uint256[](2);
+        values[0] = 1;
+        values[1] = 2;
+    }
+
     function testExplicitGroup() public {
         vm.startSnapshotCpu("custom", "explicit");
         vm.stopSnapshotCpu("custom", "explicit");
@@ -2898,11 +2904,23 @@ contract CpuSnapshotOverloadTest is DSTest {
         vm.startSnapshotCpu("implicit");
         vm.stopSnapshotCpu("implicit");
     }
+
+    function testFuzzSnapshot(uint256 input) public {
+        vm.startSnapshotCpu("fuzz");
+        input;
+        vm.stopSnapshotCpu("fuzz");
+    }
+
+    function tableSnapshot(uint256 value) public {
+        vm.startSnapshotCpu("table");
+        value;
+        vm.stopSnapshotCpu("table");
+    }
 }
     "#,
     );
 
-    cmd.forge_fuse().args(["test"]).assert_success();
+    cmd.forge_fuse().args(["test", "--fuzz-runs", "2"]).assert_success();
 
     let custom: Value = serde_json::from_str(
         &fs::read_to_string(prj.root().join("snapshots/cpu/custom.json")).unwrap(),
@@ -2915,6 +2933,60 @@ contract CpuSnapshotOverloadTest is DSTest {
     )
     .unwrap();
     assert!(implicit.get("implicit").and_then(Value::as_str).is_some());
+    assert!(implicit.get("fuzz").and_then(Value::as_str).is_some());
+    assert!(implicit.get("table").and_then(Value::as_str).is_some());
+});
+
+forgetest_init!(test_cpu_snapshot_checks_all_suites_before_emitting, |prj, cmd| {
+    prj.initialize_default_contracts();
+    prj.insert_ds_test();
+
+    for (contract, snapshot) in [("A", "a"), ("B", "b")] {
+        prj.add_source(
+            &format!("CpuSnapshot{contract}.sol"),
+            &format!(
+                r#"
+import "./test.sol";
+
+interface Vm {{
+    function startSnapshotCpu(string memory group, string memory name) external;
+    function stopSnapshotCpu(string memory group, string memory name) external returns (uint256);
+}}
+
+contract CpuSnapshot{contract} is DSTest {{
+    Vm constant vm = Vm(HEVM_ADDRESS);
+
+    function testSnapshot() public {{
+        vm.startSnapshotCpu("shared", "{snapshot}");
+        vm.stopSnapshotCpu("shared", "{snapshot}");
+    }}
+}}
+                "#,
+            ),
+        );
+    }
+
+    let snapshot_dir = prj.root().join("snapshots/cpu");
+    fs::create_dir_all(&snapshot_dir).unwrap();
+    fs::write(
+        snapshot_dir.join("shared.json"),
+        r#"{
+  "b": "18446744073709551615"
+}"#,
+    )
+    .unwrap();
+
+    cmd.forge_fuse()
+        .args(["test", "--threads", "1", "--cpu-snapshot-check=true"])
+        .assert_failure()
+        .stderr_eq(str![[r#"
+...
+[CPU shared] Failed to match snapshots:
+- [b] 18446744073709551615 → [..]
+
+Error: CPU snapshots differ from previous run
+...
+"#]]);
 });
 
 // Tests compilation restrictions enables optimizer if optimizer runs set to a value higher than 0.

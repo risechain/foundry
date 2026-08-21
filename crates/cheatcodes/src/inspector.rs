@@ -85,6 +85,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     sync::{Arc, OnceLock},
+    thread::{self, ThreadId},
 };
 
 mod utils;
@@ -472,6 +473,8 @@ pub enum CpuSnapshotError {
     AlreadyStarted { group: String, name: String },
     /// No active snapshot matches the requested group and name.
     NotStarted { group: String, name: String },
+    /// The snapshot was stopped from a different thread than it was started on.
+    WrongThread { group: String, name: String },
     /// Sampling the current thread CPU clock failed.
     Clock(foundry_evm_traces::CpuClockError),
 }
@@ -485,6 +488,10 @@ impl std::fmt::Display for CpuSnapshotError {
             Self::NotStarted { group, name } => {
                 write!(f, "no CPU snapshot was started with the name: {name} in group: {group}")
             }
+            Self::WrongThread { group, name } => write!(
+                f,
+                "CPU snapshot with name: {name} in group: {group} must be stopped on the thread where it was started"
+            ),
             Self::Clock(error) => std::fmt::Display::fmt(error, f),
         }
     }
@@ -494,7 +501,9 @@ impl std::error::Error for CpuSnapshotError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Clock(error) => Some(error),
-            Self::AlreadyStarted { .. } | Self::NotStarted { .. } => None,
+            Self::AlreadyStarted { .. } | Self::NotStarted { .. } | Self::WrongThread { .. } => {
+                None
+            }
         }
     }
 }
@@ -508,8 +517,8 @@ impl From<foundry_evm_traces::CpuClockError> for CpuSnapshotError {
 /// Holds CPU snapshot metering state.
 #[derive(Clone, Debug)]
 pub struct CpuMetering<C = SystemThreadCpuClock> {
-    /// The group, name, and starting thread CPU timestamp of the active snapshot.
-    pub active_snapshot: Option<(String, String, u64)>,
+    /// The group, name, starting thread CPU timestamp, and thread of the active snapshot.
+    pub active_snapshot: Option<(String, String, u64, ThreadId)>,
     /// Current-thread CPU clock used by snapshot cheatcodes.
     pub clock: C,
 }
@@ -528,31 +537,35 @@ impl<C> CpuMetering<C> {
 
     /// Returns the active snapshot group and name.
     pub fn active_name(&self) -> Option<(&str, &str)> {
-        self.active_snapshot.as_ref().map(|(group, name, _)| (group.as_str(), name.as_str()))
+        self.active_snapshot.as_ref().map(|(group, name, _, _)| (group.as_str(), name.as_str()))
     }
 }
 
 impl<C: CpuClock> CpuMetering<C> {
     /// Starts a named CPU snapshot.
     pub fn start(&mut self, group: String, name: String) -> Result<(), CpuSnapshotError> {
-        if let Some((group, name, _)) = &self.active_snapshot {
+        if let Some((group, name, _, _)) = &self.active_snapshot {
             return Err(CpuSnapshotError::AlreadyStarted {
                 group: group.clone(),
                 name: name.clone(),
             });
         }
         let start_ns = self.clock.now_ns()?;
-        self.active_snapshot = Some((group, name, start_ns));
+        self.active_snapshot = Some((group, name, start_ns, thread::current().id()));
         Ok(())
     }
 
     /// Stops the matching CPU snapshot and returns its elapsed thread CPU nanoseconds.
     pub fn stop(&mut self, group: &str, name: &str) -> Result<u64, CpuSnapshotError> {
-        let Some((active_group, active_name, start_ns)) = &self.active_snapshot else {
+        let Some((active_group, active_name, start_ns, start_thread)) = &self.active_snapshot
+        else {
             return Err(CpuSnapshotError::NotStarted { group: group.into(), name: name.into() });
         };
         if active_group != group || active_name != name {
             return Err(CpuSnapshotError::NotStarted { group: group.into(), name: name.into() });
+        }
+        if start_thread != &thread::current().id() {
+            return Err(CpuSnapshotError::WrongThread { group: group.into(), name: name.into() });
         }
         let start_ns = *start_ns;
         let end_ns = self.clock.now_ns()?;
@@ -4430,6 +4443,24 @@ mod tests {
             metering.stop("other", "snapshot"),
             Err(CpuSnapshotError::NotStarted { .. })
         ));
+        assert_eq!(metering.stop("group", "name").unwrap(), 65);
+    }
+
+    #[test]
+    fn cpu_snapshot_cannot_stop_on_a_different_thread() {
+        let mut metering = CpuMetering::with_clock(SequenceClock::new([100, 165]));
+        metering.start("group".into(), "name".into()).unwrap();
+
+        let mut metering = std::thread::spawn(move || {
+            assert!(matches!(
+                metering.stop("group", "name"),
+                Err(CpuSnapshotError::WrongThread { .. })
+            ));
+            metering
+        })
+        .join()
+        .unwrap();
+
         assert_eq!(metering.stop("group", "name").unwrap(), 65);
     }
 }

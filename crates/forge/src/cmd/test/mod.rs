@@ -3359,69 +3359,6 @@ impl TestArgs {
                 }
             }
 
-            if !cpu_snapshots.is_empty() {
-                let cpu_snapshots_dir = config.snapshots.join("cpu");
-                if self.cpu_snapshot_check.unwrap_or(config.cpu_snapshot_check) {
-                    let differences_found =
-                        cpu_snapshots.iter().fold(false, |mut found, (group, snapshots)| {
-                            let snapshot_path = cpu_snapshots_dir.join(format!("{group}.json"));
-                            if !snapshot_path.exists() {
-                                return found;
-                            }
-
-                            let previous_snapshots: BTreeMap<String, String> =
-                                fs::read_json_file(&snapshot_path)
-                                    .expect("Failed to read CPU snapshots from disk");
-                            let diff: BTreeMap<_, _> = snapshots
-                                .iter()
-                                .filter_map(|(key, snapshot)| {
-                                    previous_snapshots.get(key).and_then(|previous_snapshot| {
-                                        (previous_snapshot != snapshot).then(|| {
-                                            (
-                                                key.clone(),
-                                                (previous_snapshot.clone(), snapshot.clone()),
-                                            )
-                                        })
-                                    })
-                                })
-                                .collect();
-
-                            if !diff.is_empty() {
-                                let _ = sh_eprintln!(
-                                    "{}",
-                                    format!("\n[CPU {group}] Failed to match snapshots:")
-                                        .red()
-                                        .bold()
-                                );
-                                for (key, (previous_snapshot, snapshot)) in &diff {
-                                    let _ = sh_eprintln!(
-                                        "{}",
-                                        format!("- [{key}] {previous_snapshot} → {snapshot}").red()
-                                    );
-                                }
-                                found = true;
-                            }
-                            found
-                        });
-
-                    if differences_found {
-                        sh_eprintln!()?;
-                        eyre::bail!("CPU snapshots differ from previous run");
-                    }
-                }
-
-                if self.cpu_snapshot_emit.unwrap_or(config.cpu_snapshot_emit) {
-                    fs::create_dir_all(&cpu_snapshots_dir)?;
-                    for (group, snapshots) in &cpu_snapshots {
-                        fs::write_pretty_json_file(
-                            &cpu_snapshots_dir.join(format!("{group}.json")),
-                            snapshots,
-                        )
-                        .expect("Failed to write CPU snapshots to disk");
-                    }
-                }
-            }
-
             // Print suite summary.
             if !silent && has_tests {
                 sh_println!("{}", suite_result.summary())?;
@@ -3435,6 +3372,65 @@ impl TestArgs {
                 break;
             }
         }
+
+        if !cpu_snapshots.is_empty() {
+            let cpu_snapshots_dir = config.snapshots.join("cpu");
+            if self.cpu_snapshot_check.unwrap_or(config.cpu_snapshot_check) {
+                let differences_found =
+                    cpu_snapshots.iter().fold(false, |mut found, (group, snapshots)| {
+                        let snapshot_path = cpu_snapshots_dir.join(format!("{group}.json"));
+                        if !snapshot_path.exists() {
+                            return found;
+                        }
+
+                        let previous_snapshots: BTreeMap<String, String> =
+                            fs::read_json_file(&snapshot_path)
+                                .expect("Failed to read CPU snapshots from disk");
+                        let diff: BTreeMap<_, _> = snapshots
+                            .iter()
+                            .filter_map(|(key, snapshot)| {
+                                previous_snapshots.get(key).and_then(|previous_snapshot| {
+                                    (previous_snapshot != snapshot).then(|| {
+                                        (key.clone(), (previous_snapshot.clone(), snapshot.clone()))
+                                    })
+                                })
+                            })
+                            .collect();
+
+                        if !diff.is_empty() {
+                            let _ = sh_eprintln!(
+                                "{}",
+                                format!("\n[CPU {group}] Failed to match snapshots:").red().bold()
+                            );
+                            for (key, (previous_snapshot, snapshot)) in &diff {
+                                let _ = sh_eprintln!(
+                                    "{}",
+                                    format!("- [{key}] {previous_snapshot} → {snapshot}").red()
+                                );
+                            }
+                            found = true;
+                        }
+                        found
+                    });
+
+                if differences_found {
+                    sh_eprintln!()?;
+                    eyre::bail!("CPU snapshots differ from previous run");
+                }
+            }
+
+            if self.cpu_snapshot_emit.unwrap_or(config.cpu_snapshot_emit) {
+                fs::create_dir_all(&cpu_snapshots_dir)?;
+                for (group, snapshots) in &cpu_snapshots {
+                    fs::write_pretty_json_file(
+                        &cpu_snapshots_dir.join(format!("{group}.json")),
+                        snapshots,
+                    )
+                    .expect("Failed to write CPU snapshots to disk");
+                }
+            }
+        }
+
         if let Some(regression) = &symbolic_regression {
             let artifacts = collect_symbolic_artifacts_from_suites(outcome.results.values());
             let regressions =

@@ -19,7 +19,7 @@ use foundry_evm_coverage::HitMaps;
 use foundry_evm_traces::{CallTraceArena, SparsedTraceArena};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 pub use proptest::test_runner::{Config as FuzzConfig, Reason};
 
@@ -379,6 +379,9 @@ pub struct FuzzTestResult {
 
     /// Breakpoints for debugger. Correspond to the same fuzz case as `traces`.
     pub breakpoints: Option<Breakpoints>,
+
+    /// CPU snapshots captured across fuzz cases.
+    pub cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
 
     /// Runtime bytecodes for contracts seen in the debug trace.
     pub debug_bytecodes: AddressHashMap<Bytes>,

@@ -2388,6 +2388,7 @@ impl TestResult {
         self.duration = Duration::default();
         self.gas_report_traces = result.gas_report_traces.into_iter().map(|t| vec![t]).collect();
         self.breakpoints = result.breakpoints.unwrap_or_default();
+        self.cpu_snapshots = result.cpu_snapshots;
         self.deprecated_cheatcodes = result.deprecated_cheatcodes;
     }
 
@@ -2585,6 +2586,7 @@ impl TestResult {
         self.duration = Duration::default();
         self.gas_report_traces = result.gas_report_traces.into_iter().map(|t| vec![t]).collect();
         self.breakpoints = result.breakpoints.unwrap_or_default();
+        self.cpu_snapshots = result.cpu_snapshots;
         self.deprecated_cheatcodes = result.deprecated_cheatcodes;
     }
 
