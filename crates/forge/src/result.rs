@@ -1347,6 +1347,9 @@ pub struct TestResult {
     /// Any captured gas snapshots along the test's execution which should be accumulated.
     pub gas_snapshots: BTreeMap<String, BTreeMap<String, String>>,
 
+    /// Any captured CPU snapshots along the test's execution which should be accumulated.
+    pub cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
+
     /// Deprecated cheatcodes (mapped to their replacements, if any) used in current test.
     #[serde(skip)]
     pub deprecated_cheatcodes: HashMap<&'static str, Option<&'static str>>,
@@ -1576,6 +1579,8 @@ pub struct InvariantOutcome {
     pub counterexample: Option<CounterExample>,
     /// Traces collected for the gas report.
     pub gas_report_traces: Vec<Vec<CallTraceArena>>,
+    /// CPU snapshots captured along the campaign.
+    pub cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Invariant kind for results that did not run a real campaign (setup failures, replays, skips).
@@ -1663,6 +1668,7 @@ impl TestResult {
         if let Some(cheatcodes) = raw_call_result.cheatcodes {
             self.breakpoints = cheatcodes.breakpoints;
             self.gas_snapshots = cheatcodes.gas_snapshots;
+            self.cpu_snapshots = cheatcodes.cpu_snapshots;
             self.deprecated_cheatcodes = cheatcodes.deprecated;
         }
     }
@@ -1708,6 +1714,7 @@ impl TestResult {
         self.duration = Duration::default();
         self.gas_report_traces = result.gas_report_traces.into_iter().map(|t| vec![t]).collect();
         self.breakpoints = result.breakpoints.unwrap_or_default();
+        self.cpu_snapshots = result.cpu_snapshots;
         self.deprecated_cheatcodes = result.deprecated_cheatcodes;
     }
 
@@ -1802,6 +1809,7 @@ impl TestResult {
         self.invariant_failures = outcome.failures;
         self.invariant_handler_failures = outcome.handler_failures;
         self.gas_report_traces = outcome.gas_report_traces;
+        self.cpu_snapshots = outcome.cpu_snapshots;
     }
 
     /// Returns the result for a symbolic test.
@@ -2230,11 +2238,28 @@ const fn symbolic_result_schema_version() -> u32 {
 mod tests {
     use super::*;
     use foundry_cli::utils::parse_json;
+    use foundry_evm::fuzz::merge_cpu_snapshots;
 
     const SYMBOLIC_RESULT_SCHEMA: &str =
         include_str!("../../evm/symbolic/assets/symbolic-result.schema.json");
     const SYMBOLIC_COUNTEREXAMPLE_SCHEMA: &str =
         include_str!("../../evm/symbolic/assets/symbolic-counterexample.schema.json");
+
+    #[test]
+    fn repeated_cpu_snapshots_keep_the_minimum_suite_measurement() {
+        let snapshots = |value: &str| {
+            BTreeMap::from([(
+                "group".to_string(),
+                BTreeMap::from([("name".to_string(), value.to_string())]),
+            )])
+        };
+        let mut merged = BTreeMap::new();
+
+        merge_cpu_snapshots(&mut merged, snapshots("20"));
+        merge_cpu_snapshots(&mut merged, snapshots("10"));
+
+        assert_eq!(merged["group"]["name"], "10");
+    }
 
     fn schema_defs(schema: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
         schema["$defs"].as_object().expect("schema $defs object")

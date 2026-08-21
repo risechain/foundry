@@ -64,6 +64,7 @@ use foundry_evm::{
             FuzzRunIdentifiedContracts, InvariantContract, InvariantSettings, SenderFilters,
             TargetedContracts, is_optimization_invariant,
         },
+        merge_cpu_snapshots,
         strategies::EvmFuzzState,
     },
     inspectors::{CmpOperands, EdgeCovConfig, EdgeCovKind, cheatcodes::Vm::AccountAccess},
@@ -3795,6 +3796,9 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             result.gas_by_case.push((raw_call_result.gas_used, raw_call_result.stipend));
             result.logs.extend(raw_call_result.logs.clone());
             result.labels.extend(raw_call_result.labels.clone());
+            if let Some(cheatcodes) = &raw_call_result.cheatcodes {
+                merge_cpu_snapshots(&mut result.cpu_snapshots, cheatcodes.cpu_snapshots.clone());
+            }
             HitMaps::merge_opt(&mut result.line_coverage, raw_call_result.line_coverage.clone());
 
             let is_success =
@@ -5042,6 +5046,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                 invariant_count,
                 counterexample,
                 gas_report_traces: invariant_result.gas_report_traces,
+                cpu_snapshots: invariant_result.cpu_snapshots,
             },
         );
         if interrupted {

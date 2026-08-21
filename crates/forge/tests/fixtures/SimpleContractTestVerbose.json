@@ -10438,7 +10438,8 @@
         "labeled_addresses": {},
         "duration": "{...}",
         "breakpoints": {},
-        "gas_snapshots": {}
+        "gas_snapshots": {},
+        "cpu_snapshots": {}
       }
     },
     "warnings": []

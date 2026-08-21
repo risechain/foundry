@@ -71,7 +71,7 @@ use foundry_evm::{
     backend::Backend,
     core::evm::{EthEvmNetwork, FoundryEvmNetwork, TempoEvmNetwork},
     executors::{ExecutorBuilder, ShowmapDomain},
-    fuzz::{BaseCounterExample, BasicTxDetails, CounterExample},
+    fuzz::{BaseCounterExample, BasicTxDetails, CounterExample, merge_cpu_snapshots},
     opts::EvmOpts,
     traces::{
         backtrace::BacktraceBuilder, identifier::TraceIdentifiers, prune_trace_depth,
@@ -116,6 +116,16 @@ const DEBUGGER_MATCHING_TESTS_DISPLAY_LIMIT: usize = 12;
 const AUTO_FUZZ_FAILURE_DIR: &str = "fuzz";
 const AUTO_CORPUS_DIR: &str = "corpus";
 
+fn cpu_snapshot_path(snapshot_dir: &Path, group: &str) -> Result<PathBuf> {
+    let mut components = Path::new(group).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
+        bail!("invalid CPU snapshot group {group:?}: group must be a single path component");
+    }
+    Ok(snapshot_dir.join(format!("{group}.json")))
+}
 // Loads project's figment and merges the build cli arguments into it
 foundry_config::merge_impl_figment_convert!(TestArgs, build, evm);
 
@@ -599,6 +609,14 @@ pub struct TestArgs {
     /// Enable/disable recording of gas snapshot results.
     #[arg(long, env = "FORGE_SNAPSHOT_EMIT")]
     gas_snapshot_emit: Option<bool>,
+
+    /// Check CPU snapshots against previous runs.
+    #[arg(long, env = "FORGE_CPU_SNAPSHOT_CHECK")]
+    cpu_snapshot_check: Option<bool>,
+
+    /// Enable/disable recording of CPU snapshot results.
+    #[arg(long, env = "FORGE_CPU_SNAPSHOT_EMIT")]
+    cpu_snapshot_emit: Option<bool>,
 
     /// Exit with code 0 even if a test fails.
     #[arg(long, env = "FORGE_ALLOW_FAILURE")]
@@ -2516,14 +2534,17 @@ impl TestArgs {
             sh_println!("{rendered}")?;
 
             let mut gas_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();
+            let mut cpu_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();
             for result in results.values().flat_map(|suite| suite.test_results.values()) {
                 for (group, new_snapshots) in &result.gas_snapshots {
                     gas_snapshots.entry(group.clone()).or_default().extend(new_snapshots.clone());
                 }
+                merge_cpu_snapshots(&mut cpu_snapshots, result.cpu_snapshots.clone());
             }
             if !gas_snapshots.is_empty() {
                 self.check_and_write_gas_snapshots(&config, &gas_snapshots)?;
             }
+            self.check_and_write_cpu_snapshots(&config, &cpu_snapshots)?;
 
             return Ok(TestOutcome::new(
                 Some(runner.known_contracts),
@@ -2600,6 +2621,7 @@ impl TestArgs {
         });
 
         let mut gas_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();
+        let mut cpu_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();
 
         let mut outcome = TestOutcome::empty(None, self.allow_failure);
         outcome.fuzz_seed = fuzz_seed;
@@ -2800,6 +2822,7 @@ impl TestArgs {
                 for (group, new_snapshots) in &result.gas_snapshots {
                     gas_snapshots.entry(group.clone()).or_default().extend(new_snapshots.clone());
                 }
+                merge_cpu_snapshots(&mut cpu_snapshots, result.cpu_snapshots.clone());
             }
 
             // Print suite summary.
@@ -2820,6 +2843,7 @@ impl TestArgs {
         if !gas_snapshots.is_empty() {
             self.check_and_write_gas_snapshots(&config, &gas_snapshots)?;
         }
+        self.check_and_write_cpu_snapshots(&config, &cpu_snapshots)?;
 
         let regressions =
             self.emit_symbolic_regressions(&config, &known_contracts, &mut outcome.results)?;
@@ -2938,6 +2962,86 @@ impl TestArgs {
                     &snapshots,
                 )
                 .expect("Failed to write gas snapshots to disk");
+            }
+        }
+        Ok(())
+    }
+
+    /// Compares the collected CPU snapshots against the ones in `<snapshots>/cpu` and writes them
+    /// back, depending on `--cpu-snapshot-check` / `--cpu-snapshot-emit` and their config
+    /// defaults. Exits with code 1 if differences are found.
+    fn check_and_write_cpu_snapshots(
+        &self,
+        config: &Config,
+        cpu_snapshots: &BTreeMap<String, BTreeMap<String, String>>,
+    ) -> Result<()> {
+        if cpu_snapshots.is_empty() {
+            return Ok(());
+        }
+
+        let cpu_snapshots_dir = config.snapshots.join("cpu");
+        let cpu_snapshot_check = self.cpu_snapshot_check.unwrap_or(config.cpu_snapshot_check);
+        let cpu_snapshot_emit = self.cpu_snapshot_emit.unwrap_or(config.cpu_snapshot_emit);
+        let cpu_snapshot_paths = if cpu_snapshot_check || cpu_snapshot_emit {
+            cpu_snapshots
+                .keys()
+                .map(|group| {
+                    cpu_snapshot_path(&cpu_snapshots_dir, group).map(|path| (group.clone(), path))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?
+        } else {
+            BTreeMap::new()
+        };
+
+        if cpu_snapshot_check {
+            let differences_found =
+                cpu_snapshots.iter().fold(false, |mut found, (group, snapshots)| {
+                    let snapshot_path = &cpu_snapshot_paths[group];
+                    if !snapshot_path.exists() {
+                        return found;
+                    }
+
+                    let previous_snapshots: BTreeMap<String, String> =
+                        fs::read_json_file(snapshot_path)
+                            .expect("Failed to read CPU snapshots from disk");
+                    let diff: BTreeMap<_, _> = snapshots
+                        .iter()
+                        .filter_map(|(key, snapshot)| {
+                            previous_snapshots.get(key).and_then(|previous_snapshot| {
+                                (previous_snapshot != snapshot).then(|| {
+                                    (key.clone(), (previous_snapshot.clone(), snapshot.clone()))
+                                })
+                            })
+                        })
+                        .collect();
+
+                    if !diff.is_empty() {
+                        let _ = sh_eprintln!(
+                            "{}",
+                            format!("\n[CPU {group}] Failed to match snapshots:").red().bold()
+                        );
+                        for (key, (previous_snapshot, snapshot)) in &diff {
+                            let _ = sh_eprintln!(
+                                "{}",
+                                format!("- [{key}] {previous_snapshot} → {snapshot}").red()
+                            );
+                        }
+                        found = true;
+                    }
+                    found
+                });
+
+            if differences_found {
+                sh_eprintln!()?;
+                bail!("CPU snapshots differ from previous run");
+            }
+        }
+
+        if cpu_snapshot_emit {
+            fs::create_dir_all(&cpu_snapshots_dir)?;
+            for (group, snapshots) in cpu_snapshots {
+                fs::write_pretty_json_file(&cpu_snapshot_paths[group], snapshots)
+                    .expect("Failed to write CPU snapshots to disk");
             }
         }
         Ok(())
@@ -3813,6 +3917,20 @@ mod tests {
 
         let err = args.showmap_config().unwrap_err().to_string();
         assert!(err.contains("expected a single file-name component"), "{err}");
+    }
+
+    #[test]
+    fn cpu_snapshot_groups_must_be_single_path_components() {
+        let snapshot_dir = Path::new("snapshots/cpu");
+        assert_eq!(
+            cpu_snapshot_path(snapshot_dir, "group").unwrap(),
+            snapshot_dir.join("group.json")
+        );
+
+        for group in ["", ".", "..", "nested/group", "/tmp/result"] {
+            let err = cpu_snapshot_path(snapshot_dir, group).unwrap_err().to_string();
+            assert!(err.contains("group must be a single path component"), "{err}");
+        }
     }
 
     #[test]
