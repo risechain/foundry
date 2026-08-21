@@ -61,6 +61,7 @@ use foundry_evm::{
             FuzzRunIdentifiedContracts, InvariantContract, InvariantSettings, SenderFilters,
             is_optimization_invariant,
         },
+        merge_cpu_snapshots,
         strategies::EvmFuzzState,
     },
     inspectors::cheatcodes::Vm::AccountAccess,
@@ -3449,13 +3450,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             result.logs.extend(raw_call_result.logs.clone());
             result.labels.extend(raw_call_result.labels.clone());
             if let Some(cheatcodes) = &raw_call_result.cheatcodes {
-                for (group, snapshots) in &cheatcodes.cpu_snapshots {
-                    result
-                        .cpu_snapshots
-                        .entry(group.clone())
-                        .or_default()
-                        .extend(snapshots.clone());
-                }
+                merge_cpu_snapshots(&mut result.cpu_snapshots, cheatcodes.cpu_snapshots.clone());
             }
             HitMaps::merge_opt(&mut result.line_coverage, raw_call_result.line_coverage.clone());
 

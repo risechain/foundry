@@ -21,6 +21,7 @@ use foundry_evm_coverage::HitMaps;
 use foundry_evm_fuzz::{
     BasicTxDetails,
     invariant::{FuzzRunIdentifiedContracts, InvariantContract},
+    merge_cpu_snapshots,
 };
 use proptest::test_runner::TestError;
 use revm::interpreter::InstructionResult;
@@ -227,7 +228,7 @@ pub(crate) fn assert_invariants<'a, FEN: FoundryEvmNetwork>(
             invariant_contract.address,
             invariant.abi_encode_input(&[])?.into(),
         )?;
-        merge_cpu_snapshots(cpu_snapshots, &call_result);
+        merge_call_cpu_snapshots(cpu_snapshots, &call_result);
         if call_result.execution_cancelled {
             return Ok((first_broken, true));
         }
@@ -246,14 +247,12 @@ pub(crate) fn assert_invariants<'a, FEN: FoundryEvmNetwork>(
     Ok((first_broken, false))
 }
 
-pub(crate) fn merge_cpu_snapshots<FEN: FoundryEvmNetwork>(
+pub(crate) fn merge_call_cpu_snapshots<FEN: FoundryEvmNetwork>(
     cpu_snapshots: &mut BTreeMap<String, BTreeMap<String, String>>,
     call_result: &RawCallResult<FEN>,
 ) {
     let Some(cheatcodes) = &call_result.cheatcodes else { return };
-    for (group, snapshots) in &cheatcodes.cpu_snapshots {
-        cpu_snapshots.entry(group.clone()).or_default().extend(snapshots.clone());
-    }
+    merge_cpu_snapshots(cpu_snapshots, cheatcodes.cpu_snapshots.clone());
 }
 
 /// Helper function to initialize invariant inner sequence.
@@ -335,7 +334,7 @@ pub(crate) fn can_continue<'a, FEN: FoundryEvmNetwork>(
                 invariant_contract.address,
                 invariant_contract.anchor().abi_encode_input(&[])?.into(),
             )?;
-            merge_cpu_snapshots(&mut invariant_test.test_data.cpu_snapshots, &inv_result);
+            merge_call_cpu_snapshots(&mut invariant_test.test_data.cpu_snapshots, &inv_result);
             if inv_result.execution_cancelled {
                 return Ok(ContinueOutcome { continues: true, cancelled: true });
             }
@@ -472,7 +471,7 @@ pub(crate) fn assert_after_invariant<'a, FEN: FoundryEvmNetwork>(
 ) -> Result<(Option<&'a Function>, bool)> {
     let (call_result, success) =
         call_after_invariant_function(&invariant_run.executor, invariant_contract.address)?;
-    merge_cpu_snapshots(&mut invariant_test.test_data.cpu_snapshots, &call_result);
+    merge_call_cpu_snapshots(&mut invariant_test.test_data.cpu_snapshots, &call_result);
     if call_result.execution_cancelled {
         return Ok((None, true));
     }
@@ -503,7 +502,7 @@ mod tests {
     use crate::executors::{EarlyExit, ExecutorBuilder};
     use alloy_primitives::{Bytes, U256};
     use alloy_sol_types::SolCall;
-    use foundry_cheatcodes::{CheatsConfig, Vm::expectRevert_0Call};
+    use foundry_cheatcodes::{Cheatcodes, CheatsConfig, Vm::expectRevert_0Call};
     use foundry_config::Config;
     use foundry_evm_core::{
         backend::Backend,
@@ -520,6 +519,25 @@ mod tests {
         payload[..4].copy_from_slice(&[0x4e, 0x48, 0x7b, 0x71]);
         payload[35] = code;
         payload.into()
+    }
+
+    #[test]
+    fn repeated_cpu_snapshots_keep_the_minimum_measurement() {
+        let call_result = |value: &str| {
+            let mut cheatcodes = Cheatcodes::<EthEvmNetwork>::default();
+            cheatcodes
+                .cpu_snapshots
+                .entry("group".to_string())
+                .or_default()
+                .insert("name".to_string(), value.to_string());
+            RawCallResult { cheatcodes: Some(Box::new(cheatcodes)), ..Default::default() }
+        };
+        let mut snapshots = BTreeMap::new();
+
+        merge_call_cpu_snapshots(&mut snapshots, &call_result("20"));
+        merge_call_cpu_snapshots(&mut snapshots, &call_result("10"));
+
+        assert_eq!(snapshots["group"]["name"], "10");
     }
 
     #[test]

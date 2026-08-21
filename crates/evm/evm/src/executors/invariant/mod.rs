@@ -51,7 +51,7 @@ use proptest::{
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 pub(crate) use result::did_fail_on_assert;
 use result::{
-    assert_after_invariant, can_continue, invariant_preflight_check, merge_cpu_snapshots,
+    assert_after_invariant, can_continue, invariant_preflight_check, merge_call_cpu_snapshots,
 };
 use revm::state::Account;
 use serde::{Deserialize, Serialize};
@@ -1290,7 +1290,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                             current_run
                                 .fuzz_runs
                                 .push(FuzzCase { gas: result.gas_used, stipend: result.stipend });
-                            merge_cpu_snapshots(
+                            merge_call_cpu_snapshots(
                                 &mut invariant_test.test_data.cpu_snapshots,
                                 &result,
                             );

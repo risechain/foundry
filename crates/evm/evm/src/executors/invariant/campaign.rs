@@ -6,7 +6,7 @@ use crate::executors::{EarlyExit, EvmExecutionCancellation, corpus::CampaignCorp
 use alloy_primitives::{Address, I256, Selector};
 use eyre::{Result, ensure};
 use foundry_evm_coverage::HitMaps;
-use foundry_evm_fuzz::BasicTxDetails;
+use foundry_evm_fuzz::{BasicTxDetails, merge_cpu_snapshots};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
@@ -223,6 +223,7 @@ impl InvariantWorkerOutput {
 /// - predicate failures keep the first failure in logical run order;
 /// - handler assertion failures keep the shorter reproducer, with equal lengths preserving the
 ///   earlier logical worker;
+/// - repeated CPU snapshots keep the minimum observed measurement;
 /// - optimization mode keeps the maximum value, with ties preserving the earlier logical worker;
 /// - `failed_corpus_replays` is a master-worker-only value from worker `0`;
 /// - run/call counts, reverts, gas traces, selector metrics, and line coverage accumulate into the
@@ -313,9 +314,7 @@ fn fold_outputs(
         gas_report_traces.extend(result.gas_report_traces);
         HitMaps::merge_opt(&mut line_coverage, result.line_coverage);
         merge_metrics(&mut metrics, result.metrics);
-        for (group, snapshots) in result.cpu_snapshots {
-            cpu_snapshots.entry(group).or_default().extend(snapshots);
-        }
+        merge_cpu_snapshots(&mut cpu_snapshots, result.cpu_snapshots);
         merge_optimization(
             &mut optimization_best,
             result.optimization_best_value,
@@ -699,20 +698,31 @@ mod tests {
             .entry("shared".to_string())
             .or_default()
             .insert("first".to_string(), "1".to_string());
+        first
+            .cpu_snapshots
+            .entry("shared".to_string())
+            .or_default()
+            .insert("repeated".to_string(), "20".to_string());
         let mut second = empty_result(0, 0);
         second
             .cpu_snapshots
             .entry("shared".to_string())
             .or_default()
             .insert("second".to_string(), "2".to_string());
+        second
+            .cpu_snapshots
+            .entry("shared".to_string())
+            .or_default()
+            .insert("repeated".to_string(), "10".to_string());
 
         let mut aggregator = InvariantCampaignAggregator::new(spec);
-        aggregator.push(InvariantWorkerOutput::new(plans[0], first));
         aggregator.push(InvariantWorkerOutput::new(plans[1], second));
+        aggregator.push(InvariantWorkerOutput::new(plans[0], first));
         let result = aggregator.finish().unwrap();
 
         assert_eq!(result.cpu_snapshots["shared"]["first"], "1");
         assert_eq!(result.cpu_snapshots["shared"]["second"], "2");
+        assert_eq!(result.cpu_snapshots["shared"]["repeated"], "10");
     }
 
     #[test]

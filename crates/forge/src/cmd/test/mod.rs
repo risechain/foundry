@@ -70,7 +70,7 @@ use foundry_evm::{
         BlockEnvFor, EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TxEnvFor,
     },
     executors::ShowmapDomain,
-    fuzz::{BaseCounterExample, BasicTxDetails, CounterExample},
+    fuzz::{BaseCounterExample, BasicTxDetails, CounterExample, merge_cpu_snapshots},
     hardforks::{ExecutionSpec, TempoHardfork},
     opts::EvmOpts,
     traces::{
@@ -3280,9 +3280,7 @@ impl TestArgs {
                 for (group, new_snapshots) in &result.gas_snapshots {
                     gas_snapshots.entry(group.clone()).or_default().extend(new_snapshots.clone());
                 }
-                for (group, new_snapshots) in &result.cpu_snapshots {
-                    cpu_snapshots.entry(group.clone()).or_default().extend(new_snapshots.clone());
-                }
+                merge_cpu_snapshots(&mut cpu_snapshots, result.cpu_snapshots.clone());
             }
 
             // Write gas snapshots to disk if any were collected.

@@ -310,11 +310,28 @@ impl TestOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use foundry_evm::fuzz::merge_cpu_snapshots;
 
     const SYMBOLIC_RESULT_SCHEMA_JSON: &str =
         include_str!("../../evm/symbolic/assets/symbolic-result.schema.json");
     const SYMBOLIC_COUNTEREXAMPLE_SCHEMA_JSON: &str =
         include_str!("../../evm/symbolic/assets/symbolic-counterexample.schema.json");
+
+    #[test]
+    fn repeated_cpu_snapshots_keep_the_minimum_suite_measurement() {
+        let snapshots = |value: &str| {
+            BTreeMap::from([(
+                "group".to_string(),
+                BTreeMap::from([("name".to_string(), value.to_string())]),
+            )])
+        };
+        let mut merged = BTreeMap::new();
+
+        merge_cpu_snapshots(&mut merged, snapshots("20"));
+        merge_cpu_snapshots(&mut merged, snapshots("10"));
+
+        assert_eq!(merged["group"]["name"], "10");
+    }
 
     fn schema_defs(schema: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
         schema["$defs"].as_object().expect("schema $defs object")
