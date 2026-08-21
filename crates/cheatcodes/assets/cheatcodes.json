@@ -11940,6 +11940,46 @@
     },
     {
       "func": {
+        "id": "startSnapshotCpu_0",
+        "description": "Start a snapshot capture of the current thread CPU usage by name.\nThe group name is derived from the contract name.",
+        "declaration": "function startSnapshotCpu(string calldata name) external;",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "startSnapshotCpu(string)",
+        "selector": "0xe8b3cb91",
+        "selectorBytes": [
+          232,
+          179,
+          203,
+          145
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "unsafe"
+    },
+    {
+      "func": {
+        "id": "startSnapshotCpu_1",
+        "description": "Start a snapshot capture of the current thread CPU usage by name in a group.",
+        "declaration": "function startSnapshotCpu(string calldata group, string calldata name) external;",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "startSnapshotCpu(string,string)",
+        "selector": "0xc83c7c5e",
+        "selectorBytes": [
+          200,
+          60,
+          124,
+          94
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "unsafe"
+    },
+    {
+      "func": {
         "id": "startSnapshotGas_0",
         "description": "Start a snapshot capture of the current gas usage by name.\nThe group name is derived from the contract name.",
         "declaration": "function startSnapshotGas(string calldata name) external;",
@@ -12137,6 +12177,66 @@
       "group": "evm",
       "status": "stable",
       "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "stopSnapshotCpu_0",
+        "description": "Stop the snapshot capture of the current thread CPU usage by latest snapshot name, capturing the CPU nanoseconds used since the start.",
+        "declaration": "function stopSnapshotCpu() external returns (uint256 cpuUsed);",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "stopSnapshotCpu()",
+        "selector": "0x9505f2a0",
+        "selectorBytes": [
+          149,
+          5,
+          242,
+          160
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "unsafe"
+    },
+    {
+      "func": {
+        "id": "stopSnapshotCpu_1",
+        "description": "Stop the snapshot capture of the current thread CPU usage by name, capturing the CPU nanoseconds used since the start.\nThe group name is derived from the contract name.",
+        "declaration": "function stopSnapshotCpu(string calldata name) external returns (uint256 cpuUsed);",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "stopSnapshotCpu(string)",
+        "selector": "0xa468bfcd",
+        "selectorBytes": [
+          164,
+          104,
+          191,
+          205
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "unsafe"
+    },
+    {
+      "func": {
+        "id": "stopSnapshotCpu_2",
+        "description": "Stop the snapshot capture of the current thread CPU usage by name in a group, capturing the CPU nanoseconds used since the start.",
+        "declaration": "function stopSnapshotCpu(string calldata group, string calldata name) external returns (uint256 cpuUsed);",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "stopSnapshotCpu(string,string)",
+        "selector": "0x5c50885e",
+        "selectorBytes": [
+          92,
+          80,
+          136,
+          94
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "unsafe"
     },
     {
       "func": {

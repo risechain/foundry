@@ -53,7 +53,8 @@ use foundry_evm_core::{
     },
 };
 use foundry_evm_traces::{
-    TracingInspector, TracingInspectorConfig, identifier::SignaturesIdentifier,
+    CpuClock, SystemThreadCpuClock, TracingInspector, TracingInspectorConfig,
+    identifier::SignaturesIdentifier,
 };
 use foundry_wallets::wallet_multi::MultiWallet;
 use itertools::Itertools;
@@ -464,6 +465,102 @@ pub struct GasMetering {
     pub gas_records: Vec<GasRecord>,
 }
 
+/// Errors produced while recording a CPU snapshot.
+#[derive(Debug)]
+pub enum CpuSnapshotError {
+    /// Another snapshot is already active.
+    AlreadyStarted { group: String, name: String },
+    /// No active snapshot matches the requested group and name.
+    NotStarted { group: String, name: String },
+    /// Sampling the current thread CPU clock failed.
+    Clock(foundry_evm_traces::CpuClockError),
+}
+
+impl std::fmt::Display for CpuSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyStarted { group, name } => {
+                write!(f, "CPU snapshot was already started with group: {group} and name: {name}")
+            }
+            Self::NotStarted { group, name } => {
+                write!(f, "no CPU snapshot was started with the name: {name} in group: {group}")
+            }
+            Self::Clock(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for CpuSnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Clock(error) => Some(error),
+            Self::AlreadyStarted { .. } | Self::NotStarted { .. } => None,
+        }
+    }
+}
+
+impl From<foundry_evm_traces::CpuClockError> for CpuSnapshotError {
+    fn from(error: foundry_evm_traces::CpuClockError) -> Self {
+        Self::Clock(error)
+    }
+}
+
+/// Holds CPU snapshot metering state.
+#[derive(Clone, Debug)]
+pub struct CpuMetering<C = SystemThreadCpuClock> {
+    /// The group, name, and starting thread CPU timestamp of the active snapshot.
+    pub active_snapshot: Option<(String, String, u64)>,
+    /// Current-thread CPU clock used by snapshot cheatcodes.
+    pub clock: C,
+}
+
+impl Default for CpuMetering {
+    fn default() -> Self {
+        Self::with_clock(SystemThreadCpuClock)
+    }
+}
+
+impl<C> CpuMetering<C> {
+    /// Creates CPU snapshot metering backed by `clock`.
+    pub const fn with_clock(clock: C) -> Self {
+        Self { active_snapshot: None, clock }
+    }
+
+    /// Returns the active snapshot group and name.
+    pub fn active_name(&self) -> Option<(&str, &str)> {
+        self.active_snapshot.as_ref().map(|(group, name, _)| (group.as_str(), name.as_str()))
+    }
+}
+
+impl<C: CpuClock> CpuMetering<C> {
+    /// Starts a named CPU snapshot.
+    pub fn start(&mut self, group: String, name: String) -> Result<(), CpuSnapshotError> {
+        if let Some((group, name, _)) = &self.active_snapshot {
+            return Err(CpuSnapshotError::AlreadyStarted {
+                group: group.clone(),
+                name: name.clone(),
+            });
+        }
+        let start_ns = self.clock.now_ns()?;
+        self.active_snapshot = Some((group, name, start_ns));
+        Ok(())
+    }
+
+    /// Stops the matching CPU snapshot and returns its elapsed thread CPU nanoseconds.
+    pub fn stop(&mut self, group: &str, name: &str) -> Result<u64, CpuSnapshotError> {
+        let Some((active_group, active_name, start_ns)) = &self.active_snapshot else {
+            return Err(CpuSnapshotError::NotStarted { group: group.into(), name: name.into() });
+        };
+        if active_group != group || active_name != name {
+            return Err(CpuSnapshotError::NotStarted { group: group.into(), name: name.into() });
+        }
+        let start_ns = *start_ns;
+        let end_ns = self.clock.now_ns()?;
+        self.active_snapshot = None;
+        Ok(end_ns.saturating_sub(start_ns))
+    }
+}
+
 impl GasMetering {
     /// Start the gas recording.
     pub const fn start(&mut self) {
@@ -827,6 +924,13 @@ pub struct Cheatcodes<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     // **Note**: both must a BTreeMap to ensure the order of the keys is deterministic.
     pub gas_snapshots: BTreeMap<String, BTreeMap<String, String>>,
 
+    /// CPU snapshot metering state.
+    pub cpu_metering: CpuMetering,
+
+    /// Contains CPU snapshots made over the course of a test suite.
+    // **Note**: both must a BTreeMap to ensure the order of the keys is deterministic.
+    pub cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
+
     /// Mapping slots.
     pub mapping_slots: Option<AddressHashMap<MappingSlots>>,
 
@@ -974,6 +1078,8 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
             eth_deals: Default::default(),
             gas_metering: Default::default(),
             gas_snapshots: Default::default(),
+            cpu_metering: Default::default(),
+            cpu_snapshots: Default::default(),
             mapping_slots: Default::default(),
             pc: Default::default(),
             breakpoints: Default::default(),
@@ -4152,6 +4258,23 @@ const fn will_exit(action: &InterpreterAction) -> bool {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug)]
+    struct SequenceClock {
+        timestamps: VecDeque<u64>,
+    }
+
+    impl SequenceClock {
+        fn new(timestamps: impl IntoIterator<Item = u64>) -> Self {
+            Self { timestamps: timestamps.into_iter().collect() }
+        }
+    }
+
+    impl CpuClock for SequenceClock {
+        fn now_ns(&mut self) -> std::result::Result<u64, foundry_evm_traces::CpuClockError> {
+            self.timestamps.pop_front().ok_or(foundry_evm_traces::CpuClockError::Exhausted)
+        }
+    }
+
     fn cheats(flag: bool, broadcast: Option<Broadcast>) -> Cheatcodes {
         let config = CheatsConfig { batch_rewrite_creates: flag, ..Default::default() };
         let mut cheats = Cheatcodes::new(Arc::new(config));
@@ -4283,5 +4406,30 @@ mod tests {
         storage.cache_value(copied, slot, U256::ZERO);
 
         assert_eq!(storage.cached_value(source, slot), Some(U256::ZERO));
+    }
+
+    #[test]
+    fn cpu_metering_records_exact_duration_from_injected_clock() {
+        let mut metering = CpuMetering::with_clock(SequenceClock::new([100, 165]));
+
+        metering.start("group".into(), "name".into()).unwrap();
+
+        assert_eq!(metering.stop("group", "name").unwrap(), 65);
+    }
+
+    #[test]
+    fn rejected_cpu_snapshot_operations_do_not_consume_clock_samples() {
+        let mut metering = CpuMetering::with_clock(SequenceClock::new([100, 165]));
+        metering.start("group".into(), "name".into()).unwrap();
+
+        assert!(matches!(
+            metering.start("other".into(), "snapshot".into()),
+            Err(CpuSnapshotError::AlreadyStarted { .. })
+        ));
+        assert!(matches!(
+            metering.stop("other", "snapshot"),
+            Err(CpuSnapshotError::NotStarted { .. })
+        ));
+        assert_eq!(metering.stop("group", "name").unwrap(), 65);
     }
 }

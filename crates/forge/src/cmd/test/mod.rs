@@ -674,6 +674,14 @@ pub struct TestArgs {
     #[arg(long, env = "FORGE_SNAPSHOT_EMIT")]
     gas_snapshot_emit: Option<bool>,
 
+    /// Check CPU snapshots against previous runs.
+    #[arg(long, env = "FORGE_CPU_SNAPSHOT_CHECK")]
+    cpu_snapshot_check: Option<bool>,
+
+    /// Enable/disable recording of CPU snapshot results.
+    #[arg(long, env = "FORGE_CPU_SNAPSHOT_EMIT")]
+    cpu_snapshot_emit: Option<bool>,
+
     /// Exit with code 0 even if a test fails.
     #[arg(long, env = "FORGE_ALLOW_FAILURE")]
     allow_failure: bool,
@@ -3045,6 +3053,7 @@ impl TestArgs {
         });
 
         let mut gas_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();
+        let mut cpu_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();
 
         let mut outcome = TestOutcome::empty(None, self.allow_failure);
         outcome.fuzz_seed = fuzz_seed;
@@ -3260,6 +3269,9 @@ impl TestArgs {
                 for (group, new_snapshots) in &result.gas_snapshots {
                     gas_snapshots.entry(group.clone()).or_default().extend(new_snapshots.clone());
                 }
+                for (group, new_snapshots) in &result.cpu_snapshots {
+                    cpu_snapshots.entry(group.clone()).or_default().extend(new_snapshots.clone());
+                }
             }
 
             // Write gas snapshots to disk if any were collected.
@@ -3343,6 +3355,69 @@ impl TestArgs {
                             &snapshots,
                         )
                         .expect("Failed to write gas snapshots to disk");
+                    }
+                }
+            }
+
+            if !cpu_snapshots.is_empty() {
+                let cpu_snapshots_dir = config.snapshots.join("cpu");
+                if self.cpu_snapshot_check.unwrap_or(config.cpu_snapshot_check) {
+                    let differences_found =
+                        cpu_snapshots.iter().fold(false, |mut found, (group, snapshots)| {
+                            let snapshot_path = cpu_snapshots_dir.join(format!("{group}.json"));
+                            if !snapshot_path.exists() {
+                                return found;
+                            }
+
+                            let previous_snapshots: BTreeMap<String, String> =
+                                fs::read_json_file(&snapshot_path)
+                                    .expect("Failed to read CPU snapshots from disk");
+                            let diff: BTreeMap<_, _> = snapshots
+                                .iter()
+                                .filter_map(|(key, snapshot)| {
+                                    previous_snapshots.get(key).and_then(|previous_snapshot| {
+                                        (previous_snapshot != snapshot).then(|| {
+                                            (
+                                                key.clone(),
+                                                (previous_snapshot.clone(), snapshot.clone()),
+                                            )
+                                        })
+                                    })
+                                })
+                                .collect();
+
+                            if !diff.is_empty() {
+                                let _ = sh_eprintln!(
+                                    "{}",
+                                    format!("\n[CPU {group}] Failed to match snapshots:")
+                                        .red()
+                                        .bold()
+                                );
+                                for (key, (previous_snapshot, snapshot)) in &diff {
+                                    let _ = sh_eprintln!(
+                                        "{}",
+                                        format!("- [{key}] {previous_snapshot} → {snapshot}").red()
+                                    );
+                                }
+                                found = true;
+                            }
+                            found
+                        });
+
+                    if differences_found {
+                        sh_eprintln!()?;
+                        eyre::bail!("CPU snapshots differ from previous run");
+                    }
+                }
+
+                if self.cpu_snapshot_emit.unwrap_or(config.cpu_snapshot_emit) {
+                    fs::create_dir_all(&cpu_snapshots_dir)?;
+                    for (group, snapshots) in &cpu_snapshots {
+                        fs::write_pretty_json_file(
+                            &cpu_snapshots_dir.join(format!("{group}.json")),
+                            snapshots,
+                        )
+                        .expect("Failed to write CPU snapshots to disk");
                     }
                 }
             }

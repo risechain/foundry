@@ -240,12 +240,16 @@ pub struct Config {
     pub cache_path: PathBuf,
     /// Whether to dynamically link tests.
     pub dynamic_test_linking: bool,
-    /// Where the gas snapshots are stored.
+    /// Where gas and CPU snapshots are stored.
     pub snapshots: PathBuf,
     /// Whether to check for differences against previously stored gas snapshots.
     pub gas_snapshot_check: bool,
     /// Whether to emit gas snapshots to disk.
     pub gas_snapshot_emit: bool,
+    /// Whether to check for differences against previously stored CPU snapshots.
+    pub cpu_snapshot_check: bool,
+    /// Whether to emit CPU snapshots to disk.
+    pub cpu_snapshot_emit: bool,
     /// The path to store broadcast logs at.
     pub broadcast: PathBuf,
     /// Additional paths passed to `solc --allow-paths`.
@@ -2928,6 +2932,8 @@ impl Default for Config {
             snapshots: "snapshots".into(),
             gas_snapshot_check: false,
             gas_snapshot_emit: true,
+            cpu_snapshot_check: false,
+            cpu_snapshot_emit: true,
             allow_paths: vec![],
             include_paths: vec![],
             force: false,

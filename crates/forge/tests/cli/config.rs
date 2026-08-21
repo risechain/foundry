@@ -45,6 +45,8 @@ dynamic_test_linking = true
 snapshots = "snapshots"
 gas_snapshot_check = false
 gas_snapshot_emit = true
+cpu_snapshot_check = false
+cpu_snapshot_emit = true
 broadcast = "broadcast"
 allow_paths = []
 include_paths = []
@@ -323,6 +325,8 @@ forgetest!(can_extract_config_values, |prj, cmd| {
         snapshots: "snapshots".into(),
         gas_snapshot_check: false,
         gas_snapshot_emit: true,
+        cpu_snapshot_check: false,
+        cpu_snapshot_emit: true,
         broadcast: "broadcast".into(),
         force: true,
         evm_version: EvmVersion::Byzantium,
@@ -2087,6 +2091,8 @@ forgetest_init!(test_default_config, |prj, cmd| {
   "snapshots": "snapshots",
   "gas_snapshot_check": false,
   "gas_snapshot_emit": true,
+  "cpu_snapshot_check": false,
+  "cpu_snapshot_emit": true,
   "broadcast": "broadcast",
   "allow_paths": [],
   "include_paths": [],
@@ -2740,6 +2746,175 @@ contract GasSnapshotEmitTest is DSTest {
 
     // Assert that snapshots were not emitted to disk.
     assert!(!prj.root().join("snapshots/GasSnapshotEmitTest.json").exists());
+});
+
+forgetest_init!(test_cpu_snapshot_emit_default, |prj, cmd| {
+    prj.initialize_default_contracts();
+    cmd.forge_fuse().args(["config"]).assert_success().stdout_eq(str![[r#"
+...
+cpu_snapshot_emit = true
+...
+"#]]);
+    prj.insert_ds_test();
+
+    prj.add_source(
+        "CpuSnapshotEmitTest.sol",
+        r#"
+import "./test.sol";
+
+interface Vm {
+    function startSnapshotCpu(string memory name) external;
+    function stopSnapshotCpu() external returns (uint256);
+}
+
+contract CpuSnapshotEmitTest is DSTest {
+    Vm constant vm = Vm(HEVM_ADDRESS);
+
+    function testSnapshotCpuSection() public {
+        vm.startSnapshotCpu("testSection");
+        vm.stopSnapshotCpu();
+    }
+}
+    "#,
+    );
+
+    cmd.forge_fuse().args(["test"]).assert_success();
+    let snapshot = prj.root().join("snapshots/cpu/CpuSnapshotEmitTest.json");
+    assert!(snapshot.exists());
+
+    fs::remove_file(&snapshot).unwrap();
+    cmd.forge_fuse().args(["test", "--cpu-snapshot-emit=false"]).assert_success();
+    assert!(!snapshot.exists());
+
+    cmd.forge_fuse();
+    cmd.env("FORGE_CPU_SNAPSHOT_EMIT", "false");
+    cmd.args(["test"]).assert_success();
+    assert!(!snapshot.exists());
+
+    cmd.forge_fuse();
+    cmd.env("FORGE_CPU_SNAPSHOT_EMIT", "false");
+    cmd.args(["test", "--cpu-snapshot-emit=true"]).assert_success();
+    assert!(snapshot.exists());
+
+    fs::remove_file(&snapshot).unwrap();
+    prj.update_config(|config| config.cpu_snapshot_emit = false);
+    cmd.forge_fuse().args(["test"]).assert_success();
+    assert!(!snapshot.exists());
+
+    cmd.forge_fuse().args(["test", "--cpu-snapshot-emit=true"]).assert_success();
+    assert!(snapshot.exists());
+});
+
+forgetest_init!(test_cpu_snapshot_check_config, |prj, cmd| {
+    prj.initialize_default_contracts();
+    cmd.forge_fuse().args(["config"]).assert_success().stdout_eq(str![[r#"
+...
+cpu_snapshot_check = false
+...
+"#]]);
+    prj.insert_ds_test();
+
+    prj.add_source(
+        "CpuSnapshotCheckTest.sol",
+        r#"
+import "./test.sol";
+
+interface Vm {
+    function startSnapshotCpu(string memory name) external;
+    function stopSnapshotCpu() external returns (uint256);
+}
+
+contract CpuSnapshotCheckTest is DSTest {
+    Vm constant vm = Vm(HEVM_ADDRESS);
+
+    function testSnapshotCpuSection() public {
+        vm.startSnapshotCpu("testSection");
+        vm.stopSnapshotCpu();
+    }
+}
+    "#,
+    );
+
+    cmd.forge_fuse().args(["test"]).assert_success();
+    let snapshot = prj.root().join("snapshots/cpu/CpuSnapshotCheckTest.json");
+    let mismatching = r#"{
+  "testSection": "18446744073709551615"
+}"#;
+    fs::write(&snapshot, mismatching).unwrap();
+
+    prj.update_config(|config| config.cpu_snapshot_check = true);
+    cmd.forge_fuse().args(["test"]).assert_failure().stderr_eq(str![[r#"
+...
+[CPU CpuSnapshotCheckTest] Failed to match snapshots:
+- [testSection] 18446744073709551615 → [..]
+
+Error: CPU snapshots differ from previous run
+...
+"#]]);
+    assert_eq!(fs::read_to_string(&snapshot).unwrap(), mismatching);
+
+    cmd.forge_fuse().args(["test", "--cpu-snapshot-check=false"]).assert_success();
+
+    fs::write(&snapshot, mismatching).unwrap();
+    prj.update_config(|config| config.cpu_snapshot_check = false);
+    cmd.forge_fuse();
+    cmd.env("FORGE_CPU_SNAPSHOT_CHECK", "true");
+    cmd.args(["test"]).assert_failure();
+
+    cmd.forge_fuse();
+    cmd.env("FORGE_CPU_SNAPSHOT_CHECK", "false");
+    cmd.args(["test", "--cpu-snapshot-check=true"]).assert_failure();
+
+    cmd.forge_fuse();
+    cmd.env("FORGE_CPU_SNAPSHOT_CHECK", "true");
+    cmd.args(["test", "--cpu-snapshot-check=false"]).assert_success();
+});
+
+forgetest_init!(test_cpu_snapshot_named_overloads, |prj, cmd| {
+    prj.initialize_default_contracts();
+    prj.insert_ds_test();
+
+    prj.add_source(
+        "CpuSnapshotOverloadTest.sol",
+        r#"
+import "./test.sol";
+
+interface Vm {
+    function startSnapshotCpu(string memory name) external;
+    function startSnapshotCpu(string memory group, string memory name) external;
+    function stopSnapshotCpu(string memory name) external returns (uint256);
+    function stopSnapshotCpu(string memory group, string memory name) external returns (uint256);
+}
+
+contract CpuSnapshotOverloadTest is DSTest {
+    Vm constant vm = Vm(HEVM_ADDRESS);
+
+    function testExplicitGroup() public {
+        vm.startSnapshotCpu("custom", "explicit");
+        vm.stopSnapshotCpu("custom", "explicit");
+    }
+
+    function testImplicitGroup() public {
+        vm.startSnapshotCpu("implicit");
+        vm.stopSnapshotCpu("implicit");
+    }
+}
+    "#,
+    );
+
+    cmd.forge_fuse().args(["test"]).assert_success();
+
+    let custom: Value = serde_json::from_str(
+        &fs::read_to_string(prj.root().join("snapshots/cpu/custom.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(custom.get("explicit").and_then(Value::as_str).is_some());
+
+    let implicit: Value = serde_json::from_str(
+        &fs::read_to_string(prj.root().join("snapshots/cpu/CpuSnapshotOverloadTest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(implicit.get("implicit").and_then(Value::as_str).is_some());
 });
 
 // Tests compilation restrictions enables optimizer if optimizer runs set to a value higher than 0.

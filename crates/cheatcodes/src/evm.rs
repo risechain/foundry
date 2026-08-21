@@ -1036,6 +1036,41 @@ impl Cheatcode for stopSnapshotGas_2Call {
     }
 }
 
+impl Cheatcode for startSnapshotCpu_0Call {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let Self { name } = self;
+        inner_start_cpu_snapshot(ccx, None, Some(name.clone()))
+    }
+}
+
+impl Cheatcode for startSnapshotCpu_1Call {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let Self { group, name } = self;
+        inner_start_cpu_snapshot(ccx, Some(group.clone()), Some(name.clone()))
+    }
+}
+
+impl Cheatcode for stopSnapshotCpu_0Call {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let Self {} = self;
+        inner_stop_cpu_snapshot(ccx, None, None)
+    }
+}
+
+impl Cheatcode for stopSnapshotCpu_1Call {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let Self { name } = self;
+        inner_stop_cpu_snapshot(ccx, None, Some(name.clone()))
+    }
+}
+
+impl Cheatcode for stopSnapshotCpu_2Call {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let Self { group, name } = self;
+        inner_stop_cpu_snapshot(ccx, Some(group.clone()), Some(name.clone()))
+    }
+}
+
 // Deprecated in favor of `snapshotStateCall`
 impl Cheatcode for snapshotCall {
     fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
@@ -1834,6 +1869,36 @@ fn inner_stop_gas_snapshot<FEN: FoundryEvmNetwork>(
     } else {
         bail!("no gas snapshot was started with the name: {name} in group: {group}");
     }
+}
+
+fn inner_start_cpu_snapshot<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
+    group: Option<String>,
+    name: Option<String>,
+) -> Result {
+    let (group, name) = derive_snapshot_name(ccx, group, name);
+    ccx.state.cpu_metering.start(group, name).map_err(|error| fmt_err!("{error}"))?;
+    Ok(Default::default())
+}
+
+fn inner_stop_cpu_snapshot<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
+    group: Option<String>,
+    name: Option<String>,
+) -> Result {
+    let (group, name) = group
+        .zip(name)
+        .or_else(|| {
+            ccx.state
+                .cpu_metering
+                .active_name()
+                .map(|(group, name)| (group.to_string(), name.to_string()))
+        })
+        .ok_or_else(|| fmt_err!("no active CPU snapshot; call `startSnapshotCpu` first"))?;
+    let value = ccx.state.cpu_metering.stop(&group, &name).map_err(|error| fmt_err!("{error}"))?;
+
+    ccx.state.cpu_snapshots.entry(group).or_default().insert(name, value.to_string());
+    Ok(value.abi_encode())
 }
 
 // Derives the snapshot group and name from the provided group and name or the running contract.
