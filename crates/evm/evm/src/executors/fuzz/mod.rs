@@ -25,7 +25,7 @@ use foundry_evm_core::{
 use foundry_evm_coverage::HitMaps;
 use foundry_evm_fuzz::{
     BaseCounterExample, BasicTxDetails, CallDetails, CounterExample, FuzzCase, FuzzError,
-    FuzzFixtures, FuzzRunMetadata, FuzzTestResult,
+    FuzzFixtures, FuzzRunMetadata, FuzzTestResult, merge_cpu_snapshots,
     strategies::{EvmFuzzState, TxGenerator},
 };
 use foundry_evm_traces::SparsedTraceArena;
@@ -34,6 +34,7 @@ use proptest::test_runner::{RngAlgorithm, TestCaseError, TestRng, TestRunner};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde_json::json;
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU32, Ordering},
@@ -74,6 +75,8 @@ struct WorkerState<FEN: FoundryEvmNetwork> {
     coverage: Option<HitMaps>,
     /// Logs from all cases this worker ran
     logs: Vec<Log>,
+    /// CPU snapshots captured by this worker.
+    cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
     /// Deprecated cheatcodes seen by this worker
     deprecated_cheatcodes: HashMap<&'static str, Option<&'static str>>,
     /// Number of runs this worker completed
@@ -104,6 +107,7 @@ impl<FEN: FoundryEvmNetwork> WorkerState<FEN> {
             breakpoints: None,
             coverage: None,
             logs: Vec::new(),
+            cpu_snapshots: BTreeMap::new(),
             deprecated_cheatcodes: HashMap::default(),
             runs: 0,
             failure: None,
@@ -331,9 +335,13 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             return Ok(FuzzTestResult { skipped: true, reason: reason.0, ..Default::default() });
         }
 
-        let (breakpoints, deprecated_cheatcodes) =
+        let (breakpoints, deprecated_cheatcodes, cpu_snapshots) =
             call.cheatcodes.as_ref().map_or_else(Default::default, |cheats| {
-                (cheats.breakpoints.clone(), cheats.deprecated.clone())
+                (
+                    cheats.breakpoints.clone(),
+                    cheats.deprecated.clone(),
+                    cheats.cpu_snapshots.clone(),
+                )
             });
         let success = should_ignore_revert(
             self.config.fail_on_revert,
@@ -348,6 +356,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             traces: call.traces.clone(),
             debug_bytecodes: call.debug_bytecodes.clone(),
             breakpoints: Some(breakpoints),
+            cpu_snapshots,
             deprecated_cheatcodes,
             fork_block_number: call.fork_block_number,
             ..Default::default()
@@ -455,9 +464,13 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             return Err(TestCaseError::reject(FuzzError::AssumeReject));
         }
 
-        let (breakpoints, deprecated_cheatcodes) =
+        let (breakpoints, deprecated_cheatcodes, cpu_snapshots) =
             call.cheatcodes.as_ref().map_or_else(Default::default, |cheats| {
-                (cheats.breakpoints.clone(), cheats.deprecated.clone())
+                (
+                    cheats.breakpoints.clone(),
+                    cheats.deprecated.clone(),
+                    cheats.cpu_snapshots.clone(),
+                )
             });
 
         // Consider call success if test should not fail on reverts and reverter is not the test
@@ -477,6 +490,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 coverage: call.line_coverage,
                 breakpoints,
                 logs: call.logs,
+                cpu_snapshots,
                 deprecated_cheatcodes,
             }))
         } else {
@@ -554,6 +568,9 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 result.traces.clone_from(&call.traces);
                 result.debug_bytecodes.clone_from(&call.debug_bytecodes);
                 result.breakpoints = call.cheatcodes.as_ref().map(|c| c.breakpoints.clone());
+                if let Some(cheatcodes) = &call.cheatcodes {
+                    result.cpu_snapshots.clone_from(&cheatcodes.cpu_snapshots);
+                }
                 result.fork_block_number = call.fork_block_number;
             }
 
@@ -595,6 +612,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             result.logs = workers[output_worker_idx].logs.clone();
         }
 
+        let mut campaign_cpu_snapshots = BTreeMap::new();
         for mut worker in workers {
             result.gas_by_case.append(&mut worker.gas_by_case);
             if self.config.show_logs {
@@ -602,7 +620,20 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             }
             result.gas_report_traces.extend(worker.traces.into_iter().map(|t| t.arena));
             HitMaps::merge_opt(&mut result.line_coverage, worker.coverage);
+            merge_cpu_snapshots(&mut campaign_cpu_snapshots, worker.cpu_snapshots);
             result.deprecated_cheatcodes.extend(worker.deprecated_cheatcodes);
+        }
+        if result.success {
+            result.cpu_snapshots = campaign_cpu_snapshots;
+        } else {
+            // Keep measurements from the failing call for repeated names while retaining unique
+            // snapshots captured by successful campaign calls.
+            for (group, snapshots) in campaign_cpu_snapshots {
+                let result_group = result.cpu_snapshots.entry(group).or_default();
+                for (name, value) in snapshots {
+                    result_group.entry(name).or_insert(value);
+                }
+            }
         }
 
         if let Some(reason) = &result.reason
@@ -895,6 +926,8 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                             worker.logs = case.logs;
                         }
 
+                        merge_cpu_snapshots(&mut worker.cpu_snapshots, case.cpu_snapshots);
+
                         HitMaps::merge_opt(&mut worker.coverage, case.coverage);
                         worker.deprecated_cheatcodes = case.deprecated_cheatcodes;
                     }
@@ -1006,5 +1039,26 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
     /// Derives the deterministic RNG seed for cheatcode randomness in a worker-local run.
     fn fuzz_run_seed(seed: U256, worker_id: usize, run: u32) -> U256 {
         Self::fuzz_worker_seed(seed, worker_id).wrapping_add(U256::from(run.saturating_sub(1)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_cpu_snapshots_keep_the_minimum_fuzz_measurement() {
+        let snapshots = |value: &str| {
+            BTreeMap::from([(
+                "group".to_string(),
+                BTreeMap::from([("name".to_string(), value.to_string())]),
+            )])
+        };
+        let mut merged = BTreeMap::new();
+
+        merge_cpu_snapshots(&mut merged, snapshots("20"));
+        merge_cpu_snapshots(&mut merged, snapshots("10"));
+
+        assert_eq!(merged["group"]["name"], "10");
     }
 }

@@ -888,6 +888,30 @@ interface Vm {
     #[cheatcode(group = Evm, safety = Unsafe)]
     function stopSnapshotGas(string calldata group, string calldata name) external returns (uint256 gasUsed);
 
+    // -------- CPU Snapshots --------
+
+    /// Start a snapshot capture of the current thread CPU usage by name.
+    /// The group name is derived from the contract name.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function startSnapshotCpu(string calldata name) external;
+
+    /// Start a snapshot capture of the current thread CPU usage by name in a group.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function startSnapshotCpu(string calldata group, string calldata name) external;
+
+    /// Stop the snapshot capture of the current thread CPU usage by latest snapshot name, capturing the CPU nanoseconds used since the start.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function stopSnapshotCpu() external returns (uint256 cpuUsed);
+
+    /// Stop the snapshot capture of the current thread CPU usage by name, capturing the CPU nanoseconds used since the start.
+    /// The group name is derived from the contract name.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function stopSnapshotCpu(string calldata name) external returns (uint256 cpuUsed);
+
+    /// Stop the snapshot capture of the current thread CPU usage by name in a group, capturing the CPU nanoseconds used since the start.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function stopSnapshotCpu(string calldata group, string calldata name) external returns (uint256 cpuUsed);
+
     // -------- State Snapshots --------
 
     /// `snapshot` is being deprecated in favor of `snapshotState`. It will be removed in future versions.

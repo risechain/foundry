@@ -21,11 +21,15 @@ use foundry_evm_coverage::HitMaps;
 use foundry_evm_fuzz::{
     BasicTxDetails,
     invariant::{FuzzRunIdentifiedContracts, InvariantContract},
+    merge_cpu_snapshots,
 };
 use proptest::test_runner::TestError;
 use revm::interpreter::InstructionResult;
 use revm_inspectors::tracing::CallTraceArena;
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+};
 
 /// The outcome of an invariant fuzz test
 #[derive(Debug)]
@@ -50,6 +54,8 @@ pub struct InvariantFuzzTestResult {
     pub line_coverage: Option<HitMaps>,
     /// Fuzzed selectors metrics collected during the invariant test runs.
     pub metrics: HashMap<String, InvariantMetrics>,
+    /// CPU snapshots collected during the invariant test runs.
+    pub cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
     /// Number of failed replays from persisted corpus.
     pub failed_corpus_replays: usize,
     /// Actual number of workers used for this logical campaign.
@@ -75,6 +81,7 @@ impl InvariantFuzzTestResult {
         gas_report_traces: Vec<Vec<CallTraceArena>>,
         line_coverage: Option<HitMaps>,
         metrics: HashMap<String, InvariantMetrics>,
+        cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
         failed_corpus_replays: usize,
         workers: usize,
         optimization_best_value: Option<I256>,
@@ -99,6 +106,7 @@ impl InvariantFuzzTestResult {
             gas_report_traces,
             line_coverage,
             metrics,
+            cpu_snapshots,
             failed_corpus_replays,
             workers,
             fork_block_number,
@@ -118,7 +126,8 @@ pub(crate) fn invariant_preflight_check<FEN: FoundryEvmNetwork>(
     executor: &Executor<FEN>,
     calldata: &[BasicTxDetails],
     invariant_failures: &mut InvariantFailures,
-) -> Result<()> {
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+    let mut cpu_snapshots = BTreeMap::new();
     assert_invariants(
         invariant_contract,
         invariant_config,
@@ -126,8 +135,9 @@ pub(crate) fn invariant_preflight_check<FEN: FoundryEvmNetwork>(
         executor,
         calldata,
         invariant_failures,
+        &mut cpu_snapshots,
     )?;
-    Ok(())
+    Ok(cpu_snapshots)
 }
 
 /// Returns true if this call failed due to a Solidity assertion:
@@ -196,6 +206,7 @@ pub(crate) fn assert_invariants<'a, FEN: FoundryEvmNetwork>(
     executor: &Executor<FEN>,
     calldata: &[BasicTxDetails],
     invariant_failures: &mut InvariantFailures,
+    cpu_snapshots: &mut BTreeMap<String, BTreeMap<String, String>>,
 ) -> Result<(Option<&'a Function>, bool)> {
     let mut inner_sequence = None;
     let mut first_broken: Option<&'a Function> = None;
@@ -217,6 +228,7 @@ pub(crate) fn assert_invariants<'a, FEN: FoundryEvmNetwork>(
             invariant_contract.address,
             invariant.abi_encode_input(&[])?.into(),
         )?;
+        merge_call_cpu_snapshots(cpu_snapshots, &call_result);
         if call_result.execution_cancelled {
             return Ok((first_broken, true));
         }
@@ -233,6 +245,14 @@ pub(crate) fn assert_invariants<'a, FEN: FoundryEvmNetwork>(
     }
 
     Ok((first_broken, false))
+}
+
+pub(crate) fn merge_call_cpu_snapshots<FEN: FoundryEvmNetwork>(
+    cpu_snapshots: &mut BTreeMap<String, BTreeMap<String, String>>,
+    call_result: &RawCallResult<FEN>,
+) {
+    let Some(cheatcodes) = &call_result.cheatcodes else { return };
+    merge_cpu_snapshots(cpu_snapshots, cheatcodes.cpu_snapshots.clone());
 }
 
 /// Helper function to initialize invariant inner sequence.
@@ -314,6 +334,7 @@ pub(crate) fn can_continue<'a, FEN: FoundryEvmNetwork>(
                 invariant_contract.address,
                 invariant_contract.anchor().abi_encode_input(&[])?.into(),
             )?;
+            merge_call_cpu_snapshots(&mut invariant_test.test_data.cpu_snapshots, &inv_result);
             if inv_result.execution_cancelled {
                 return Ok(ContinueOutcome { continues: true, cancelled: true });
             }
@@ -337,6 +358,7 @@ pub(crate) fn can_continue<'a, FEN: FoundryEvmNetwork>(
                 &invariant_run.executor,
                 &invariant_run.inputs,
                 &mut invariant_test.test_data.failures,
+                &mut invariant_test.test_data.cpu_snapshots,
             )?;
             if cancelled {
                 return Ok(ContinueOutcome { continues: true, cancelled: true });
@@ -449,6 +471,7 @@ pub(crate) fn assert_after_invariant<'a, FEN: FoundryEvmNetwork>(
 ) -> Result<(Option<&'a Function>, bool)> {
     let (call_result, success) =
         call_after_invariant_function(&invariant_run.executor, invariant_contract.address)?;
+    merge_call_cpu_snapshots(&mut invariant_test.test_data.cpu_snapshots, &call_result);
     if call_result.execution_cancelled {
         return Ok((None, true));
     }
@@ -479,7 +502,7 @@ mod tests {
     use crate::executors::{EarlyExit, ExecutorBuilder};
     use alloy_primitives::{Bytes, U256};
     use alloy_sol_types::SolCall;
-    use foundry_cheatcodes::{CheatsConfig, Vm::expectRevert_0Call};
+    use foundry_cheatcodes::{Cheatcodes, CheatsConfig, Vm::expectRevert_0Call};
     use foundry_config::Config;
     use foundry_evm_core::{
         backend::Backend,
@@ -496,6 +519,25 @@ mod tests {
         payload[..4].copy_from_slice(&[0x4e, 0x48, 0x7b, 0x71]);
         payload[35] = code;
         payload.into()
+    }
+
+    #[test]
+    fn repeated_cpu_snapshots_keep_the_minimum_measurement() {
+        let call_result = |value: &str| {
+            let mut cheatcodes = Cheatcodes::<EthEvmNetwork>::default();
+            cheatcodes
+                .cpu_snapshots
+                .entry("group".to_string())
+                .or_default()
+                .insert("name".to_string(), value.to_string());
+            RawCallResult { cheatcodes: Some(Box::new(cheatcodes)), ..Default::default() }
+        };
+        let mut snapshots = BTreeMap::new();
+
+        merge_call_cpu_snapshots(&mut snapshots, &call_result("20"));
+        merge_call_cpu_snapshots(&mut snapshots, &call_result("10"));
+
+        assert_eq!(snapshots["group"]["name"], "10");
     }
 
     #[test]
@@ -554,6 +596,7 @@ mod tests {
 
         let targets = FuzzRunIdentifiedContracts::new(TargetedContracts::new(), false);
         let mut failures = InvariantFailures::new();
+        let mut cpu_snapshots = BTreeMap::new();
         let broken = assert_invariants(
             &invariant_contract,
             &InvariantConfig::default(),
@@ -561,6 +604,7 @@ mod tests {
             &executor,
             &[],
             &mut failures,
+            &mut cpu_snapshots,
         )
         .unwrap();
 

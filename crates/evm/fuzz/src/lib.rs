@@ -19,7 +19,7 @@ use foundry_evm_coverage::HitMaps;
 use foundry_evm_traces::{CallTraceArena, SparsedTraceArena};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 pub use proptest::test_runner::{Config as FuzzConfig, Reason};
 
@@ -52,6 +52,37 @@ impl FuzzRunMetadata {
     /// Creates metadata for reproducing a fuzz run.
     pub const fn new(seed: Option<U256>, run: Option<u32>, worker: Option<u32>) -> Self {
         Self { seed, run, worker }
+    }
+}
+
+/// Merges CPU snapshot measurements by retaining the minimum elapsed nanoseconds for each name.
+///
+/// This aggregation is associative and commutative, so repeated fuzz and invariant measurements
+/// do not depend on worker completion order.
+pub fn merge_cpu_snapshots(
+    cpu_snapshots: &mut BTreeMap<String, BTreeMap<String, String>>,
+    new_snapshots: BTreeMap<String, BTreeMap<String, String>>,
+) {
+    for (group, snapshots) in new_snapshots {
+        let group_snapshots = cpu_snapshots.entry(group).or_default();
+        for (name, value) in snapshots {
+            match group_snapshots.entry(name) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(value);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let current = entry
+                        .get()
+                        .parse::<u64>()
+                        .expect("CPU snapshot values are decimal u64 strings");
+                    let candidate =
+                        value.parse::<u64>().expect("CPU snapshot values are decimal u64 strings");
+                    if candidate < current {
+                        entry.insert(value);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -379,6 +410,9 @@ pub struct FuzzTestResult {
 
     /// Breakpoints for debugger. Correspond to the same fuzz case as `traces`.
     pub breakpoints: Option<Breakpoints>,
+
+    /// CPU snapshots captured across fuzz cases.
+    pub cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
 
     /// Runtime bytecodes for contracts seen in the debug trace.
     pub debug_bytecodes: AddressHashMap<Bytes>,

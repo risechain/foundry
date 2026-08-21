@@ -61,6 +61,7 @@ use foundry_evm::{
             FuzzRunIdentifiedContracts, InvariantContract, InvariantSettings, SenderFilters,
             is_optimization_invariant,
         },
+        merge_cpu_snapshots,
         strategies::EvmFuzzState,
     },
     inspectors::cheatcodes::Vm::AccountAccess,
@@ -3106,6 +3107,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                                     0,
                                     1,
                                     None,
+                                    Default::default(),
                                 );
                             } else {
                                 let signature = invariant.signature();
@@ -3447,6 +3449,9 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             result.gas_by_case.push((raw_call_result.gas_used, raw_call_result.stipend));
             result.logs.extend(raw_call_result.logs.clone());
             result.labels.extend(raw_call_result.labels.clone());
+            if let Some(cheatcodes) = &raw_call_result.cheatcodes {
+                merge_cpu_snapshots(&mut result.cpu_snapshots, cheatcodes.cpu_snapshots.clone());
+            }
             HitMaps::merge_opt(&mut result.line_coverage, raw_call_result.line_coverage.clone());
 
             let is_success =
@@ -4295,6 +4300,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                                                 failed_corpus_replays,
                                                 symbolic_workers,
                                                 None,
+                                                Default::default(),
                                             );
 
                                             let mut symbolic_result =
@@ -4853,6 +4859,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             invariant_result.failed_corpus_replays,
             invariant_result.workers,
             invariant_result.optimization_best_value,
+            invariant_result.cpu_snapshots,
         );
         self.result
     }

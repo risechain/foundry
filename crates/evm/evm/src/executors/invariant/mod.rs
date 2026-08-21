@@ -50,12 +50,14 @@ use proptest::{
 };
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 pub(crate) use result::did_fail_on_assert;
-use result::{assert_after_invariant, can_continue, invariant_preflight_check};
+use result::{
+    assert_after_invariant, can_continue, invariant_preflight_check, merge_call_cpu_snapshots,
+};
 use revm::state::Account;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap as Map, HashSet, btree_map::Entry},
+    collections::{BTreeMap, HashMap as Map, HashSet, btree_map::Entry},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -597,6 +599,8 @@ struct InvariantTestData {
     line_coverage: Option<HitMaps>,
     // Metrics for each fuzzed selector.
     metrics: Map<String, InvariantMetrics>,
+    // CPU snapshots collected during invariant calls.
+    cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
     // Cache from fuzzed (target, selector) to its metric key. Only resolved keys are cached and
     // they are invalidated when targets change (see `invalidate_metric_key_cache`).
     metric_key_cache: Map<(Address, Selector), String>,
@@ -629,6 +633,7 @@ impl InvariantTest {
         fuzz_state: FuzzState,
         targeted_contracts: FuzzRunIdentifiedContracts,
         failures: InvariantFailures,
+        cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
         branch_runner: TestRunner,
     ) -> Self {
         let test_data = InvariantTestData {
@@ -639,6 +644,7 @@ impl InvariantTest {
             gas_report_traces: vec![],
             line_coverage: None,
             metrics: Map::default(),
+            cpu_snapshots,
             metric_key_cache: Map::default(),
             branch_runner,
             optimization_best_value: None,
@@ -1284,6 +1290,10 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                             current_run
                                 .fuzz_runs
                                 .push(FuzzCase { gas: result.gas_used, stipend: result.stipend });
+                            merge_call_cpu_snapshots(
+                                &mut invariant_test.test_data.cpu_snapshots,
+                                &result,
+                            );
 
                             let continues = if should_check {
                                 let outcome = can_continue(
@@ -1612,6 +1622,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             result.gas_report_traces,
             result.line_coverage,
             result.metrics,
+            result.cpu_snapshots,
             if plan.worker_id == 0 { corpus_manager.failed_replays } else { 0 },
             1,
             result.optimization_best_value,
@@ -1757,7 +1768,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         for (&(addr, sel), err) in &campaign_seed.initial_handler_failures {
             failures.seed_handler_failure(addr, sel, err.clone());
         }
-        invariant_preflight_check(
+        let cpu_snapshots = invariant_preflight_check(
             invariant_contract,
             config,
             &targeted_contracts,
@@ -1828,8 +1839,13 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             }
         }
 
-        let mut invariant_test =
-            InvariantTest::new(fuzz_state, targeted_contracts, failures, runner.clone());
+        let mut invariant_test = InvariantTest::new(
+            fuzz_state,
+            targeted_contracts,
+            failures,
+            cpu_snapshots,
+            runner.clone(),
+        );
 
         // Seed invariant test with previously persisted optimization state,
         // but only if the current invariant is in optimization mode. Persisted optimization state
