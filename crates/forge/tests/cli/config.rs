@@ -2937,6 +2937,101 @@ contract CpuSnapshotOverloadTest is DSTest {
     assert!(implicit.get("table").and_then(Value::as_str).is_some());
 });
 
+forgetest_init!(test_cpu_snapshot_invariant_results, |prj, cmd| {
+    prj.initialize_default_contracts();
+    prj.insert_ds_test();
+
+    prj.add_source(
+        "CpuSnapshotInvariantTest.sol",
+        r#"
+import "./test.sol";
+
+interface Vm {
+    function startSnapshotCpu(string memory name) external;
+    function startSnapshotCpu(string memory group, string memory name) external;
+    function stopSnapshotCpu(string memory name) external returns (uint256);
+    function stopSnapshotCpu(string memory group, string memory name) external returns (uint256);
+}
+
+contract CpuSnapshotHandler {
+    Vm immutable vm;
+
+    constructor(Vm vm_) {
+        vm = vm_;
+    }
+
+    function touch() public {
+        vm.startSnapshotCpu("invariant-handler", "handler");
+        vm.stopSnapshotCpu("invariant-handler", "handler");
+    }
+}
+
+contract CpuSnapshotInvariantTest is DSTest {
+    Vm constant vm = Vm(HEVM_ADDRESS);
+    CpuSnapshotHandler internal handler;
+
+    function setUp() public {
+        handler = new CpuSnapshotHandler(vm);
+    }
+
+    /// forge-config: default.invariant.runs = 2
+    /// forge-config: default.invariant.depth = 1
+    function invariantSnapshotCpu() public {
+        vm.startSnapshotCpu("invariant");
+        vm.stopSnapshotCpu("invariant");
+    }
+}
+    "#,
+    );
+
+    cmd.forge_fuse().args(["test"]).assert_success();
+
+    let snapshots: Value = serde_json::from_str(
+        &fs::read_to_string(prj.root().join("snapshots/cpu/CpuSnapshotInvariantTest.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(snapshots.get("invariant").and_then(Value::as_str).is_some());
+
+    let handler_snapshots: Value = serde_json::from_str(
+        &fs::read_to_string(prj.root().join("snapshots/cpu/invariant-handler.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(handler_snapshots.get("handler").and_then(Value::as_str).is_some());
+});
+
+forgetest_init!(test_cpu_snapshot_rejects_escaping_group, |prj, cmd| {
+    prj.initialize_default_contracts();
+    prj.insert_ds_test();
+
+    prj.add_source(
+        "CpuSnapshotEscapingGroupTest.sol",
+        r#"
+import "./test.sol";
+
+interface Vm {
+    function startSnapshotCpu(string memory group, string memory name) external;
+    function stopSnapshotCpu(string memory group, string memory name) external returns (uint256);
+}
+
+contract CpuSnapshotEscapingGroupTest is DSTest {
+    Vm constant vm = Vm(HEVM_ADDRESS);
+
+    function testSnapshotCpu() public {
+        vm.startSnapshotCpu("../escaped", "escape");
+        vm.stopSnapshotCpu("../escaped", "escape");
+    }
+}
+    "#,
+    );
+
+    cmd.forge_fuse().args(["test"]).assert_failure().stderr_eq(str![[r#"
+Error: invalid CPU snapshot group "../escaped": group must be a single path component
+
+"#]]);
+    assert!(!prj.root().join("snapshots/escaped.json").exists());
+});
+
 forgetest_init!(test_cpu_snapshot_checks_all_suites_before_emitting, |prj, cmd| {
     prj.initialize_default_contracts();
     prj.insert_ds_test();

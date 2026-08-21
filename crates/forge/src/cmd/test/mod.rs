@@ -112,6 +112,17 @@ const DEBUGGER_MATCHING_TESTS_DISPLAY_LIMIT: usize = 12;
 const AUTO_FUZZ_FAILURE_DIR: &str = "fuzz";
 const AUTO_CORPUS_DIR: &str = "corpus";
 
+fn cpu_snapshot_path(snapshot_dir: &Path, group: &str) -> Result<PathBuf> {
+    let mut components = Path::new(group).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
+        bail!("invalid CPU snapshot group {group:?}: group must be a single path component");
+    }
+    Ok(snapshot_dir.join(format!("{group}.json")))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 enum FuzzOnlyMode {
     #[default]
@@ -3375,16 +3386,30 @@ impl TestArgs {
 
         if !cpu_snapshots.is_empty() {
             let cpu_snapshots_dir = config.snapshots.join("cpu");
-            if self.cpu_snapshot_check.unwrap_or(config.cpu_snapshot_check) {
+            let cpu_snapshot_check = self.cpu_snapshot_check.unwrap_or(config.cpu_snapshot_check);
+            let cpu_snapshot_emit = self.cpu_snapshot_emit.unwrap_or(config.cpu_snapshot_emit);
+            let cpu_snapshot_paths = if cpu_snapshot_check || cpu_snapshot_emit {
+                cpu_snapshots
+                    .keys()
+                    .map(|group| {
+                        cpu_snapshot_path(&cpu_snapshots_dir, group)
+                            .map(|path| (group.clone(), path))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?
+            } else {
+                BTreeMap::new()
+            };
+
+            if cpu_snapshot_check {
                 let differences_found =
                     cpu_snapshots.iter().fold(false, |mut found, (group, snapshots)| {
-                        let snapshot_path = cpu_snapshots_dir.join(format!("{group}.json"));
+                        let snapshot_path = &cpu_snapshot_paths[group];
                         if !snapshot_path.exists() {
                             return found;
                         }
 
                         let previous_snapshots: BTreeMap<String, String> =
-                            fs::read_json_file(&snapshot_path)
+                            fs::read_json_file(snapshot_path)
                                 .expect("Failed to read CPU snapshots from disk");
                         let diff: BTreeMap<_, _> = snapshots
                             .iter()
@@ -3419,14 +3444,11 @@ impl TestArgs {
                 }
             }
 
-            if self.cpu_snapshot_emit.unwrap_or(config.cpu_snapshot_emit) {
+            if cpu_snapshot_emit {
                 fs::create_dir_all(&cpu_snapshots_dir)?;
                 for (group, snapshots) in &cpu_snapshots {
-                    fs::write_pretty_json_file(
-                        &cpu_snapshots_dir.join(format!("{group}.json")),
-                        snapshots,
-                    )
-                    .expect("Failed to write CPU snapshots to disk");
+                    fs::write_pretty_json_file(&cpu_snapshot_paths[group], snapshots)
+                        .expect("Failed to write CPU snapshots to disk");
                 }
             }
         }
@@ -4473,6 +4495,20 @@ mod tests {
 
         let err = args.showmap_config().unwrap_err().to_string();
         assert!(err.contains("expected a single file-name component"), "{err}");
+    }
+
+    #[test]
+    fn cpu_snapshot_groups_must_be_single_path_components() {
+        let snapshot_dir = Path::new("snapshots/cpu");
+        assert_eq!(
+            cpu_snapshot_path(snapshot_dir, "group").unwrap(),
+            snapshot_dir.join("group.json")
+        );
+
+        for group in ["", ".", "..", "nested/group", "/tmp/result"] {
+            let err = cpu_snapshot_path(snapshot_dir, group).unwrap_err().to_string();
+            assert!(err.contains("group must be a single path component"), "{err}");
+        }
     }
 
     #[test]

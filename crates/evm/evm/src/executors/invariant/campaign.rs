@@ -8,7 +8,7 @@ use eyre::{Result, ensure};
 use foundry_evm_coverage::HitMaps;
 use foundry_evm_fuzz::BasicTxDetails;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -290,6 +290,7 @@ fn fold_outputs(
     let mut gas_report_traces = Vec::new();
     let mut line_coverage = None;
     let mut metrics = HashMap::default();
+    let mut cpu_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();
     let mut corpus_entries = Vec::new();
     let mut failed_corpus_replays = 0;
     let mut optimization_best = None;
@@ -312,6 +313,9 @@ fn fold_outputs(
         gas_report_traces.extend(result.gas_report_traces);
         HitMaps::merge_opt(&mut line_coverage, result.line_coverage);
         merge_metrics(&mut metrics, result.metrics);
+        for (group, snapshots) in result.cpu_snapshots {
+            cpu_snapshots.entry(group).or_default().extend(snapshots);
+        }
         merge_optimization(
             &mut optimization_best,
             result.optimization_best_value,
@@ -331,6 +335,7 @@ fn fold_outputs(
             gas_report_traces,
             line_coverage,
             metrics,
+            cpu_snapshots,
             failed_corpus_replays,
             workers,
             optimization_best_value,
@@ -462,6 +467,7 @@ mod tests {
             Vec::new(),
             None,
             HashMap::default(),
+            BTreeMap::default(),
             failed_corpus_replays,
             1,
             None,
@@ -681,6 +687,32 @@ mod tests {
 
         assert_eq!(result.reverts, 2);
         assert_eq!(result.failed_corpus_replays, 3);
+    }
+
+    #[test]
+    fn aggregator_merges_cpu_snapshots_from_all_workers() {
+        let spec = InvariantCampaignSpec::new(2);
+        let plans = spec.worker_plans(2).unwrap();
+        let mut first = empty_result(0, 0);
+        first
+            .cpu_snapshots
+            .entry("shared".to_string())
+            .or_default()
+            .insert("first".to_string(), "1".to_string());
+        let mut second = empty_result(0, 0);
+        second
+            .cpu_snapshots
+            .entry("shared".to_string())
+            .or_default()
+            .insert("second".to_string(), "2".to_string());
+
+        let mut aggregator = InvariantCampaignAggregator::new(spec);
+        aggregator.push(InvariantWorkerOutput::new(plans[0], first));
+        aggregator.push(InvariantWorkerOutput::new(plans[1], second));
+        let result = aggregator.finish().unwrap();
+
+        assert_eq!(result.cpu_snapshots["shared"]["first"], "1");
+        assert_eq!(result.cpu_snapshots["shared"]["second"], "2");
     }
 
     #[test]

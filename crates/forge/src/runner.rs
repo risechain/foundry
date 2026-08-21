@@ -3106,6 +3106,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                                     0,
                                     1,
                                     None,
+                                    Default::default(),
                                 );
                             } else {
                                 let signature = invariant.signature();
@@ -4304,6 +4305,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                                                 failed_corpus_replays,
                                                 symbolic_workers,
                                                 None,
+                                                Default::default(),
                                             );
 
                                             let mut symbolic_result =
@@ -4862,6 +4864,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             invariant_result.failed_corpus_replays,
             invariant_result.workers,
             invariant_result.optimization_best_value,
+            invariant_result.cpu_snapshots,
         );
         self.result
     }

@@ -2514,6 +2514,7 @@ impl TestResult {
         failed_corpus_replays: usize,
         workers: usize,
         optimization_best_value: Option<I256>,
+        cpu_snapshots: BTreeMap<String, BTreeMap<String, String>>,
     ) {
         self.kind = TestKind::Invariant {
             runs,
@@ -2560,6 +2561,7 @@ impl TestResult {
             self.add_counterexample_artifact(artifact);
         }
         self.gas_report_traces = gas_report_traces;
+        self.cpu_snapshots = cpu_snapshots;
     }
 
     /// Returns the result for a table test. Merges table test execution results (logs, labeled
