@@ -78,6 +78,11 @@ use foundry_evm::{
         trace_arena_at_depth,
     },
 };
+#[cfg(feature = "risex-risk-precompile")]
+use foundry_evm_networks::risex_formula::{
+    ProviderMode, clear_metrics, drain_metrics, peak_rss_bytes, serialize_jsonl,
+    set_metrics_enabled, set_provider_mode,
+};
 use foundry_tui::tui_mode;
 use rand::Rng;
 use regex::Regex;
@@ -111,6 +116,39 @@ use summary::{TestSummaryReport, format_invariant_metrics_table};
 const DEBUGGER_MATCHING_TESTS_DISPLAY_LIMIT: usize = 12;
 const AUTO_FUZZ_FAILURE_DIR: &str = "fuzz";
 const AUTO_CORPUS_DIR: &str = "corpus";
+
+#[cfg(feature = "risex-risk-precompile")]
+struct RisexMetricsOutput {
+    path: PathBuf,
+    mode: ProviderMode,
+}
+
+#[cfg(feature = "risex-risk-precompile")]
+impl RisexMetricsOutput {
+    fn finish(self) -> Result<()> {
+        let peak_rss_bytes = peak_rss_bytes().map_err(|error| eyre::eyre!(error))?;
+        let invocations = drain_metrics().map_err(|error| eyre::eyre!(error))?;
+        let output = serialize_jsonl(self.mode, peak_rss_bytes, &invocations)?;
+        let parent = self.path.parent().ok_or_else(|| {
+            eyre::eyre!("RISEx metrics path has no parent: {}", self.path.display())
+        })?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent).wrap_err_with(|| {
+            format!("failed to create atomic RISEx metrics file in {}", parent.display())
+        })?;
+        std::io::Write::write_all(temporary.as_file_mut(), &output)
+            .wrap_err("failed to write RISEx metrics")?;
+        std::io::Write::flush(temporary.as_file_mut()).wrap_err("failed to flush RISEx metrics")?;
+        temporary.as_file().sync_all().wrap_err("failed to sync RISEx metrics")?;
+        temporary.persist(&self.path).map_err(|error| {
+            eyre::eyre!(
+                "failed to atomically persist RISEx metrics to {}: {}",
+                self.path.display(),
+                error.error
+            )
+        })?;
+        Ok(())
+    }
+}
 
 fn cpu_snapshot_path(snapshot_dir: &Path, group: &str) -> Result<PathBuf> {
     let mut components = Path::new(group).components();
@@ -664,6 +702,16 @@ pub struct TestArgs {
     #[arg(long, help_heading = "Trace options")]
     cpu_trace: bool,
 
+    /// Select the experimental RISEx risk-formula provider.
+    #[cfg(feature = "risex-risk-precompile")]
+    #[arg(long, hide = true, value_enum)]
+    risex_risk_provider: Option<ProviderMode>,
+
+    /// Atomically export experimental RISEx native metrics as JSON Lines.
+    #[cfg(feature = "risex-risk-precompile")]
+    #[arg(long, hide = true, value_name = "ABSOLUTE_JSONL_PATH")]
+    pub(crate) risex_risk_metrics: Option<PathBuf>,
+
     /// Dumps all debugger steps to file.
     #[arg(
         long,
@@ -1215,7 +1263,70 @@ pub struct TestArgs {
 impl TestArgs {
     pub async fn run(mut self) -> Result<TestOutcome> {
         trace!(target: "forge::test", "executing test command");
-        self.compile_and_run().await
+        #[cfg(feature = "risex-risk-precompile")]
+        let risex_metrics = self.prepare_risex_metrics()?;
+
+        let outcome = self.compile_and_run().await;
+
+        #[cfg(feature = "risex-risk-precompile")]
+        if let Some(metrics) = risex_metrics {
+            let metrics_result = metrics.finish();
+            set_metrics_enabled(false);
+            metrics_result?;
+        }
+
+        outcome
+    }
+
+    #[cfg(feature = "risex-risk-precompile")]
+    fn prepare_risex_metrics(&self) -> Result<Option<RisexMetricsOutput>> {
+        let provider_mode = self.risex_risk_provider.unwrap_or_default();
+        if self.risex_risk_metrics.is_some() && !cfg!(unix) {
+            bail!("`--risex-risk-metrics` is unsupported on this platform");
+        }
+        set_provider_mode(provider_mode)
+            .map_err(|error| eyre::eyre!("failed to set RISEx risk provider: {error:?}"))?;
+
+        clear_metrics().map_err(|error| eyre::eyre!(error))?;
+        set_metrics_enabled(false);
+        let Some(path) = self.risex_risk_metrics.clone() else {
+            return Ok(None);
+        };
+        if self.mutate.is_some() {
+            bail!("`--risex-risk-metrics` cannot be combined with `--mutate`");
+        }
+        if !self.cpu_trace {
+            bail!("`--risex-risk-metrics` requires `--cpu-trace`");
+        }
+        let threads = rayon::current_num_threads();
+        if threads != 1 {
+            bail!(
+                "`--risex-risk-metrics` requires single-threaded execution (`--threads 1`); resolved {threads} threads"
+            );
+        }
+        if !path.is_absolute() {
+            bail!("`--risex-risk-metrics` requires an absolute path");
+        }
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            if !metadata.is_file() {
+                bail!("RISEx metrics output path must be a file: {}", path.display());
+            }
+            if metadata.len() != 0 {
+                bail!("RISEx metrics output file is not empty: {}", path.display());
+            }
+        }
+        set_metrics_enabled(true);
+        Ok(Some(RisexMetricsOutput { path, mode: provider_mode }))
+    }
+
+    #[cfg(feature = "risex-risk-precompile")]
+    pub(crate) fn ensure_risex_flags_supported(&self, command: &str) -> Result<()> {
+        if self.risex_risk_provider.is_some() || self.risex_risk_metrics.is_some() {
+            bail!(
+                "RISEx risk flags are only supported by `forge test`; `forge {command}` cannot use them"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn ensure_mutation_mode_compatible(&self, coverage: bool) -> Result<()> {

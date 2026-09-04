@@ -1,0 +1,308 @@
+{
+  "aggregateVectors": [
+    {
+      "expected": {
+        "cross_balance_delta": "1700000000000000000",
+        "total_initial_margin": "2400000000000000000"
+      },
+      "expectedStatus": "OK",
+      "name": "cross_and_isolated_ordered",
+      "reductionOrder": [
+        1,
+        2,
+        3
+      ],
+      "rowNames": [
+        "cross_long",
+        "cross_short",
+        "isolated_guarded"
+      ]
+    }
+  ],
+  "arithmeticErrorVectors": [
+    {
+      "expectedError": "DIVISION_BY_ZERO",
+      "expectedStatus": "ARITHMETIC_ERROR",
+      "kind": "row",
+      "name": "active_cross_zero_denominator",
+      "row": {
+        "accumulated_funding_payment": "0",
+        "effective_buy_order_size": "0",
+        "effective_isolated_balance": "0",
+        "effective_last_funding_payment": "0",
+        "effective_leverage_wad": "0",
+        "effective_order_notional": "0",
+        "effective_position_quote": "0",
+        "effective_position_size": "0",
+        "effective_sell_order_size": "0",
+        "margin_mode": "0",
+        "mark_price": "1000000000000000000",
+        "market_id": "10",
+        "projected_settlement_pnl": "0"
+      }
+    },
+    {
+      "expectedError": "I256_PRODUCT_OVERFLOW",
+      "expectedStatus": "ARITHMETIC_ERROR",
+      "kind": "row",
+      "name": "active_signed_product_overflow",
+      "row": {
+        "accumulated_funding_payment": "0",
+        "effective_buy_order_size": "0",
+        "effective_isolated_balance": "0",
+        "effective_last_funding_payment": "0",
+        "effective_leverage_wad": "1000000000000000000",
+        "effective_order_notional": "0",
+        "effective_position_quote": "0",
+        "effective_position_size": "170141183460469231731687303715884105727",
+        "effective_sell_order_size": "0",
+        "margin_mode": "0",
+        "mark_price": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "market_id": "11",
+        "projected_settlement_pnl": "0"
+      }
+    },
+    {
+      "expectedError": "I128_OVERFLOW",
+      "expectedStatus": "ARITHMETIC_ERROR",
+      "kind": "row",
+      "name": "narrow_funding_subtraction_overflow",
+      "row": {
+        "accumulated_funding_payment": "170141183460469231731687303715884105727",
+        "effective_buy_order_size": "0",
+        "effective_isolated_balance": "0",
+        "effective_last_funding_payment": "-170141183460469231731687303715884105728",
+        "effective_leverage_wad": "1000000000000000000",
+        "effective_order_notional": "0",
+        "effective_position_quote": "0",
+        "effective_position_size": "1",
+        "effective_sell_order_size": "0",
+        "margin_mode": "0",
+        "mark_price": "1000000000000000000",
+        "market_id": "12",
+        "projected_settlement_pnl": "0"
+      }
+    },
+    {
+      "expectedError": "U256_PRODUCT_OVERFLOW",
+      "expectedStatus": "ARITHMETIC_ERROR",
+      "kind": "row",
+      "name": "active_isolated_product_overflow",
+      "row": {
+        "accumulated_funding_payment": "0",
+        "effective_buy_order_size": "0",
+        "effective_isolated_balance": "0",
+        "effective_last_funding_payment": "0",
+        "effective_leverage_wad": "1000000000000000000",
+        "effective_order_notional": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "effective_position_quote": "0",
+        "effective_position_size": "0",
+        "effective_sell_order_size": "0",
+        "margin_mode": "1",
+        "mark_price": "1000000000000000000",
+        "market_id": "13",
+        "projected_settlement_pnl": "0"
+      }
+    },
+    {
+      "expectedError": "I256_CONVERSION_OVERFLOW",
+      "expectedStatus": "ARITHMETIC_ERROR",
+      "kind": "row",
+      "name": "checked_u256_to_i256_overflow",
+      "row": {
+        "accumulated_funding_payment": "0",
+        "effective_buy_order_size": "0",
+        "effective_isolated_balance": "0",
+        "effective_last_funding_payment": "0",
+        "effective_leverage_wad": "1",
+        "effective_order_notional": "115792089237316195423570985008687907853269984665640564039457",
+        "effective_position_quote": "0",
+        "effective_position_size": "0",
+        "effective_sell_order_size": "0",
+        "margin_mode": "1",
+        "mark_price": "1000000000000000000",
+        "market_id": "14",
+        "projected_settlement_pnl": "0"
+      }
+    },
+    {
+      "expectedError": "INACTIVE_GUARD_NO_ERROR",
+      "expectedStatus": "OK",
+      "kind": "row",
+      "name": "inactive_cross_errors_do_not_execute",
+      "row": {
+        "accumulated_funding_payment": "170141183460469231731687303715884105727",
+        "effective_buy_order_size": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "effective_isolated_balance": "1000000000000000000",
+        "effective_last_funding_payment": "-170141183460469231731687303715884105728",
+        "effective_leverage_wad": "2000000000000000000",
+        "effective_order_notional": "3000000000000000000",
+        "effective_position_quote": "-170141183460469231731687303715884105728",
+        "effective_position_size": "-170141183460469231731687303715884105728",
+        "effective_sell_order_size": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "margin_mode": "1",
+        "mark_price": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "market_id": "3",
+        "projected_settlement_pnl": "400000000000000000"
+      }
+    },
+    {
+      "expectedError": "ORDERED_SUM_OVERFLOW",
+      "expectedStatus": "ARITHMETIC_ERROR",
+      "kind": "aggregate",
+      "name": "ordered_sum_overflow",
+      "reductionOrder": [
+        20,
+        21
+      ],
+      "rows": [
+        {
+          "accumulated_funding_payment": "0",
+          "effective_buy_order_size": "0",
+          "effective_isolated_balance": "0",
+          "effective_last_funding_payment": "0",
+          "effective_leverage_wad": "1000000000000000000",
+          "effective_order_notional": "0",
+          "effective_position_quote": "0",
+          "effective_position_size": "0",
+          "effective_sell_order_size": "0",
+          "margin_mode": "0",
+          "mark_price": "1000000000000000000",
+          "market_id": "20",
+          "projected_settlement_pnl": "57896044618658097711785492504343953926634992332820282019728792003956564819967"
+        },
+        {
+          "accumulated_funding_payment": "0",
+          "effective_buy_order_size": "0",
+          "effective_isolated_balance": "0",
+          "effective_last_funding_payment": "0",
+          "effective_leverage_wad": "1000000000000000000",
+          "effective_order_notional": "0",
+          "effective_position_quote": "0",
+          "effective_position_size": "0",
+          "effective_sell_order_size": "0",
+          "margin_mode": "0",
+          "mark_price": "1000000000000000000",
+          "market_id": "21",
+          "projected_settlement_pnl": "1"
+        }
+      ],
+      "underlyingError": "I256_OVERFLOW"
+    },
+    {
+      "expectedError": "ABS_MIN_OVERFLOW",
+      "expectedStatus": "ARITHMETIC_ERROR",
+      "inputs": [
+        "-57896044618658097711785492504343953926634992332820282019728792003956564819968"
+      ],
+      "kind": "operation",
+      "name": "abs_i256_min",
+      "opcode": "ABS_CHECKED",
+      "type": "i256"
+    },
+    {
+      "expected": "57896044618658097711785492504343953926634992332820282019728792003956564819967",
+      "expectedStatus": "OK",
+      "inputs": [
+        "57896044618658097711785492504343953926634992332820282019728792003956564819967"
+      ],
+      "kind": "operation",
+      "name": "u256_to_i256_max_success",
+      "opcode": "U256_TO_I256_CHECKED",
+      "type": "i256"
+    },
+    {
+      "expectedError": "I256_CONVERSION_OVERFLOW",
+      "expectedStatus": "ARITHMETIC_ERROR",
+      "inputs": [
+        "57896044618658097711785492504343953926634992332820282019728792003956564819968"
+      ],
+      "kind": "operation",
+      "name": "u256_to_i256_first_failure",
+      "opcode": "U256_TO_I256_CHECKED",
+      "type": "i256"
+    }
+  ],
+  "identities": {
+    "blobCodeHash": "0x14afad781b4af3cb77cbe7dc02cdeef706a124c43c343e8983abf078f9483b82",
+    "create2Salt": "0xa0223a14173e459673b4318c2cb92ec4f90762a9cdf4e6bd28e7fcd95d9b9a07",
+    "formulaSourceSha256": "0x03f181e005730a6856a7307681c0779bd90780affb3c142d088f578c131480fb",
+    "loaderSchemaHash": "0x333e0b49a3387e87d5ec96b040d522c7c46ddf29dacc85185277cb928a409dcb",
+    "loaderSourceSha256": "0x20239691025cff960dd963a39f074491ff9952c94001966924557eeca6d7b72d",
+    "normalizedSourceDigest": "0xa0223a14173e459673b4318c2cb92ec4f90762a9cdf4e6bd28e7fcd95d9b9a07"
+  },
+  "rowVectors": [
+    {
+      "expected": {
+        "cross_balance_delta": "3100000000000000000",
+        "total_initial_margin": "1200000000000000000"
+      },
+      "expectedStatus": "OK",
+      "name": "cross_long",
+      "row": {
+        "accumulated_funding_payment": "200000000000000000",
+        "effective_buy_order_size": "1000000000000000000",
+        "effective_isolated_balance": "0",
+        "effective_last_funding_payment": "100000000000000000",
+        "effective_leverage_wad": "5000000000000000000",
+        "effective_order_notional": "0",
+        "effective_position_quote": "-1000000000000000000",
+        "effective_position_size": "2000000000000000000",
+        "effective_sell_order_size": "500000000000000000",
+        "margin_mode": "0",
+        "mark_price": "2000000000000000000",
+        "market_id": "1",
+        "projected_settlement_pnl": "300000000000000000"
+      }
+    },
+    {
+      "expected": {
+        "cross_balance_delta": "700000000000000000",
+        "total_initial_margin": "1200000000000000000"
+      },
+      "expectedStatus": "OK",
+      "name": "cross_short",
+      "row": {
+        "accumulated_funding_payment": "0",
+        "effective_buy_order_size": "500000000000000000",
+        "effective_isolated_balance": "0",
+        "effective_last_funding_payment": "100000000000000000",
+        "effective_leverage_wad": "5000000000000000000",
+        "effective_order_notional": "0",
+        "effective_position_quote": "5000000000000000000",
+        "effective_position_size": "-2000000000000000000",
+        "effective_sell_order_size": "1000000000000000000",
+        "margin_mode": "0",
+        "mark_price": "2000000000000000000",
+        "market_id": "2",
+        "projected_settlement_pnl": "-100000000000000000"
+      }
+    },
+    {
+      "expected": {
+        "cross_balance_delta": "-2100000000000000000",
+        "total_initial_margin": "0"
+      },
+      "expectedStatus": "OK",
+      "name": "isolated_guarded",
+      "row": {
+        "accumulated_funding_payment": "170141183460469231731687303715884105727",
+        "effective_buy_order_size": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "effective_isolated_balance": "1000000000000000000",
+        "effective_last_funding_payment": "-170141183460469231731687303715884105728",
+        "effective_leverage_wad": "2000000000000000000",
+        "effective_order_notional": "3000000000000000000",
+        "effective_position_quote": "-170141183460469231731687303715884105728",
+        "effective_position_size": "-170141183460469231731687303715884105728",
+        "effective_sell_order_size": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "margin_mode": "1",
+        "mark_price": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "market_id": "3",
+        "projected_settlement_pnl": "400000000000000000"
+      }
+    }
+  ],
+  "runtimeHex": "0x0052534631012b053d020200010001000000010000036500000000000000000000040000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000de0b6b3a76400000600000000000000000000000000000000000000000000000000000000000000010112ffffff04ff0000000000000000000113ffffff02ff0001000000000000000114ffffff02ff0001000000000000000915010fff05ff00ff00000000000000141602ffff041501ff00000000000000141703ffff041501ff00000000000000051816ffff021501ff000000000000000a19160dff051501ff00000000000000121a160b10041501ff00000000000000021b1a17ff041501ff00000000000000091c160dff051501ff000000000000000d1d151cff05ff00ff000000000000000c1e1cffff05ff00ff000000000000000d1f151eff05ff00ff0000000000000003200c04ff031f01ff00000000000000142120ffff041f01ff000000000000001222211610041f01ff000000000000000e231c0d22041501ff000000000000000d241519ff05ff00ff000000000000000c2519ffff05ff00ff000000000000000d261525ff05ff00ff0000000000000006271808ff022401ff0000000000000002281808ff022601ff000000000000000e29192728021501ff000000000000000d2a1519ff05ff00ff000000000000000c2b19ffff05ff00ff000000000000000d2c152bff05ff00ff00000000000000022d1809ff022a01ff00000000000000062e1809ff022c01ff000000000000000e2f192d2e021501ff0000000000000003301b23ff041501ff000000000000000e3115301204ff00ff000000000000000832292fff021501ff000000000000001133320b05021501ff000000000000000e3415331302ff00ff0000000000000009350111ff05ff00ff00000000000000133606ffff023501ff000000000000000f370a1005023501ff0000000000000002383637ff023501ff000000000000000e3935381402ff00ff00000000000000023a0731ff04ff00ff00000000000000153b39ffff04ff00ff00000000000000033c3a3bff04ff00ff00000000000000013c0004000000000134010200000000",
+  "schema": "risex.risk_formula.foundry_corpus",
+  "schemaVersion": 1
+}

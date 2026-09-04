@@ -1,0 +1,42 @@
+{
+  "inputs": {
+    "formulaSourcePath": "risk-formula/formulas/portfolio_order_risk_v1.risk",
+    "formulaSourceSha256": "03f181e005730a6856a7307681c0779bd90780affb3c142d088f578c131480fb",
+    "loaderCanonicalKeccak256": "333e0b49a3387e87d5ec96b040d522c7c46ddf29dacc85185277cb928a409dcb",
+    "loaderSourcePath": "risk-formula/loaders/effective_market_v1.json",
+    "loaderSourceSha256": "20239691025cff960dd963a39f074491ff9952c94001966924557eeca6d7b72d",
+    "normalizedSourceKeccak256": "a0223a14173e459673b4318c2cb92ec4f90762a9cdf4e6bd28e7fcd95d9b9a07"
+  },
+  "manifestSelfDigest": "excluded because a file cannot contain its own cryptographic digest",
+  "outputs": {
+    "foundry/portfolio_order_risk_v1.json": {
+      "sha256": "5494eed832754f761ff18b6c8697b6a5bcb88c943d410fd394cb27aaa5a95b17",
+      "sizeBytes": 13583
+    },
+    "foundry/schema_generated.rs": {
+      "sha256": "f0b02010bb6ffd82969cc875f65e301de705ad93f24a3a6b08dd0512466272f3",
+      "sizeBytes": 73552
+    },
+    "src/libraries/exchanges/perps/engine/risk/generated/LibEffectiveMarketV1Schema.sol": {
+      "sha256": "c73e1f4df1daf4bfcc04715342ef2c912ff6f029c7b1aeaa8910bc20cff4ff20",
+      "sizeBytes": 3452
+    },
+    "src/libraries/exchanges/perps/engine/risk/generated/LibPortfolioOrderRiskV1.sol": {
+      "sha256": "206f57ea1e0bf750d5820caa011e284157a4896c9eaa54a98eafeab2488f4603",
+      "sizeBytes": 1630
+    }
+  },
+  "ownership": {
+    "entries": "direct regular files only",
+    "policy": "compile unlinks only unexpected direct regular files; check rejects symlinks, subdirectories, and unexpected direct files",
+    "solidityGeneratedDirectory": "src/libraries/exchanges/perps/engine/risk/generated"
+  },
+  "schema": "risex.risk_formula.artifact_manifest",
+  "schemaVersion": 1,
+  "versions": {
+    "format": 1,
+    "loader": 1,
+    "operationSet": 1,
+    "outputSchema": 1
+  }
+}

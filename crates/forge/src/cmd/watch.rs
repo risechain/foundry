@@ -357,6 +357,8 @@ pub async fn watch_build(args: BuildArgs) -> Result<()> {
 /// Executes a [`Watchexec`] that listens for changes in the project's src dir and reruns `forge
 /// snapshot`
 pub async fn watch_gas_snapshot(args: GasSnapshotArgs) -> Result<()> {
+    #[cfg(feature = "risex-risk-precompile")]
+    args.test.ensure_risex_flags_supported("snapshot")?;
     let config = args.watchexec_config()?;
     run(config).await
 }
@@ -364,6 +366,10 @@ pub async fn watch_gas_snapshot(args: GasSnapshotArgs) -> Result<()> {
 /// Executes a [`Watchexec`] that listens for changes in the project's src dir and reruns `forge
 /// test`
 pub async fn watch_test(args: TestArgs) -> Result<()> {
+    #[cfg(feature = "risex-risk-precompile")]
+    if args.risex_risk_metrics.is_some() {
+        eyre::bail!("`--risex-risk-metrics` cannot be combined with `--watch`");
+    }
     let config: Config = args.build.load_config()?;
     let filter = args.filter(&config)?;
     // Marker to check whether to override the command.
