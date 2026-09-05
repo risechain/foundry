@@ -44,6 +44,8 @@ pub(super) struct LoaderContext<'reader, 'journal, 'evm, 'metrics, M> {
     reader: &'reader mut JournalReader<'journal, 'evm>,
     phases: &'metrics mut M,
     funding_dependency: Option<Address>,
+    validated_oracle: Option<Address>,
+    validated_orders: Option<Address>,
 }
 
 impl<'reader, 'journal, 'evm, 'metrics, M: PhaseMeasurer>
@@ -53,7 +55,13 @@ impl<'reader, 'journal, 'evm, 'metrics, M: PhaseMeasurer>
         reader: &'reader mut JournalReader<'journal, 'evm>,
         phases: &'metrics mut M,
     ) -> Self {
-        Self { reader, phases, funding_dependency: None }
+        Self {
+            reader,
+            phases,
+            funding_dependency: None,
+            validated_oracle: None,
+            validated_orders: None,
+        }
     }
 
     pub(super) fn derive<T>(&mut self, operation: impl FnOnce() -> T) -> T {
@@ -81,14 +89,28 @@ impl<'reader, 'journal, 'evm, 'metrics, M: PhaseMeasurer>
         if dependency.is_zero() {
             return Err(LoaderError::Unavailable);
         }
+        self.validate_dependency_code(dependency)?;
+        self.funding_dependency = Some(dependency);
+        Ok(dependency)
+    }
+
+    fn validate_dependency_code(&mut self, dependency: Address) -> Result<(), LoaderError> {
         let code_hash = self.phases.measure(Phase::JournalLoad, || {
             self.reader.code_hash(dependency).map_err(LoaderError::from)
         })?;
         if code_hash == B256::ZERO || code_hash == KECCAK_EMPTY {
             return Err(LoaderError::Unavailable);
         }
-        self.funding_dependency = Some(dependency);
-        Ok(dependency)
+        Ok(())
+    }
+
+    fn validate_orders(&mut self, orders: Address) -> Result<(), LoaderError> {
+        if self.validated_orders == Some(orders) {
+            return Ok(());
+        }
+        self.validate_dependency_code(orders)?;
+        self.validated_orders = Some(orders);
+        Ok(())
     }
 
     fn block_timestamp(&self) -> U256 {
@@ -626,6 +648,7 @@ fn load_market_row_in_context<M: PhaseMeasurer>(
         if orders.is_zero() {
             return Err(LoaderError::Unavailable);
         }
+        context.validate_orders(orders)?;
         let streamed = super::deferred::stream_projected_chunks_in_context(
             context,
             orders,
@@ -703,6 +726,7 @@ fn may_have_projected_fills<M: PhaseMeasurer>(
     if orders.is_zero() {
         return Ok(false);
     }
+    context.validate_orders(orders)?;
     let (counters_slot, open_slot) = context.derive(|| {
         let counters_slot = checked_slot_offset(
             book,
@@ -740,6 +764,7 @@ fn load_empty_live_risk<M: PhaseMeasurer>(
     if orders.is_zero() {
         return Err(LoaderError::Unavailable);
     }
+    context.validate_orders(orders)?;
     let (open_orders_slot, config_slot) = context.derive(|| {
         let open_orders_seed = checked_slot_offset(
             book,
@@ -1031,6 +1056,10 @@ fn load_localized_mark<M: PhaseMeasurer>(
     if oracle.is_zero() {
         return Err(LoaderError::Unavailable);
     }
+    if context.validated_oracle != Some(oracle) {
+        context.validate_dependency_code(oracle)?;
+        context.validated_oracle = Some(oracle);
+    }
     let ([slot0, slot1], control_slot) = context.derive(|| {
         Ok::<_, LoaderError>((
             risk_mark_snapshot_slots(market_id)?,
@@ -1119,6 +1148,7 @@ fn load_localized_mark<M: PhaseMeasurer>(
         )?;
         Ok::<_, LoaderError>((hook_root, activation_slot))
     })?;
+    context.validate_orders(orders)?;
     let activation = context.sload(orders, activation_slot)?;
     if extract_unsigned_bytes(
         activation,
@@ -1210,8 +1240,9 @@ mod tests {
 
     use super::{
         LoadProgress, LoadRowsError, LoaderContext, LoaderError, MarginMode, MarketRow,
-        load_funding, load_market_row, load_market_row_profiled, load_rows, load_rows_profiled,
-        perps_market_slot, pop_active_market, scan_live_risk, schema, trading_account_slot, word,
+        load_funding, load_localized_mark, load_market_row, load_market_row_profiled, load_rows,
+        load_rows_profiled, perps_market_slot, pop_active_market, scan_live_risk, schema,
+        trading_account_slot, word,
     };
     use crate::risex_formula::{
         Request, Status,
@@ -1462,6 +1493,7 @@ mod tests {
                 .unwrap();
             }
             db.insert_account_info(caller, AccountInfo::default());
+            db.insert_account_info(orders, contract_account_info());
             let registry =
                 U256::from_be_bytes(schema::STORAGE_NAMESPACES_PERPS_MANAGER_REGISTRY_STORAGE_ROOT);
             install_zero_funding_dependency(&mut db, caller, registry);
@@ -1621,7 +1653,7 @@ mod tests {
             << schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_RESTING_ORDER_ID_OWNER_BITS_0;
         let mut db = InMemoryDB::default();
         db.insert_account_info(caller, AccountInfo::default());
-        db.insert_account_info(orders, AccountInfo::default());
+        db.insert_account_info(orders, contract_account_info());
         install_zero_funding_dependency(&mut db, caller, registry);
         db.insert_account_storage(
             caller,
@@ -1817,7 +1849,7 @@ mod tests {
                 (Phase::KeyDerivation, 1),
                 (Phase::JournalLoad, 2),
                 (Phase::KeyDerivation, 2),
-                (Phase::JournalLoad, 1),
+                (Phase::JournalLoad, 2),
                 (Phase::KeyDerivation, 1),
                 (Phase::JournalLoad, 3),
                 (Phase::KeyDerivation, 1),
@@ -1863,7 +1895,7 @@ mod tests {
             ],
             "pin the live-fallback decode, normalization, and read chronology",
         );
-        assert_step_clock_durations(&phases, 260, 320, 590);
+        assert_step_clock_durations(&phases, 260, 330, 600);
     }
 
     #[test]
@@ -2199,6 +2231,70 @@ mod tests {
     }
 
     #[test]
+    fn localized_snapshot_rejects_codeless_dependencies() {
+        let fixture: Value =
+            serde_json::from_slice(include_bytes!("../testdata/effective-market-v1.json")).unwrap();
+        let case = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "canonical_localized_ready_non_target_price")
+            .unwrap();
+        for name in ["risexOracle", "ordersManager"] {
+            let (caller, mut db, request) = fixture_world(case);
+            let dependency: Address = case["addresses"][name].as_str().unwrap().parse().unwrap();
+            db.insert_account_info(dependency, AccountInfo::default());
+
+            let mut context = EthEvmContext::new(db, Default::default());
+            let mut internals = EvmInternals::from_context(&mut context);
+            let mut reader = JournalReader::new(&mut internals);
+            assert_eq!(
+                load_market_row(&mut reader, caller, &request, 2, 1),
+                Err(LoaderError::Unavailable),
+                "accepted codeless dependency {name} at {dependency}",
+            );
+        }
+    }
+
+    #[test]
+    fn localized_dependencies_are_validated_once_per_invocation() {
+        let fixture: Value =
+            serde_json::from_slice(include_bytes!("../testdata/effective-market-v1.json")).unwrap();
+        let case = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "canonical_localized_ready_non_target_price")
+            .unwrap();
+        let (caller, db, request) = fixture_world(case);
+        let mut context = EthEvmContext::new(db, Default::default());
+        let mut internals = EvmInternals::from_context(&mut context);
+        let mut reader = JournalReader::new(&mut internals);
+        let mut phases = CountingPhases::default();
+        {
+            let mut context = LoaderContext::new(&mut reader, &mut phases);
+            for _ in 0..2 {
+                assert_eq!(
+                    load_localized_mark(&mut context, caller, 2, request.source_policy),
+                    Ok(U256::from_str_radix("4505000000000000000000", 10).unwrap()),
+                );
+            }
+        }
+
+        assert_eq!(reader.ordered_storage_reads().len(), 18);
+        assert_eq!(phases.key_derivations, 12);
+        assert_eq!(phases.journal_loads, 20);
+        assert_eq!(
+            reader.stats(),
+            JournalReadStats {
+                journal_reads: 20,
+                unique_storage_keys: 9,
+                state_access_gas: 25_000
+            },
+        );
+    }
+
+    #[test]
     fn localized_snapshot_rejects_nonzero_word1_reserved_bits() {
         let fixture: Value =
             serde_json::from_slice(include_bytes!("../testdata/effective-market-v1.json")).unwrap();
@@ -2384,9 +2480,11 @@ mod tests {
             )
             .unwrap();
         }
-        let funding: Address = case["addresses"]["fundingRate"].as_str().unwrap().parse().unwrap();
-        if !funding.is_zero() {
-            db.insert_account_info(funding, contract_account_info());
+        for name in ["fundingRate", "ordersManager", "risexOracle"] {
+            let dependency: Address = case["addresses"][name].as_str().unwrap().parse().unwrap();
+            if !dependency.is_zero() {
+                db.insert_account_info(dependency, contract_account_info());
+            }
         }
         let request = Request {
             expected_loader_version: 1,
