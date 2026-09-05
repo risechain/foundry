@@ -1,5 +1,6 @@
 use alloy_evm::EvmInternalsError;
-use alloy_primitives::{Address, I256, U256};
+use alloy_primitives::{Address, B256, I256, U256};
+use revm::primitives::KECCAK_EMPTY;
 
 use crate::risex_formula::{
     Request, Status,
@@ -42,6 +43,7 @@ impl PhaseMeasurer for NoopPhaseMeasurer {
 pub(super) struct LoaderContext<'reader, 'journal, 'evm, 'metrics, M> {
     reader: &'reader mut JournalReader<'journal, 'evm>,
     phases: &'metrics mut M,
+    funding_dependency: Option<Address>,
 }
 
 impl<'reader, 'journal, 'evm, 'metrics, M: PhaseMeasurer>
@@ -51,7 +53,7 @@ impl<'reader, 'journal, 'evm, 'metrics, M: PhaseMeasurer>
         reader: &'reader mut JournalReader<'journal, 'evm>,
         phases: &'metrics mut M,
     ) -> Self {
-        Self { reader, phases }
+        Self { reader, phases, funding_dependency: None }
     }
 
     pub(super) fn derive<T>(&mut self, operation: impl FnOnce() -> T) -> T {
@@ -62,6 +64,31 @@ impl<'reader, 'journal, 'evm, 'metrics, M: PhaseMeasurer>
         self.phases.measure(Phase::JournalLoad, || {
             self.reader.sload(address, slot).map_err(LoaderError::from)
         })
+    }
+
+    fn funding_dependency(&mut self, caller: Address) -> Result<Address, LoaderError> {
+        if let Some(dependency) = self.funding_dependency {
+            return Ok(dependency);
+        }
+        let dependency_slot = self.derive(|| {
+            checked_slot_offset(
+                word(schema::STORAGE_NAMESPACES_PERPS_MANAGER_REGISTRY_STORAGE_ROOT),
+                schema::STORAGE_PATHS_PERPS_REGISTRY_FIELDS_FUNDING_RATE_SLOT_OFFSET,
+            )
+            .map_err(LoaderError::from)
+        })?;
+        let dependency = address(self.sload(caller, dependency_slot)?);
+        if dependency.is_zero() {
+            return Err(LoaderError::Unavailable);
+        }
+        let code_hash = self.phases.measure(Phase::JournalLoad, || {
+            self.reader.code_hash(dependency).map_err(LoaderError::from)
+        })?;
+        if code_hash == B256::ZERO || code_hash == KECCAK_EMPTY {
+            return Err(LoaderError::Unavailable);
+        }
+        self.funding_dependency = Some(dependency);
+        Ok(dependency)
     }
 
     fn block_timestamp(&self) -> U256 {
@@ -956,17 +983,7 @@ fn load_funding<M: PhaseMeasurer>(
     caller: Address,
     market_id: u16,
 ) -> Result<i128, LoaderError> {
-    let dependency_slot = context.derive(|| {
-        checked_slot_offset(
-            word(schema::STORAGE_NAMESPACES_PERPS_MANAGER_REGISTRY_STORAGE_ROOT),
-            schema::STORAGE_PATHS_PERPS_REGISTRY_FIELDS_FUNDING_RATE_SLOT_OFFSET,
-        )
-        .map_err(LoaderError::from)
-    })?;
-    let dependency = address(context.sload(caller, dependency_slot)?);
-    if dependency.is_zero() {
-        return Err(LoaderError::Unavailable);
-    }
+    let dependency = context.funding_dependency(caller)?;
     let (compact, cutover_slot) = context.derive(|| {
         let compact = mapping_slot(
             U256::from(market_id),
@@ -1187,21 +1204,21 @@ fn as_i128(value: I256) -> Result<i128, LoaderError> {
 #[cfg(test)]
 mod tests {
     use alloy_evm::{EvmInternals, eth::EthEvmContext};
-    use alloy_primitives::{Address, B256, I256, U256, keccak256};
-    use revm::{database::InMemoryDB, state::AccountInfo};
+    use alloy_primitives::{Address, B256, Bytes, I256, U256, keccak256};
+    use revm::{bytecode::Bytecode, database::InMemoryDB, state::AccountInfo};
     use serde_json::Value;
 
     use super::{
-        LoadProgress, LoadRowsError, LoaderError, MarginMode, MarketRow, load_market_row,
-        load_market_row_profiled, load_rows, load_rows_profiled, perps_market_slot,
-        pop_active_market, scan_live_risk, schema, trading_account_slot,
+        LoadProgress, LoadRowsError, LoaderContext, LoaderError, MarginMode, MarketRow,
+        load_funding, load_market_row, load_market_row_profiled, load_rows, load_rows_profiled,
+        perps_market_slot, pop_active_market, scan_live_risk, schema, trading_account_slot, word,
     };
     use crate::risex_formula::{
         Request, Status,
         metrics::{Phase, PhaseMeasurer},
         storage::{
-            JournalReader, checked_slot_offset, mapping_slot, orders_market_book_slot,
-            orders_tick_level_slot_from_book, risk_mark_snapshot_slots,
+            JournalReadStats, JournalReader, checked_slot_offset, mapping_slot,
+            orders_market_book_slot, orders_tick_level_slot_from_book, risk_mark_snapshot_slots,
         },
     };
 
@@ -1785,11 +1802,10 @@ mod tests {
             .find(|case| case["name"] == "canonical_wrong_epoch_risk_live_fallback")
             .unwrap();
 
-        let (result, reads, phases) = load_fixture_profiled(case);
+        let (result, _reads, phases) = load_fixture_profiled(case);
         let (rows, progress) = result.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(progress.rows_started, 1);
-        assert_eq!(phases.journal_loads as usize, reads.len());
         assert_eq!(
             phase_runs(&phases.events),
             vec![
@@ -1839,7 +1855,7 @@ mod tests {
                 (Phase::KeyDerivation, 1),
                 (Phase::JournalLoad, 1),
                 (Phase::KeyDerivation, 1),
-                (Phase::JournalLoad, 1),
+                (Phase::JournalLoad, 2),
                 (Phase::KeyDerivation, 1),
                 (Phase::JournalLoad, 1),
                 (Phase::KeyDerivation, 1),
@@ -1847,7 +1863,7 @@ mod tests {
             ],
             "pin the live-fallback decode, normalization, and read chronology",
         );
-        assert_step_clock_durations(&phases, 260, 310, 580);
+        assert_step_clock_durations(&phases, 260, 320, 590);
     }
 
     #[test]
@@ -1976,9 +1992,9 @@ mod tests {
             &mut phases,
             &mut progress,
         );
-        let reads = reader.ordered_storage_reads();
+        let journal_reads = reader.journal_reads();
         assert_eq!(result, Err(LoaderError::Unavailable));
-        assert_eq!(phases.journal_loads as usize, reads.len());
+        assert_eq!(u64::from(phases.journal_loads), journal_reads);
         assert_eq!(
             (
                 phases.events.len(),
@@ -2090,6 +2106,67 @@ mod tests {
         assert_eq!(
             load_market_row(&mut reader, caller, &request, 1, 1),
             Err(LoaderError::Unavailable),
+        );
+    }
+
+    #[test]
+    fn market_row_rejects_a_codeless_funding_dependency() {
+        let fixture: Value =
+            serde_json::from_slice(include_bytes!("../testdata/effective-market-v1.json")).unwrap();
+        let case = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "canonical_cross_ready_compact_funding")
+            .unwrap();
+        let (caller, mut db, request) = fixture_world(case);
+        let funding: Address = case["addresses"]["fundingRate"].as_str().unwrap().parse().unwrap();
+        db.insert_account_info(funding, AccountInfo::default());
+
+        let mut context = EthEvmContext::new(db, Default::default());
+        let mut internals = EvmInternals::from_context(&mut context);
+        let mut reader = JournalReader::new(&mut internals);
+        assert_eq!(
+            load_market_row(&mut reader, caller, &request, 1, 1),
+            Err(LoaderError::Unavailable),
+        );
+    }
+
+    #[test]
+    fn funding_dependency_is_validated_once_across_two_markets() {
+        let caller = Address::repeat_byte(0xc1);
+        let registry = word(schema::STORAGE_NAMESPACES_PERPS_MANAGER_REGISTRY_STORAGE_ROOT);
+        let mut db = InMemoryDB::default();
+        install_zero_funding_dependency(&mut db, caller, registry);
+        let dependency_slot = checked_slot_offset(
+            registry,
+            schema::STORAGE_PATHS_PERPS_REGISTRY_FIELDS_FUNDING_RATE_SLOT_OFFSET,
+        )
+        .unwrap();
+
+        let mut context = EthEvmContext::new(db, Default::default());
+        let mut internals = EvmInternals::from_context(&mut context);
+        let mut reader = JournalReader::new(&mut internals);
+        let mut phases = CountingPhases::default();
+        {
+            let mut context = LoaderContext::new(&mut reader, &mut phases);
+            assert_eq!(load_funding(&mut context, caller, 1), Ok(0));
+            assert_eq!(load_funding(&mut context, caller, 2), Ok(0));
+        }
+
+        assert_eq!(
+            reader
+                .ordered_storage_reads()
+                .iter()
+                .filter(|read| **read == (caller, dependency_slot))
+                .count(),
+            1,
+        );
+        assert_eq!(phases.key_derivations, 5);
+        assert_eq!(phases.journal_loads, 6);
+        assert_eq!(
+            reader.stats(),
+            JournalReadStats { journal_reads: 6, unique_storage_keys: 5, state_access_gas: 13_100 },
         );
     }
 
@@ -2288,8 +2365,9 @@ mod tests {
             },
         );
         let result = result.map(|()| (rows, progress));
+        let journal_reads = reader.journal_reads();
         let reads = reader.ordered_storage_reads().to_vec();
-        assert_eq!(phases.journal_loads as usize, reads.len());
+        assert_eq!(u64::from(phases.journal_loads), journal_reads);
         (result, reads, phases)
     }
 
@@ -2305,6 +2383,10 @@ mod tests {
                 hex_word(item["value"].as_str().unwrap()),
             )
             .unwrap();
+        }
+        let funding: Address = case["addresses"]["fundingRate"].as_str().unwrap().parse().unwrap();
+        if !funding.is_zero() {
+            db.insert_account_info(funding, contract_account_info());
         }
         let request = Request {
             expected_loader_version: 1,
@@ -2328,7 +2410,7 @@ mod tests {
 
     fn install_zero_funding_dependency(db: &mut InMemoryDB, caller: Address, registry: U256) {
         let funding = Address::repeat_byte(0xf1);
-        db.insert_account_info(funding, AccountInfo::default());
+        db.insert_account_info(funding, contract_account_info());
         db.insert_account_storage(
             caller,
             checked_slot_offset(
@@ -2339,6 +2421,11 @@ mod tests {
             U256::from_be_slice(funding.as_slice()),
         )
         .unwrap();
+    }
+
+    fn contract_account_info() -> AccountInfo {
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x00]));
+        AccountInfo { code_hash: code.hash_slow(), code: Some(code), ..Default::default() }
     }
 
     fn fixture_reads(case: &Value) -> Vec<(Address, U256)> {

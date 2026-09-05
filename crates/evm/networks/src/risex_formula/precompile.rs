@@ -687,7 +687,7 @@ mod tests {
 
         let result = execute_specialized(&mut input, &request, &mut metrics, &gas_meter);
         let expected_work_units = result.work_units;
-        assert_eq!(result.stats.journal_reads, 26);
+        assert_eq!(result.stats.journal_reads, 27);
         let encoded = metrics.measure_phase(Phase::OutputEncoding, || {
             result
                 .response
@@ -699,12 +699,12 @@ mod tests {
 
         assert_eq!(encoded.len(), 160);
         assert_eq!(encoded[26], crate::risex_formula::Status::Ok as u8);
-        // The ten-nanosecond StepClock pins 20 key operations and 24 loader
+        // The ten-nanosecond StepClock pins 20 key operations and 25 loader
         // reads. Two additional journal reads load the packed descriptor root
         // and its blob account, while the outer row timer subtracts every nested phase.
         assert_eq!(record["key_derivation_cpu_ns"], 200);
-        assert_eq!(record["journal_load_cpu_ns"], 240);
-        assert_eq!(record["row_materialization_cpu_ns"], 470);
+        assert_eq!(record["journal_load_cpu_ns"], 250);
+        assert_eq!(record["row_materialization_cpu_ns"], 480);
         assert_eq!(record["formula_evaluation_cpu_ns"], 10);
         assert_eq!(record["ordered_reduction_cpu_ns"], 10);
         let phase_sum = [
@@ -749,7 +749,7 @@ mod tests {
         let gas_meter = GasMeter::new(u64::MAX);
 
         let result = execute_specialized(&mut input, &request, &mut metrics, &gas_meter);
-        assert_eq!(result.stats.journal_reads, 27);
+        assert_eq!(result.stats.journal_reads, 28);
         let encoded = metrics.measure_phase(Phase::OutputEncoding, || {
             result
                 .response
@@ -762,11 +762,11 @@ mod tests {
         assert_eq!(record["status"], crate::risex_formula::Status::Unavailable as u8);
         assert_eq!(record["active_markets"], 1);
         assert!(record["work_units"].as_u64().unwrap() > 0);
-        // The late missing-price exit still completed 21 key operations, 25
+        // The late missing-price exit still completed 21 key operations, 26
         // loader reads, and all pure row-building control work before failing.
         assert_eq!(record["key_derivation_cpu_ns"], 210);
-        assert_eq!(record["journal_load_cpu_ns"], 250);
-        assert_eq!(record["row_materialization_cpu_ns"], 470);
+        assert_eq!(record["journal_load_cpu_ns"], 260);
+        assert_eq!(record["row_materialization_cpu_ns"], 480);
         assert_eq!(record["formula_evaluation_cpu_ns"], 0);
         assert_eq!(record["ordered_reduction_cpu_ns"], 0);
         assert_phase_total_reconciles(&record);
@@ -1160,6 +1160,16 @@ mod tests {
             )
             .unwrap();
         }
+        let funding: Address = case["addresses"]["fundingRate"].as_str().unwrap().parse().unwrap();
+        let funding_code = revm::bytecode::Bytecode::new_raw(Bytes::from_static(&[0x00]));
+        db.insert_account_info(
+            funding,
+            AccountInfo {
+                code_hash: funding_code.hash_slow(),
+                code: Some(funding_code),
+                ..Default::default()
+            },
+        );
         install_specialized_descriptor(&mut db, caller, SPECIALIZED_FORMULA_BLOB_CODE_HASH);
         let mut request = specialized_request();
         request[11..13].copy_from_slice(&1_u16.to_be_bytes());
