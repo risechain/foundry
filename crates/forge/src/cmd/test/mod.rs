@@ -121,25 +121,21 @@ const AUTO_CORPUS_DIR: &str = "corpus";
 struct RisexMetricsOutput {
     path: PathBuf,
     mode: ProviderMode,
+    temporary: tempfile::NamedTempFile,
 }
 
 #[cfg(feature = "risex-risk-precompile")]
 impl RisexMetricsOutput {
-    fn finish(self) -> Result<()> {
+    fn finish(mut self) -> Result<()> {
         let peak_rss_bytes = peak_rss_bytes().map_err(|error| eyre::eyre!(error))?;
         let invocations = drain_metrics().map_err(|error| eyre::eyre!(error))?;
         let output = serialize_jsonl(self.mode, peak_rss_bytes, &invocations)?;
-        let parent = self.path.parent().ok_or_else(|| {
-            eyre::eyre!("RISEx metrics path has no parent: {}", self.path.display())
-        })?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent).wrap_err_with(|| {
-            format!("failed to create atomic RISEx metrics file in {}", parent.display())
-        })?;
-        std::io::Write::write_all(temporary.as_file_mut(), &output)
+        std::io::Write::write_all(self.temporary.as_file_mut(), &output)
             .wrap_err("failed to write RISEx metrics")?;
-        std::io::Write::flush(temporary.as_file_mut()).wrap_err("failed to flush RISEx metrics")?;
-        temporary.as_file().sync_all().wrap_err("failed to sync RISEx metrics")?;
-        temporary.persist(&self.path).map_err(|error| {
+        std::io::Write::flush(self.temporary.as_file_mut())
+            .wrap_err("failed to flush RISEx metrics")?;
+        self.temporary.as_file().sync_all().wrap_err("failed to sync RISEx metrics")?;
+        self.temporary.persist(&self.path).map_err(|error| {
             eyre::eyre!(
                 "failed to atomically persist RISEx metrics to {}: {}",
                 self.path.display(),
@@ -1307,16 +1303,29 @@ impl TestArgs {
         if !path.is_absolute() {
             bail!("`--risex-risk-metrics` requires an absolute path");
         }
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            if !metadata.is_file() {
+        match std::fs::metadata(&path) {
+            Ok(metadata) if !metadata.is_file() => {
                 bail!("RISEx metrics output path must be a file: {}", path.display());
             }
-            if metadata.len() != 0 {
+            Ok(metadata) if metadata.len() != 0 => {
                 bail!("RISEx metrics output file is not empty: {}", path.display());
             }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).wrap_err_with(|| {
+                    format!("failed to inspect RISEx metrics output path {}", path.display())
+                });
+            }
         }
+        let parent = path
+            .parent()
+            .ok_or_else(|| eyre::eyre!("RISEx metrics path has no parent: {}", path.display()))?;
+        let temporary = tempfile::NamedTempFile::new_in(parent).wrap_err_with(|| {
+            format!("failed to create atomic RISEx metrics file in {}", parent.display())
+        })?;
         set_metrics_enabled(true);
-        Ok(Some(RisexMetricsOutput { path, mode: provider_mode }))
+        Ok(Some(RisexMetricsOutput { path, mode: provider_mode, temporary }))
     }
 
     #[cfg(feature = "risex-risk-precompile")]

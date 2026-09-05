@@ -70,6 +70,38 @@ forgetest_init!(risex_formula_metrics_flags_validate_before_test_execution, |prj
     assert_eq!(std::fs::read_to_string(absolute).unwrap(), "occupied\n");
 });
 
+forgetest_init!(
+    risex_formula_metrics_reject_path_metadata_errors_before_test_execution,
+    |prj, cmd| {
+        prj.add_test("Broken.t.sol", "not solidity");
+        let parent = prj.root().join("not-a-directory");
+        std::fs::write(&parent, "occupied\n").unwrap();
+        for (metrics, expected) in [
+            (parent.join("risex-metrics.jsonl"), "failed to inspect RISEx metrics output path"),
+            (
+                prj.root().join("missing-directory/risex-metrics.jsonl"),
+                "failed to create atomic RISEx metrics file",
+            ),
+        ] {
+            cmd.forge_fuse().args([
+                "test",
+                "--threads",
+                "1",
+                "--cpu-trace",
+                "--risex-risk-metrics",
+                metrics.to_str().unwrap(),
+            ]);
+            let stderr = cmd.assert_failure().get_output().stderr.clone();
+            assert!(
+                String::from_utf8_lossy(&stderr).contains(expected),
+                "metrics path error was not reported before compilation: {}",
+                String::from_utf8_lossy(&stderr),
+            );
+        }
+        assert_eq!(std::fs::read_to_string(parent).unwrap(), "occupied\n");
+    }
+);
+
 forgetest_init!(risex_formula_metrics_require_single_thread, |prj, cmd| {
     prj.add_test("RisexFormulaMetrics.t.sol", FIXTURE);
     let metrics = prj.root().join("risex-metrics.jsonl");
