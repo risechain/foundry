@@ -64,7 +64,7 @@ pub fn set_provider_mode(requested: ProviderMode) -> Result<(), ProviderModeConf
 static TEST_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-pub(super) fn reset_provider_mode_for_test() -> ProviderModeResetGuard {
+pub(crate) fn reset_provider_mode_for_test() -> ProviderModeResetGuard {
     let test_lock = TEST_CONFIG_LOCK.lock().expect("provider mode test lock poisoned");
     PROVIDER_MODE.store(UNSET_PROVIDER_MODE, Ordering::Relaxed);
     ProviderModeResetGuard { test_lock }
@@ -72,7 +72,7 @@ pub(super) fn reset_provider_mode_for_test() -> ProviderModeResetGuard {
 
 /// Holds exclusive access to the process mode and resets it on drop.
 #[cfg(test)]
-pub(super) struct ProviderModeResetGuard {
+pub(crate) struct ProviderModeResetGuard {
     test_lock: std::sync::MutexGuard<'static, ()>,
 }
 

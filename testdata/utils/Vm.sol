@@ -23,6 +23,7 @@ interface Vm {
     struct StorageAccess { address account; bytes32 slot; bool isWrite; bytes32 previousValue; bytes32 newValue; bool reverted; }
     struct Gas { uint64 gasLimit; uint64 gasTotalUsed; uint64 gasMemoryUsed; int64 gasRefunded; uint64 gasRemaining; }
     struct DebugStep { uint256[] stack; bytes memoryInput; uint8 opcode; uint64 depth; bool isOutOfGas; address contractAddr; }
+    struct FilteredStorageRead { address account; bytes32 slot; }
     struct BroadcastTxSummary { bytes32 txHash; BroadcastTxType txType; address contractAddress; uint64 blockNumber; bool success; }
     struct SignedDelegation { uint8 v; bytes32 r; bytes32 s; uint64 nonce; address implementation; }
     struct PotentialRevert { address reverter; bool partialMatch; bytes revertData; }
@@ -584,6 +585,7 @@ interface Vm {
     function startBroadcast(address signer) external;
     function startBroadcast(uint256 privateKey) external;
     function startDebugTraceRecording() external;
+    function startFilteredStorageReadRecording(bytes32[32] calldata accounts, uint256 count) external;
     function startMappingRecording() external;
     function startPrank(address msgSender) external;
     function startPrank(address msgSender, address txOrigin) external;
@@ -595,6 +597,7 @@ interface Vm {
     function startSnapshotGas(string calldata group, string calldata name) external;
     function startStateDiffRecording() external;
     function stopAndReturnDebugTraceRecording() external returns (DebugStep[] memory step);
+    function stopAndReturnFilteredStorageReadRecording() external returns (FilteredStorageRead[] memory reads);
     function stopAndReturnStateDiff() external returns (AccountAccess[] memory accountAccesses);
     function stopBroadcast() external;
     function stopExpectSafeMemory() external;

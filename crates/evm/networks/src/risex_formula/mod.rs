@@ -13,6 +13,8 @@ mod precompile;
 pub(crate) mod storage;
 
 pub use abi::{Request, Response, Status};
+#[cfg(test)]
+pub(crate) use config::reset_provider_mode_for_test;
 pub use config::{ProviderMode, ProviderModeConflict, provider_mode, set_provider_mode};
 pub use metrics::{
     InvocationMetadata, begin_invocation, clear_metrics, drain_metrics, peak_rss_bytes,

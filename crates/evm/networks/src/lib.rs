@@ -1373,6 +1373,7 @@ mod tests {
 
     #[test]
     fn new_tempo_flag_equivalent_to_legacy() {
+        let _reset = risex_formula::reset_provider_mode_for_test();
         let via_new = NetworkConfigs { network: Some(NetworkVariant::Tempo), ..Default::default() };
         let via_old = NetworkConfigs { tempo: true, ..Default::default() };
         assert_eq!(via_new.is_tempo(), via_old.is_tempo());
