@@ -1,0 +1,377 @@
+{
+  "schema": "risex.risk_formula.loader_slot_vectors",
+  "schemaVersion": 1,
+  "loaderVersion": 1,
+  "encoding": {
+    "word": "32-byte lowercase 0x-prefixed big-endian hex",
+    "mapping": "keccak256(abi.encode(canonical_key, uint256(seed_slot)))",
+    "dynamicArray": "keccak256(abi.encode(uint256(array_slot)))",
+    "packedOffsets": "byte offsets count from the least-significant byte"
+  },
+  "roots": {
+    "perpsMarket": "0x36fc465037eba40ad0a43c7d76cbe7ddad16b5d557357237a0cad2d931247800",
+    "tradingAccount": "0xf46074dc6958ae693e77398ca6fcce65ec4d8eac65bb4dfb47ee4874131fcd00",
+    "portfolio": "0x65d6085942bc2703c9817a6c1a5115836175a71beefe9943884b3c39ebb09800",
+    "perpsRegistry": "0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800",
+    "compactFunding": "0x327d334b535748e4379ba7b9947096dfe93d642b3517b3c5f139dfb5c7332b00",
+    "legacyFunding": "0xf73b406eca64930458c95e101a2fd4801c9c56662d9604c4b661aa637dce2000",
+    "ordersMarketBook": "0x53503d4bb16a18ed678863e22d1794777093b6e4a47757d6b5b5c956d3639900",
+    "riskMarkDirect": "0x070d838e6cf01e9c6eb39928c027eccbd1d49b55814644e6d99008b8bab6885c",
+    "riskMarkControl": "0xfdf686d1a90720564c9731684ba96b15b2ab49414a5983cf65d0ef53bd9fb100",
+    "ordersHook": "0x8968aa8ebdb26f1e2af5359f45852953e93aebee96c764bf9ea4d83af902e800",
+    "localImpactPrefix": "0x6df091490adb00b18ade339258b843d08f7b69b56773f3fc0000000000000000",
+    "formulaRegistry": "0x311eaf2cf29c4b2f8b8ce017889b075a91bdb7242e61b82230138ee4fa0a3700"
+  },
+  "proofCoverage": {
+    "direct": 5,
+    "mapping": 5,
+    "nestedMapping": 3,
+    "bitmap": 3,
+    "ordersBook": 4,
+    "dynamicArray": 3,
+    "dirtyHeap": 10,
+    "tickPrefixIndexes": 3,
+    "fillSegments": 4,
+    "restingOrderMetadata": 4,
+    "tickBitmap": 9,
+    "hookAndPriceDirect": 6,
+    "registry": 7,
+    "blob": 2
+  },
+  "vectors": {
+    "direct": [
+      {
+        "name": "risk_mark_market_0",
+        "marketId": 0,
+        "derivation": "riskMarkDirect + marketId * 2",
+        "word0Slot": "0x070d838e6cf01e9c6eb39928c027eccbd1d49b55814644e6d99008b8bab6885c",
+        "word1Slot": "0x070d838e6cf01e9c6eb39928c027eccbd1d49b55814644e6d99008b8bab6885d"
+      },
+      {
+        "name": "risk_mark_market_1",
+        "marketId": 1,
+        "derivation": "riskMarkDirect + marketId * 2",
+        "word0Slot": "0x070d838e6cf01e9c6eb39928c027eccbd1d49b55814644e6d99008b8bab6885e",
+        "word1Slot": "0x070d838e6cf01e9c6eb39928c027eccbd1d49b55814644e6d99008b8bab6885f"
+      },
+      {
+        "name": "risk_mark_market_max",
+        "marketId": 65535,
+        "derivation": "riskMarkDirect + marketId * 2",
+        "word0Slot": "0x070d838e6cf01e9c6eb39928c027eccbd1d49b55814644e6d99008b8bab8885a",
+        "word1Slot": "0x070d838e6cf01e9c6eb39928c027eccbd1d49b55814644e6d99008b8bab8885b"
+      },
+      {
+        "name": "reduce_only_presence_one",
+        "protocolId": 1,
+        "marketId": 1,
+        "userId": 1,
+        "derivation": "prefix | protocolId << 48 | marketId << 32 | userId",
+        "slot": "0xa2f86ec60ebf83b376cbda250000000000000000000000000001000100000001"
+      },
+      {
+        "name": "reduce_only_presence_max",
+        "protocolId": 4294967295,
+        "marketId": 65535,
+        "userId": 4294967295,
+        "derivation": "prefix | protocolId << 48 | marketId << 32 | userId",
+        "slot": "0xa2f86ec60ebf83b376cbda2500000000000000000000ffffffffffffffffffff"
+      }
+    ],
+    "mapping": [
+      {
+        "name": "perps_market_0",
+        "keyType": "uint16",
+        "key": 0,
+        "seed": "0x36fc465037eba40ad0a43c7d76cbe7ddad16b5d557357237a0cad2d931247801",
+        "slot": "0xdd100700cd9dd5f1bf77020742d17885a8be3aefa84e7a73a193bbb136178985"
+      },
+      {
+        "name": "perps_market_1",
+        "keyType": "uint16",
+        "key": 1,
+        "seed": "0x36fc465037eba40ad0a43c7d76cbe7ddad16b5d557357237a0cad2d931247801",
+        "slot": "0x373077a7453a1ddfbbf37ea58e120e811ba396f2ef10f563da80e4a1747dc086"
+      },
+      {
+        "name": "perps_market_max",
+        "keyType": "uint16",
+        "key": 65535,
+        "seed": "0x36fc465037eba40ad0a43c7d76cbe7ddad16b5d557357237a0cad2d931247801",
+        "slot": "0x41bb687b312345d5fd3df984e235868bb17b10ac00eea9b370afa1ac2249dbda"
+      },
+      {
+        "name": "compact_funding_max",
+        "keyType": "uint16",
+        "key": 65535,
+        "seed": "0x327d334b535748e4379ba7b9947096dfe93d642b3517b3c5f139dfb5c7332b00",
+        "recordSlot": "0x806d599b44bf0b33f71d0ebd279db9e345c7dbd4805b41d0dee2c1a6339a6bae",
+        "cutoverWordSlot": "0x806d599b44bf0b33f71d0ebd279db9e345c7dbd4805b41d0dee2c1a6339a6baf"
+      },
+      {
+        "name": "legacy_funding_max",
+        "keyType": "uint16",
+        "key": 65535,
+        "seed": "0xf73b406eca64930458c95e101a2fd4801c9c56662d9604c4b661aa637dce2000",
+        "recordSlot": "0x46b11f80f2ea2720cd9f931468cc1624b166d9d88626c5bb6f1fcf464a70a1e7"
+      }
+    ],
+    "nestedMapping": [
+      {
+        "name": "trading_account_zero",
+        "outerKeyType": "uint16",
+        "outerKey": 0,
+        "innerKeyType": "uint32",
+        "innerKey": 0,
+        "outerSlot": "0xd448556608384fb94d58e20bcfb6c74fd3a35c99ef0108bd8507e0c7ebd4a162",
+        "recordSlot": "0xe40d2177406ea640999ba2b18e5e1737c3412f6459e9b818b3f425fb15948f60"
+      },
+      {
+        "name": "trading_account_one",
+        "outerKeyType": "uint16",
+        "outerKey": 1,
+        "innerKeyType": "uint32",
+        "innerKey": 1,
+        "outerSlot": "0xf8938883bdf00e55fc4d869b2f689fc8caa3188267351779364e9268c91ab618",
+        "recordSlot": "0x3e8df7a971e8c924d51f220ca95a3cd0d47ae51b5c0bfe70d806f78ec8c55855"
+      },
+      {
+        "name": "trading_account_max",
+        "outerKeyType": "uint16",
+        "outerKey": 65535,
+        "innerKeyType": "uint32",
+        "innerKey": 4294967295,
+        "outerSlot": "0xbead0c4216b19ef0a405e2c1b71da2c9fa19ab9ba8f245180be74170ea6b4d8e",
+        "recordSlot": "0xcf968b8168c84599c15167613016ac8064e0c021ddb5262f58024d43a59576ab"
+      }
+    ],
+    "bitmap": [
+      {
+        "name": "portfolio_zero",
+        "userId": 0,
+        "marketId": 0,
+        "portfolioSlot": "0xae840daed3d2e4d8b3a9cff006e60e8573df7ffeb975632169a93c7f9ac47eba",
+        "bucket": 0,
+        "crossBucketSlot": "0xbae696321cd4081feb74d3177084f1a11414f26c8fde801bc443e7f66967a416",
+        "isolatedBucketSlot": "0xd00326db8e44ad79b3cad908fee3bea3f3a96786e9fb98625240a3f011ae3521",
+        "bitMask": "0x0000000000000000000000000000000000000000000000000000000000000001"
+      },
+      {
+        "name": "portfolio_one",
+        "userId": 1,
+        "marketId": 1,
+        "portfolioSlot": "0x5ffb143f15755f4bb0c7c997eea44716d9cfc719fc80fe2bb18e7f80e809b983",
+        "bucket": 0,
+        "crossBucketSlot": "0x7161daeeb057f557e783a1d39388a9f66bc62472f5f6dc52a8b8203b2b45034f",
+        "isolatedBucketSlot": "0xf46848849ea47db6030858da2b2c71e96b7fcf3c14ff185a39f3b5761267b7d1",
+        "bitMask": "0x0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      {
+        "name": "portfolio_max",
+        "userId": 4294967295,
+        "marketId": 65535,
+        "portfolioSlot": "0xa2826ce4237fe90ed91a15fbfdced42c8f5fc64e31b1d5696804ec62ca6f906c",
+        "bucket": 255,
+        "crossBucketSlot": "0xd03a9839fb04e71442799b09d819679e6df8ef3ed93c0625d6fafd20bf397f95",
+        "isolatedBucketSlot": "0x18de2170cc73dd57646714ebd3e271bd4f4ffd0f1f7c8994231043b5832df8de",
+        "bitMask": "0x8000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "ordersBook": {
+      "protocol": "0x111122223333444455556666777788889999aaaa",
+      "protocolSlot": "0x60bf635d63151289d3d1af42e9adf4e8d311441b920622bcc0dd9395550e5e3d",
+      "markets": [
+        {
+          "marketId": 0,
+          "bookSlot": "0xa681bd65132f96552e282cab4365e84a88684b93c0db94f63e064a1b499a7e84",
+          "queueCountersSlot": "0xa681bd65132f96552e282cab4365e84a88684b93c0db94f63e064a1b499a7e85",
+          "metadataSeed": "0xa681bd65132f96552e282cab4365e84a88684b93c0db94f63e064a1b499a7e92",
+          "openOrdersSeed": "0xa681bd65132f96552e282cab4365e84a88684b93c0db94f63e064a1b499a7e93"
+        },
+        {
+          "marketId": 1,
+          "bookSlot": "0xbd7fc8ea3c1b844bb0609b27a0e33e50d9d6767e2b0aac4a280e6fa4c880bc94",
+          "queueCountersSlot": "0xbd7fc8ea3c1b844bb0609b27a0e33e50d9d6767e2b0aac4a280e6fa4c880bc95",
+          "metadataSeed": "0xbd7fc8ea3c1b844bb0609b27a0e33e50d9d6767e2b0aac4a280e6fa4c880bca2",
+          "openOrdersSeed": "0xbd7fc8ea3c1b844bb0609b27a0e33e50d9d6767e2b0aac4a280e6fa4c880bca3"
+        },
+        {
+          "marketId": 65535,
+          "bookSlot": "0x531672662928e779d9a3d6cdbd7797e052115e25893570b27953617e87ecb520",
+          "queueCountersSlot": "0x531672662928e779d9a3d6cdbd7797e052115e25893570b27953617e87ecb521",
+          "metadataSeed": "0x531672662928e779d9a3d6cdbd7797e052115e25893570b27953617e87ecb52e",
+          "openOrdersSeed": "0x531672662928e779d9a3d6cdbd7797e052115e25893570b27953617e87ecb52f"
+        }
+      ]
+    },
+    "dynamicArray": [
+      {
+        "name": "tick_order_id_zero",
+        "marketId": 65535,
+        "tick": 0,
+        "elementIndex": 0,
+        "tickLevelSlot": "0xd2b7b1f4aaa3cb00979d4d8a5398d5a37ee2a9a26a42440457a94ff47c5c5d48",
+        "dataRoot": "0x2fc17af67aa1e7df7021385199c6a5b1bacf89287d88762500e0c94a44360e2b",
+        "elementSlot": "0x2fc17af67aa1e7df7021385199c6a5b1bacf89287d88762500e0c94a44360e2b",
+        "byteOffset": 0,
+        "byteWidth": 5
+      },
+      {
+        "name": "tick_order_id_one",
+        "marketId": 65535,
+        "tick": 1,
+        "elementIndex": 1,
+        "tickLevelSlot": "0xedd4384892fe311fb01a96edd28965858b4621b86148b00b03f3ddca77fe5746",
+        "dataRoot": "0x3751286085602486101066b8d62f2a193ed38624ca2f23acd0350e5aff30dd1f",
+        "elementSlot": "0x3751286085602486101066b8d62f2a193ed38624ca2f23acd0350e5aff30dd1f",
+        "byteOffset": 5,
+        "byteWidth": 5
+      },
+      {
+        "name": "tick_order_id_max",
+        "marketId": 65535,
+        "tick": 16777215,
+        "elementIndex": 32767,
+        "seqId": 32768,
+        "tickLevelSlot": "0x9e04c0acdc6a1d2bae1783ddff54d9f678509bd64b0fb7c63adb26849dbeefc5",
+        "dataRoot": "0x3483fb276b2c836a32703946a87bfaaff3195f0fb524ba7d0e28170b13f8117e",
+        "elementSlot": "0x3483fb276b2c836a32703946a87bfaaff3195f0fb524ba7d0e28170b13f826d3",
+        "byteOffset": 5,
+        "byteWidth": 5
+      }
+    ],
+    "dirtyHeap": {
+      "marketId": 65535,
+      "keysLengthSlot": "0x531672662928e779d9a3d6cdbd7797e052115e25893570b27953617e87ecb525",
+      "keysDataRoot": "0x9c0a8a0a6bfcd20ea9204487b9593de29de9a8ccab9a1bb31d6ddca1652f4065",
+      "keys": [
+        { "index": 0, "slot": "0x9c0a8a0a6bfcd20ea9204487b9593de29de9a8ccab9a1bb31d6ddca1652f4065", "bitOffset": 0 },
+        { "index": 3, "slot": "0x9c0a8a0a6bfcd20ea9204487b9593de29de9a8ccab9a1bb31d6ddca1652f4065", "bitOffset": 192 },
+        { "index": 4, "slot": "0x9c0a8a0a6bfcd20ea9204487b9593de29de9a8ccab9a1bb31d6ddca1652f4066", "bitOffset": 0 },
+        { "index": 65534, "slot": "0x9c0a8a0a6bfcd20ea9204487b9593de29de9a8ccab9a1bb31d6ddca1652f8064", "bitOffset": 128 }
+      ],
+      "positionSeed": "0x531672662928e779d9a3d6cdbd7797e052115e25893570b27953617e87ecb526",
+      "positions": [
+        { "tick": 0, "mapKey": 0, "slot": "0x132687646c5050e6e57962833a6c76372674bb6caec06d4e3691429de2535d8c", "bitOffset": 0 },
+        { "tick": 15, "mapKey": 0, "slot": "0x132687646c5050e6e57962833a6c76372674bb6caec06d4e3691429de2535d8c", "bitOffset": 240 },
+        { "tick": 16, "mapKey": 1, "slot": "0xfcf62d8e26fd19432edf521bad022e66229dcd0ad9619196eb500aedc6472c68", "bitOffset": 0 },
+        { "tick": 16777215, "mapKey": 1048575, "slot": "0x32815c95c09b28bb3a13f1d988a46fb11e6b471a6da72fe3e02528b4de5b576a", "bitOffset": 240 }
+      ]
+    },
+    "tickPrefixIndexes": [
+      {
+        "name": "minimum_tick",
+        "tick": 0,
+        "tickLevelSlot": "0xd2b7b1f4aaa3cb00979d4d8a5398d5a37ee2a9a26a42440457a94ff47c5c5d48",
+        "legacyFirstSlot": "0xd2b7b1f4aaa3cb00979d4d8a5398d5a37ee2a9a26a42440457a94ff47c5c5d49",
+        "legacyLastSlot": "0xd2b7b1f4aaa3cb00979d4d8a5398d5a37ee2a9a26a42440457a94ff47c5c5e85",
+        "v2RootSlot": "0xd2b7b1f4aaa3cb00979d4d8a5398d5a37ee2a9a26a42440457a94ff47c5c5f11",
+        "v2LastLeafSlot": "0xd2b7b1f4aaa3cb00979d4d8a5398d5a37ee2a9a26a42440457a94ff47c5c71d9"
+      },
+      {
+        "name": "boundary_tick",
+        "tick": 1,
+      "tickLevelSlot": "0xedd4384892fe311fb01a96edd28965858b4621b86148b00b03f3ddca77fe5746",
+      "legacyFirstSlot": "0xedd4384892fe311fb01a96edd28965858b4621b86148b00b03f3ddca77fe5747",
+      "legacyLastSlot": "0xedd4384892fe311fb01a96edd28965858b4621b86148b00b03f3ddca77fe5883",
+      "v2RootSlot": "0xedd4384892fe311fb01a96edd28965858b4621b86148b00b03f3ddca77fe590f",
+      "v2LastLeafSlot": "0xedd4384892fe311fb01a96edd28965858b4621b86148b00b03f3ddca77fe6bd7"
+      },
+      {
+        "name": "maximum_tick",
+        "tick": 16777215,
+        "tickLevelSlot": "0x9e04c0acdc6a1d2bae1783ddff54d9f678509bd64b0fb7c63adb26849dbeefc5",
+        "legacyFirstSlot": "0x9e04c0acdc6a1d2bae1783ddff54d9f678509bd64b0fb7c63adb26849dbeefc6",
+        "legacyLastSlot": "0x9e04c0acdc6a1d2bae1783ddff54d9f678509bd64b0fb7c63adb26849dbef102",
+        "v2RootSlot": "0x9e04c0acdc6a1d2bae1783ddff54d9f678509bd64b0fb7c63adb26849dbef18e",
+        "v2LastLeafSlot": "0x9e04c0acdc6a1d2bae1783ddff54d9f678509bd64b0fb7c63adb26849dbf0456"
+      }
+    ],
+    "fillSegments": {
+      "seed": "0x9e04c0acdc6a1d2bae1783ddff54d9f678509bd64b0fb7c63adb26849dbef18d",
+      "vectors": [
+        { "index": 0, "slot": "0xbd0f43be623b870a050fcb34a55e30c27da0c08dbc42ddeccd7619dd5a763910" },
+        { "index": 1, "slot": "0x55e04af6f7f46538e0c447c7c52e545958469d642606d70a35d5ab9886406bb4" },
+        { "index": 4294967295, "slot": "0x91440430dbde7b9f5c3f7637c3720879d8eeeba4705f30d836eae7839fa337d4" }
+      ]
+    },
+    "restingOrderMetadata": {
+      "seed": "0x531672662928e779d9a3d6cdbd7797e052115e25893570b27953617e87ecb52e",
+      "vectors": [
+        { "name": "minimum_nonzero", "orderId": "0x0000000002", "slot": "0xe6ad21db76f0a46c3b8f54cbac1ceec97fb529457843f6d6acae5599084852c4" },
+        { "name": "slot_64_sell_owner_1", "orderId": "0x8000000003", "slot": "0xd2f0b5e7df8715e43b428e079d25aacaf20f899b1b414d6cd9e59b66f42a6fdb" },
+        { "name": "maximum", "orderId": "0xffffffffff", "slot": "0x57d949fdeb4efe0568e06cee5af898f8d02a1fdb51a751f345ec15b6de9d8cf7" }
+      ]
+    },
+    "tickBitmap": {
+      "sideSeed": "0x531672662928e779d9a3d6cdbd7797e052115e25893570b27953617e87ecb523",
+      "buyMapSlot": "0xa237e457fd942b738623fc7fabf3678cca2c93bb01be8ac13193a17d2eaaa021",
+      "sellMapSlot": "0xa45b52754c5954f8e45ee1da2c9fe228d0184110e67c570941ee49182cd6ec10",
+      "buyRootSlot": "0x5d6a8676f210b6c4891ffd6899332a4ee1c1e74153cef60a12dadc623a7ba245",
+      "buyMinLeafSlot": "0x48d3955695c9d24266b63ee2b9990e2c8ebbc7b94a81f1fcb069e7d5f964aed3",
+      "buyMaxLeafSlot": "0xe3043567fe4ba6b00ad5167b703ab8ab1e44cf49a688e849060d72a6de7635e6",
+      "sellRootSlot": "0x00ff5018ade8a707fe9727f343b2582010cce3c779422339409b3a8ecc374ade",
+      "sellMinLeafSlot": "0x02f3bf95596b73e911f3d838d94d96866ab03e1cda08c0233d21b771e20ec206",
+      "sellMaxLeafSlot": "0xa4cd75aa99365fa45e1df2fe47fee517e2a92bf90d4864e947e7482dfbc359af"
+    },
+    "hookAndPriceDirect": {
+      "hookProtocolRegistrationSlot": "0xb184c3f23729764b32e853141e1ff2b7f3b0db62a426aed80bf8a622054a6b7b",
+      "hookActivationSlot": "0x8968aa8ebdb26f1e2af5359f45852953e93aebee96c764bf9ea4d83af902e801",
+      "riskMarkControlSlot": "0xfdf686d1a90720564c9731684ba96b15b2ab49414a5983cf65d0ef53bd9fb100",
+      "localizedImpact": [
+        { "protocolId": 1, "marketId": 0, "stateSlot": "0x6df091490adb00b18ade339258b843d08f7b69b56773f3fc0000000000020000", "configSlot": "0x6df091490adb00b18ade339258b843d08f7b69b56773f3fc0000000000020001" },
+        { "protocolId": 1, "marketId": 65535, "stateSlot": "0x6df091490adb00b18ade339258b843d08f7b69b56773f3fc000000000003fffe", "configSlot": "0x6df091490adb00b18ade339258b843d08f7b69b56773f3fc000000000003ffff" },
+        { "protocolId": 4294967295, "marketId": 65535, "stateSlot": "0x6df091490adb00b18ade339258b843d08f7b69b56773f3fc0001fffffffffffe", "configSlot": "0x6df091490adb00b18ade339258b843d08f7b69b56773f3fc0001ffffffffffff" }
+      ]
+    },
+    "registry": {
+      "perpsDependencies": [
+        {
+          "field": "fundingRate",
+          "slot": "0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800",
+          "byteOffset": 0,
+          "byteWidth": 20
+        },
+        {
+          "field": "ordersManager",
+          "slot": "0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e804",
+          "byteOffset": 0,
+          "byteWidth": 20
+        },
+        {
+          "field": "risexOracle",
+          "slot": "0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e805",
+          "byteOffset": 0,
+          "byteWidth": 20
+        },
+        {
+          "field": "accountRegistry_and_orderRiskActivationSeal",
+          "slot": "0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e806",
+          "addressByteOffset": 0,
+          "sealByteOffset": 20
+        }
+      ],
+      "formulaDescriptors": [
+        {
+          "metricId": 1,
+          "valid": true,
+          "packedDescriptorSlot": "0x311eaf2cf29c4b2f8b8ce017889b075a91bdb7242e61b82230138ee4fa0a3700"
+        }
+      ],
+      "formulaDescriptorPacking": [
+        { "field": "blob", "byteOffset": 0, "byteWidth": 20 },
+        { "field": "formulaEpoch", "byteOffset": 20, "byteWidth": 4 }
+      ]
+    },
+    "blob": {
+      "note": "fixture-only immutable-code derivation vector; it is not the compiled portfolio formula",
+      "runtime": "0x00525346310102030405000100010000000100000010000000000000000000a1b2c3d4e5f6",
+      "runtimeCodeHash": "0xfbab12f75a9a0de58304fb7c5aecab029ecc88ac3eeb79f09142baef6c1bb8db",
+      "factory": "0x1234567890abcdef1234567890abcdef12345678",
+      "salt": "0x102132435465768798a9bacbdcedfe0f102132435465768798a9bacbdcedfe0f",
+      "initCodeHash": "0xf1e2d3c4b5a697887766554433221100f1e2d3c4b5a697887766554433221100",
+      "create2Address": "0xe6be52958ce56d65bdaf17528315f0e7b447a8fa",
+      "create2Formula": "last20(keccak256(0xff || factory || salt || initCodeHash))"
+    }
+  }
+}

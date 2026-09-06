@@ -4,6 +4,51 @@
       "name": "CheatcodeError",
       "description": "Error thrown by cheatcodes.",
       "declaration": "error CheatcodeError(string message);"
+    },
+    {
+      "name": "FilteredStorageReadAccountFilterDuplicate",
+      "description": "The requested storage-account filter contains a duplicate account.",
+      "declaration": "error FilteredStorageReadAccountFilterDuplicate(address account);"
+    },
+    {
+      "name": "FilteredStorageReadAccountFilterEmpty",
+      "description": "A compact ordered SLOAD recording requires at least one storage account.",
+      "declaration": "error FilteredStorageReadAccountFilterEmpty();"
+    },
+    {
+      "name": "FilteredStorageReadAccountFilterNonCanonicalAddress",
+      "description": "The requested selected-account word has nonzero address padding.",
+      "declaration": "error FilteredStorageReadAccountFilterNonCanonicalAddress(uint256 index, bytes32 word);"
+    },
+    {
+      "name": "FilteredStorageReadAccountFilterNonCanonicalTail",
+      "description": "The requested storage-account filter has a nonzero unused fixed-array entry.",
+      "declaration": "error FilteredStorageReadAccountFilterNonCanonicalTail(uint256 index, bytes32 word);"
+    },
+    {
+      "name": "FilteredStorageReadAccountFilterTooLarge",
+      "description": "The requested storage-account filter exceeds the supported bound.",
+      "declaration": "error FilteredStorageReadAccountFilterTooLarge(uint256 count, uint256 max);"
+    },
+    {
+      "name": "FilteredStorageReadAccountFilterZero",
+      "description": "The requested storage-account filter contains a zero selected account.",
+      "declaration": "error FilteredStorageReadAccountFilterZero(uint256 index);"
+    },
+    {
+      "name": "FilteredStorageReadRecordingAlreadyStarted",
+      "description": "Another compact ordered SLOAD recording is already active.",
+      "declaration": "error FilteredStorageReadRecordingAlreadyStarted();"
+    },
+    {
+      "name": "FilteredStorageReadRecordingNotStarted",
+      "description": "No compact ordered SLOAD recording is active.",
+      "declaration": "error FilteredStorageReadRecordingNotStarted();"
+    },
+    {
+      "name": "FilteredStorageReadResultOverflow",
+      "description": "The compact ordered SLOAD result exceeded the supported bound.",
+      "declaration": "error FilteredStorageReadResultOverflow(uint256 max);"
     }
   ],
   "events": [],
@@ -576,6 +621,22 @@
           "name": "contractAddr",
           "ty": "address",
           "description": "The contract address where the opcode is running"
+        }
+      ]
+    },
+    {
+      "name": "FilteredStorageRead",
+      "description": "An ordered SLOAD captured for an explicitly selected effective storage account.",
+      "fields": [
+        {
+          "name": "account",
+          "ty": "address",
+          "description": "The effective storage account read by the SLOAD."
+        },
+        {
+          "name": "slot",
+          "ty": "bytes32",
+          "description": "The exact 256-bit storage slot read by the SLOAD."
         }
       ]
     },
@@ -11840,6 +11901,26 @@
     },
     {
       "func": {
+        "id": "startFilteredStorageReadRecording",
+        "description": "Starts compact ordered SLOAD recording for an explicit set of effective storage accounts.\n`count` must be 1 through 32. Each selected prefix word must be a unique nonzero canonical\naddress and every unused fixed-array word must be zero. At most 65,536 reads are retained.",
+        "declaration": "function startFilteredStorageReadRecording(bytes32[32] calldata accounts, uint256 count) external;",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "startFilteredStorageReadRecording(bytes32[32],uint256)",
+        "selector": "0x7599ca0b",
+        "selectorBytes": [
+          117,
+          153,
+          202,
+          11
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "startMappingRecording",
         "description": "Starts recording mapping SSTOREs for later retrieval.",
         "declaration": "function startMappingRecording() external;",
@@ -12052,6 +12133,26 @@
           211,
           152,
           162
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "stopAndReturnFilteredStorageReadRecording",
+        "description": "Stops compact ordered SLOAD recording and returns every selected read in execution order.",
+        "declaration": "function stopAndReturnFilteredStorageReadRecording() external returns (FilteredStorageRead[] memory reads);",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "stopAndReturnFilteredStorageReadRecording()",
+        "selector": "0x3d138eb1",
+        "selectorBytes": [
+          61,
+          19,
+          142,
+          177
         ]
       },
       "group": "evm",

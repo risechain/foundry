@@ -50,6 +50,12 @@ const MONAD_CHEATCODE_ADDRESSES: &[Address] = &[MONAD_CHEATCODE_ADDRESS];
 pub mod arbitrum;
 pub mod celo;
 
+#[cfg(feature = "risex-risk-precompile")]
+pub mod risex_formula;
+
+#[cfg(all(test, not(feature = "risex-risk-precompile")))]
+mod risex_formula;
+
 #[cfg(feature = "optimism")]
 mod optimism;
 
@@ -783,6 +789,12 @@ impl NetworkConfigs {
                 Some(celo::transfer::precompile())
             });
         }
+        #[cfg(feature = "risex-risk-precompile")]
+        if risex_formula::provider_mode() == risex_formula::ProviderMode::Specialized {
+            precompiles.apply_precompile(&risex_formula::RISEX_RISK_FORMULA_ADDRESS, move |_| {
+                Some(risex_formula::risk_formula_precompile())
+            });
+        }
     }
 
     /// Injects chain-specific precompiles active at the given timestamp.
@@ -813,6 +825,11 @@ impl NetworkConfigs {
         let mut labels = AddressHashMap::default();
         if self.is_celo() {
             labels.insert(CELO_TRANSFER_ADDRESS, CELO_TRANSFER_LABEL.to_string());
+        }
+        #[cfg(feature = "risex-risk-precompile")]
+        if risex_formula::provider_mode() == risex_formula::ProviderMode::Specialized {
+            labels
+                .insert(risex_formula::RISEX_RISK_FORMULA_ADDRESS, "RISExRiskFormula".to_string());
         }
         if self.is_tempo() {
             labels.extend(
@@ -1356,6 +1373,7 @@ mod tests {
 
     #[test]
     fn new_tempo_flag_equivalent_to_legacy() {
+        let _reset = risex_formula::reset_provider_mode_for_test();
         let via_new = NetworkConfigs { network: Some(NetworkVariant::Tempo), ..Default::default() };
         let via_old = NetworkConfigs { tempo: true, ..Default::default() };
         assert_eq!(via_new.is_tempo(), via_old.is_tempo());
