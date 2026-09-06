@@ -117,7 +117,10 @@ impl<'reader, 'evm> JournalReader<'reader, 'evm> {
                     consume_gas(gas_meter, cold_cost)?;
                     unreachable!("cold load was skipped only when its gas was unavailable")
                 }
-                Err(error) => return Err(error.unwrap_db_error()),
+                Err(error) => {
+                    Self::record_state_access(&mut self.state_access_gas, WARM_STORAGE_READ_COST);
+                    return Err(error.unwrap_db_error());
+                }
             };
         let value = match account.data.sload(key, skip_cold_load) {
             Ok(value) => value,
@@ -126,14 +129,21 @@ impl<'reader, 'evm> JournalReader<'reader, 'evm> {
                 consume_gas(gas_meter, cold_cost)?;
                 unreachable!("cold load was skipped only when its gas was unavailable")
             }
-            Err(error) => return Err(EvmInternalsError::database(error.unwrap_db_error())),
+            Err(error) => {
+                drop(account);
+                Self::record_state_access(&mut self.state_access_gas, WARM_STORAGE_READ_COST);
+                return Err(EvmInternalsError::database(error.unwrap_db_error()));
+            }
         };
         let (value, is_cold) = (value.data.present_value(), value.is_cold);
         drop(account);
         if is_cold {
             consume_gas(gas_meter, cold_cost)?;
         }
-        self.record_state_access(if is_cold { COLD_SLOAD_COST } else { WARM_STORAGE_READ_COST });
+        Self::record_state_access(
+            &mut self.state_access_gas,
+            if is_cold { COLD_SLOAD_COST } else { WARM_STORAGE_READ_COST },
+        );
         Ok(value)
     }
 
@@ -153,18 +163,20 @@ impl<'reader, 'evm> JournalReader<'reader, 'evm> {
                 consume_gas(gas_meter, cold_cost)?;
                 unreachable!("cold load was skipped only when its gas was unavailable")
             }
-            Err(error) => return Err(error.unwrap_db_error()),
+            Err(error) => {
+                Self::record_state_access(&mut self.state_access_gas, WARM_STORAGE_READ_COST);
+                return Err(error.unwrap_db_error());
+            }
         };
         let (code_hash, is_cold) = (*account.data.code_hash(), account.is_cold);
         drop(account);
         if is_cold {
             consume_gas(gas_meter, cold_cost)?;
         }
-        self.record_state_access(if is_cold {
-            COLD_ACCOUNT_ACCESS_COST
-        } else {
-            WARM_STORAGE_READ_COST
-        });
+        Self::record_state_access(
+            &mut self.state_access_gas,
+            if is_cold { COLD_ACCOUNT_ACCESS_COST } else { WARM_STORAGE_READ_COST },
+        );
         Ok(code_hash)
     }
 
@@ -203,9 +215,8 @@ impl<'reader, 'evm> JournalReader<'reader, 'evm> {
             .expect("loader bounds keep the journal-read count within u64");
     }
 
-    const fn record_state_access(&mut self, gas: u64) {
-        self.state_access_gas = self
-            .state_access_gas
+    const fn record_state_access(state_access_gas: &mut u64, gas: u64) {
+        *state_access_gas = state_access_gas
             .checked_add(gas)
             .expect("loader bounds keep state-access gas within u64");
     }
@@ -553,14 +564,15 @@ mod tests {
         eth::{EthEvmBuilder, EthEvmContext},
         precompiles::{DynPrecompile, PrecompilesMap},
     };
-    use alloy_primitives::{Address, Bytes, I256, U256, address, hex};
+    use alloy_primitives::{Address, B256, Bytes, I256, U256, address, hex};
     use revm::{
         bytecode::Bytecode,
         context::TxEnv,
         context_interface::cfg::gas::{
             COLD_ACCOUNT_ACCESS_COST, COLD_SLOAD_COST, WARM_STORAGE_READ_COST,
         },
-        database::InMemoryDB,
+        database::{CacheDB, DatabaseRef, InMemoryDB},
+        database_interface::ErasedError,
         precompile::{PrecompileId, PrecompileOutput, Precompiles},
         primitives::TxKind,
         state::AccountInfo,
@@ -933,6 +945,70 @@ mod tests {
         let mut reader = JournalReader::new(&mut internals);
         assert_eq!(reader.code_hash(address).unwrap(), expected);
         assert_eq!(reader.stats().state_access_gas, WARM_STORAGE_READ_COST);
+    }
+
+    #[test]
+    fn journal_reader_preserves_precharged_gas_on_database_errors() {
+        #[derive(Debug)]
+        struct FailingReadDb;
+
+        impl DatabaseRef for FailingReadDb {
+            type Error = ErasedError;
+
+            fn basic_ref(&self, _: Address) -> Result<Option<AccountInfo>, Self::Error> {
+                Err(ErasedError::new(std::io::Error::other("injected account read failure")))
+            }
+
+            fn storage_ref(&self, _: Address, _: U256) -> Result<U256, Self::Error> {
+                Err(ErasedError::new(std::io::Error::other("injected storage read failure")))
+            }
+
+            fn code_by_hash_ref(&self, _: B256) -> Result<Bytecode, Self::Error> {
+                unreachable!()
+            }
+
+            fn block_hash_ref(&self, _: u64) -> Result<B256, Self::Error> {
+                unreachable!()
+            }
+        }
+
+        let address = Address::repeat_byte(0xa8);
+        for (cached_account, code_hash) in [(false, false), (true, false), (false, true)] {
+            let mut db = CacheDB::new(FailingReadDb);
+            if cached_account {
+                db.insert_account_info(address, AccountInfo::default());
+            }
+            let mut context = EthEvmContext::new(db, Default::default());
+            let mut internals = alloy_evm::EvmInternals::from_context(&mut context);
+            let meter = GasMeter::new(10_000);
+            let mut reader = JournalReader::with_gas_meter(&mut internals, &meter);
+
+            for attempts in 1..=2 {
+                let error = if code_hash {
+                    reader.code_hash(address).unwrap_err()
+                } else {
+                    reader.sload(address, U256::ZERO).unwrap_err()
+                };
+                assert!(error.to_string().contains(if cached_account {
+                    "injected storage read failure"
+                } else {
+                    "injected account read failure"
+                }));
+                assert_eq!(
+                    reader.stats(),
+                    JournalReadStats {
+                        journal_reads: attempts,
+                        unique_storage_keys: u64::from(!code_hash),
+                        state_access_gas: attempts * WARM_STORAGE_READ_COST,
+                    },
+                );
+                assert_eq!(
+                    meter.used.get(),
+                    reader.state_access_gas + reader.unique_storage_keys()
+                );
+                assert!(!meter.is_exhausted());
+            }
+        }
     }
 
     #[test]
