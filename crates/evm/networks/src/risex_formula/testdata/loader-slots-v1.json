@@ -105,8 +105,7 @@
         "keyType": "uint16",
         "key": 65535,
         "seed": "0x327d334b535748e4379ba7b9947096dfe93d642b3517b3c5f139dfb5c7332b00",
-        "recordSlot": "0x806d599b44bf0b33f71d0ebd279db9e345c7dbd4805b41d0dee2c1a6339a6bae",
-        "cutoverWordSlot": "0x806d599b44bf0b33f71d0ebd279db9e345c7dbd4805b41d0dee2c1a6339a6baf"
+        "recordSlot": "0x806d599b44bf0b33f71d0ebd279db9e345c7dbd4805b41d0dee2c1a6339a6bae"
       },
       {
         "name": "legacy_funding_max",

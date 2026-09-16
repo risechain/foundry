@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "loader": "effective_market_v1",
   "loaderVersion": 1,
-  "sourceBaseRevision": "037d7217b620065c3b41d8a04a570741fe140c63",
+  "sourceBaseRevision": "9c202cd5d8a2c3956da6a68055d336a6629996f9",
   "encoding": {
     "word": "32-byte lowercase 0x-prefixed big-endian hex",
     "integer": "base-10 string except bounded identifiers",
@@ -325,7 +325,7 @@
     "ready_risk",
     "unready_risk",
     "wrong_epoch_risk",
-    "funding_legacy",
+    "retired_funding_ignored",
     "target_active",
     "isolated",
     "leverage_fallback",
@@ -425,7 +425,6 @@
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0x3e8df7a971e8c924d51f220ca95a3cd0d47ae51b5c0bfe70d806f78ec8c55858","value":"0x8001000000000000000000000000000000000000000000000000000000000000"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0x373077a7453a1ddfbbf37ea58e120e811ba396f2ef10f563da80e4a1747dc088","value":"0x0000c3500de0b6b3a764000000038d7ea4c68000ffffffffffffffff0000000a"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800","value":"0x000000000000000000000000212224d2f2d262cd093ee13240ca4873fccbba3c"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d66","value":"0x679d6400679d6400000000000000000000000000000000000000000000000000"},
         {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d65","value":"0x679d640000000000000000000000000000000000000000000000000000000000"}
       ],
       "orderedRows": [{"marketId":1,"marginMode":0,"effectivePositionSize":"10000000000000000","effectivePositionQuote":"-1000000000000000000000","effectiveLastFundingPayment":"0","effectiveLeverageWad":"50000000000000000000","effectiveIsolatedBalance":"0","projectedSettlementPnl":"0","effectiveBuyOrderSize":"0","effectiveSellOrderSize":"0","effectiveOrderNotional":"0","markPrice":"100000000000000000000000","accumulatedFundingPayment":"0"}],
@@ -433,7 +432,7 @@
       "finalRow": {"marketId":1,"marginMode":0,"effectivePositionSize":"10000000000000000","effectivePositionQuote":"-1000000000000000000000","effectiveLastFundingPayment":"0","effectiveLeverageWad":"50000000000000000000","effectiveIsolatedBalance":"0","projectedSettlementPnl":"0","effectiveBuyOrderSize":"0","effectiveSellOrderSize":"0","effectiveOrderNotional":"0","markPrice":"100000000000000000000000","accumulatedFundingPayment":"0"},
       "status": "OK",
       "orderedJournalReads": {
-        "count":24,
+        "count":23,
         "items":[
           {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e806"},
           {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0x36fc465037eba40ad0a43c7d76cbe7ddad16b5d557357237a0cad2d931247800"},
@@ -457,10 +456,9 @@
           {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0xc8223f5c89f4f1844370360c5fdf0501924e9119c1a6ad60b73446dc65755013"},
           {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0xc8223f5c89f4f1844370360c5fdf0501924e9119c1a6ad60b73446dc65755013"},
           {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800"},
-          {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d66"},
           {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d65"}
         ],
-        "commitment":"0xa529235aea6c3de6bd6b1d50c1f1187795459ac4df0139214180fa8fa4135685"
+        "commitment":"0x10048e068c9776eb240447dddd5a79d703b95a73bc4a462493180c8513699e97"
       },
       "canonicalHarness":{"authority":"current-production-libraries-and-views","test":"EffectiveMarketV1CanonicalHarnessTest.testCanonicalCrossWorldProducesCompleteTargetRow"}
     },
@@ -485,14 +483,13 @@
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0x3e8df7a971e8c924d51f220ca95a3cd0d47ae51b5c0bfe70d806f78ec8c55858","value":"0x8001000000000000000000000000000000000000000000000000000000000000"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0x373077a7453a1ddfbbf37ea58e120e811ba396f2ef10f563da80e4a1747dc088","value":"0x0000c3500de0b6b3a764000000038d7ea4c68000ffffffffffffffff0000000a"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800","value":"0x000000000000000000000000212224d2f2d262cd093ee13240ca4873fccbba3c"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d66","value":"0x679d6400679d6400000000000000000000000000000000000000000000000000"},
         {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d65","value":"0x679d640000000000000000000000000000000000000000000000000000000000"}
       ],
       "orderedRows":[{"marketId":1,"marginMode":1,"effectivePositionSize":"10000000000000000","effectivePositionQuote":"-1000000000000000000000","effectiveLastFundingPayment":"0","effectiveLeverageWad":"50000000000000000000","effectiveIsolatedBalance":"20000000000000000000","projectedSettlementPnl":"0","effectiveBuyOrderSize":"0","effectiveSellOrderSize":"0","effectiveOrderNotional":"0","markPrice":"100000000000000000000000","accumulatedFundingPayment":"0"}],
       "projectedChunks":{"count":0,"items":[],"commitment":"0x0000000000000000000000000000000000000000000000000000000000000000"},
       "finalRow":{"marketId":1,"marginMode":1,"effectivePositionSize":"10000000000000000","effectivePositionQuote":"-1000000000000000000000","effectiveLastFundingPayment":"0","effectiveLeverageWad":"50000000000000000000","effectiveIsolatedBalance":"20000000000000000000","projectedSettlementPnl":"0","effectiveBuyOrderSize":"0","effectiveSellOrderSize":"0","effectiveOrderNotional":"0","markPrice":"100000000000000000000000","accumulatedFundingPayment":"0"},
       "status":"OK",
-      "orderedJournalReads":{"count":24,"items":[
+      "orderedJournalReads":{"count":23,"items":[
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e806"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0x36fc465037eba40ad0a43c7d76cbe7ddad16b5d557357237a0cad2d931247800"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xf46848849ea47db6030858da2b2c71e96b7fcf3c14ff185a39f3b5761267b7d1"},
@@ -515,9 +512,8 @@
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0xc8223f5c89f4f1844370360c5fdf0501924e9119c1a6ad60b73446dc65755013"},
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0xc8223f5c89f4f1844370360c5fdf0501924e9119c1a6ad60b73446dc65755013"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d66"},
         {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d65"}
-      ],"commitment":"0xa529235aea6c3de6bd6b1d50c1f1187795459ac4df0139214180fa8fa4135685"},
+      ],"commitment":"0x10048e068c9776eb240447dddd5a79d703b95a73bc4a462493180c8513699e97"},
       "canonicalHarness":{"authority":"current-production-libraries-and-views","test":"EffectiveMarketV1CanonicalHarnessTest.testCanonicalIsolatedWorldUsesProductionLeverageFallbackAndFundingView"}
     },
     {
@@ -568,8 +564,8 @@
       "canonicalHarness":{"authority":"current-production-libraries-and-views","test":"ProjectedFillReplayStateRegressionTest.test_regression_projection_capacityError_reportsObservedChunkCount"}
     },
     {
-      "name":"canonical_unready_risk_live_orders_legacy_funding",
-      "covers":["unready_risk","funding_legacy","live_orders_fallback"],
+      "name":"canonical_unready_risk_live_orders_compact_funding",
+      "covers":["unready_risk","retired_funding_ignored","live_orders_fallback"],
       "timestamp":1738368000,
       "addresses":{"caller":"0xc7183455a4c133ae270771860664b6b7ec320bb1","account":"0xb1966322897c16bbaee28b1cc311e05bdd6acd69","fundingRate":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","ordersManager":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","risexOracle":"0xa0cb889707d426a7a386870a03bc70d1b0697598"},
       "request":{"operation":"SNAPSHOT_BEFORE","metricId":1,"expectedFormulaEpoch":1,"expectedLoaderVersion":1,"expectedOperationSetVersion":1,"userId":1,"targetMarketId":1,"expectedLoaderSchemaHash":"fixture-unbound","baseBalance":"0","sourcePolicy":"fixture-live-policy","targetMarkPrice":"100000000000000000000000"},
@@ -592,14 +588,13 @@
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x5b63b3a78c28b859db4e0e536c98371037d724e31027d0b8c2bc89f27d13b3c3","value":"0x000000010000000000000000000000000000000000000000000000000000003e"},
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0xa2f86ec60ebf83b376cbda250000000000000000000000000001000100000001","value":"0x0000000000000000000000000000000000000000000000000000000000000000"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800","value":"0x000000000000000000000000212224d2f2d262cd093ee13240ca4873fccbba3c"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d66","value":"0x0000000000000000000000000000000000000000000000000000000000000000"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x08037c49bfdfe64814db0be809730589296750eec0290609e664fab98db4189d","value":"0x0000000000000000000000000000000000000000000000000000000000000000"}
+        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d65","value":"0x679d640000000000000000000000000000000000000000000000000000000000"}
       ],
       "orderedRows":[{"marketId":1,"marginMode":0,"effectivePositionSize":"10000000000000000","effectivePositionQuote":"-1000000000000000000000","effectiveLastFundingPayment":"0","effectiveLeverageWad":"50000000000000000000","effectiveIsolatedBalance":"0","projectedSettlementPnl":"0","effectiveBuyOrderSize":"0","effectiveSellOrderSize":"0","effectiveOrderNotional":"0","markPrice":"100000000000000000000000","accumulatedFundingPayment":"0"}],
       "projectedChunks":{"count":0,"items":[],"commitment":"0x0000000000000000000000000000000000000000000000000000000000000000"},
       "finalRow":{"marketId":1,"marginMode":0,"effectivePositionSize":"10000000000000000","effectivePositionQuote":"-1000000000000000000000","effectiveLastFundingPayment":"0","effectiveLeverageWad":"50000000000000000000","effectiveIsolatedBalance":"0","projectedSettlementPnl":"0","effectiveBuyOrderSize":"0","effectiveSellOrderSize":"0","effectiveOrderNotional":"0","markPrice":"100000000000000000000000","accumulatedFundingPayment":"0"},
       "status":"OK",
-      "orderedJournalReads":{"count":31,"items":[
+      "orderedJournalReads":{"count":30,"items":[
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e806"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0x36fc465037eba40ad0a43c7d76cbe7ddad16b5d557357237a0cad2d931247800"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xf46848849ea47db6030858da2b2c71e96b7fcf3c14ff185a39f3b5761267b7d1"},
@@ -629,9 +624,8 @@
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x5b63b3a78c28b859db4e0e536c98371037d724e31027d0b8c2bc89f27d13b3c3"},
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0xa2f86ec60ebf83b376cbda250000000000000000000000000001000100000001"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d66"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x08037c49bfdfe64814db0be809730589296750eec0290609e664fab98db4189d"}
-      ],"commitment":"0xd8048e9c7a991ba014782e6de6d846f14e37831c5f6e7f9a27040f1c01fcb23e"},
+        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d65"}
+      ],"commitment":"0x8168c5832c7cc6f7cf2d034ac6929c9ab46e2d078ae4b61ca91bd85c49595ff2"},
       "canonicalHarness":{"authority":"current-production-libraries-and-views","test":"EffectiveMarketV1CanonicalHarnessTest.testCanonicalUnreadyRiskUsesLiveOrdersAndLegacyFunding"}
     },
     {
@@ -659,14 +653,13 @@
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x5b63b3a78c28b859db4e0e536c98371037d724e31027d0b8c2bc89f27d13b3c3","value":"0x000000010000000000000000000000000000000000000000000000000000003e"},
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0xa2f86ec60ebf83b376cbda250000000000000000000000000001000100000001","value":"0x0000000000000000000000000000000000000000000000000000000000000000"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800","value":"0x000000000000000000000000212224d2f2d262cd093ee13240ca4873fccbba3c"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d66","value":"0x679d6400679d6400000000000000000000000000000000000000000000000000"},
         {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d65","value":"0x679d640000000000000000000000000000000000000000000000000000000000"}
       ],
       "orderedRows":[{"marketId":1,"marginMode":0,"effectivePositionSize":"10000000000000000","effectivePositionQuote":"-1000000000000000000000","effectiveLastFundingPayment":"0","effectiveLeverageWad":"50000000000000000000","effectiveIsolatedBalance":"0","projectedSettlementPnl":"0","effectiveBuyOrderSize":"0","effectiveSellOrderSize":"0","effectiveOrderNotional":"0","markPrice":"100000000000000000000000","accumulatedFundingPayment":"0"}],
       "projectedChunks":{"count":0,"items":[],"commitment":"0x0000000000000000000000000000000000000000000000000000000000000000"},
       "finalRow":{"marketId":1,"marginMode":0,"effectivePositionSize":"10000000000000000","effectivePositionQuote":"-1000000000000000000000","effectiveLastFundingPayment":"0","effectiveLeverageWad":"50000000000000000000","effectiveIsolatedBalance":"0","projectedSettlementPnl":"0","effectiveBuyOrderSize":"0","effectiveSellOrderSize":"0","effectiveOrderNotional":"0","markPrice":"100000000000000000000000","accumulatedFundingPayment":"0"},
       "status":"OK",
-      "orderedJournalReads":{"count":31,"items":[
+      "orderedJournalReads":{"count":30,"items":[
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e806"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0x36fc465037eba40ad0a43c7d76cbe7ddad16b5d557357237a0cad2d931247800"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xf46848849ea47db6030858da2b2c71e96b7fcf3c14ff185a39f3b5761267b7d1"},
@@ -696,9 +689,8 @@
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x5b63b3a78c28b859db4e0e536c98371037d724e31027d0b8c2bc89f27d13b3c3"},
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0xa2f86ec60ebf83b376cbda250000000000000000000000000001000100000001"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d66"},
         {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0x0df648ade5d881908e330022bc849ff56c80684eaae3e13ce8b8a7f692375d65"}
-      ],"commitment":"0x63e320d000d8a01d76fdf66b30747d633c42d753a6d9755c65190b5eb45ccb42"},
+      ],"commitment":"0x8168c5832c7cc6f7cf2d034ac6929c9ab46e2d078ae4b61ca91bd85c49595ff2"},
       "canonicalHarness":{"authority":"current-production-libraries-and-views","test":"EffectiveMarketV1CanonicalHarnessTest.testCanonicalWrongEpochRiskUsesLiveFallback"}
     },
     {
@@ -828,7 +820,6 @@
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x869ff906fea96d24bded63123bba8ee7870b7254c1114fdd809ef54aae6d82e7","value":"0x0000000000000000000000000000000000000000000000000000000100000001"},
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x46dcaa764d0277736f54dfe81bd5d28779a6f90d85f31ee8831f3673fcab1f5a","value":"0x0000000000000000000000000000000000000000000000000000000000000000"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800","value":"0x000000000000000000000000212224d2f2d262cd093ee13240ca4873fccbba3c"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0xfe4045f4381194226ea209935a7774c32d019c30734b60a0504c94ec095e8c8c","value":"0x679d6400679d6400000000000000000000000000000000000000000000000000"},
         {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0xfe4045f4381194226ea209935a7774c32d019c30734b60a0504c94ec095e8c8b","value":"0x679d640000000000000000000000000000000000000000000000000000000000"},
         {"address":"0xa0cb889707d426a7a386870a03bc70d1b0697598","slot":"0x0000000000000000000000000000000000000000000000000000000000000036","value":"0x00000000000000000000000015cf58144ef33af1e14b5208015d11f9143e27b9"},
         {"address":"0xa0cb889707d426a7a386870a03bc70d1b0697598","slot":"0x0000000000000000000000000000000000000000000000000000000000000037","value":"0x000000000000000000000000c7183455a4c133ae270771860664b6b7ec320bb1"},
@@ -840,7 +831,7 @@
       "projectedChunks":{"count":0,"items":[],"commitment":"0x0000000000000000000000000000000000000000000000000000000000000000"},
       "finalRow":{"marketId":2,"marginMode":0,"effectivePositionSize":"10000000000000000","effectivePositionQuote":"-45000000000000000000","effectiveLastFundingPayment":"0","effectiveLeverageWad":"50000000000000000000","effectiveIsolatedBalance":"0","projectedSettlementPnl":"0","effectiveBuyOrderSize":"0","effectiveSellOrderSize":"0","effectiveOrderNotional":"0","markPrice":"4505000000000000000000","accumulatedFundingPayment":"0"},
       "status":"OK",
-      "orderedJournalReads":{"count":30,"items":[
+      "orderedJournalReads":{"count":29,"items":[
         {"address":"0xa0cb889707d426a7a386870a03bc70d1b0697598","slot":"0x0000000000000000000000000000000000000000000000000000000000000032"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e805"},
         {"address":"0xa0cb889707d426a7a386870a03bc70d1b0697598","slot":"0x070d838e6cf01e9c6eb39928c027eccbd1d49b55814644e6d99008b8bab68860"},
@@ -860,7 +851,6 @@
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x46dcaa764d0277736f54dfe81bd5d28779a6f90d85f31ee8831f3673fcab1f5a"},
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x46dcaa764d0277736f54dfe81bd5d28779a6f90d85f31ee8831f3673fcab1f5a"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e800"},
-        {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0xfe4045f4381194226ea209935a7774c32d019c30734b60a0504c94ec095e8c8c"},
         {"address":"0x212224d2f2d262cd093ee13240ca4873fccbba3c","slot":"0xfe4045f4381194226ea209935a7774c32d019c30734b60a0504c94ec095e8c8b"},
         {"address":"0xc7183455a4c133ae270771860664b6b7ec320bb1","slot":"0xd153b50820485fe7e7ec798be9d45828fc76495e594e7965c4413a80ee09e805"},
         {"address":"0xa0cb889707d426a7a386870a03bc70d1b0697598","slot":"0x070d838e6cf01e9c6eb39928c027eccbd1d49b55814644e6d99008b8bab68860"},
@@ -871,7 +861,7 @@
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x8968aa8ebdb26f1e2af5359f45852953e93aebee96c764bf9ea4d83af902e801"},
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x5b63b3a78c28b859db4e0e536c98371037d724e31027d0b8c2bc89f27d13b3c3"},
         {"address":"0x15cf58144ef33af1e14b5208015d11f9143e27b9","slot":"0x6df091490adb00b18ade339258b843d08f7b69b56773f3fc0000000000020004"}
-      ],"commitment":"0xd16f7bb60faf5128a08cda50dd5a3a239097ba3151d41e04f75ce2c5f15c1175"},
+      ],"commitment":"0x7c16bccfe3858b8157eb4d6fa47d65ee11207776eb3a62a331620ee22984d98d"},
       "canonicalHarness":{"authority":"current-production-libraries-and-views","test":"EffectiveMarketV1CanonicalHarnessTest.testCanonicalLocalizedReadyNonTargetPriceProducesCompleteRow"}
     },
     {

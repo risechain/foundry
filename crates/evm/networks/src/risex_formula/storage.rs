@@ -598,26 +598,26 @@ mod tests {
 
     #[test]
     fn journal_reader_generated_artifacts_match_the_pinned_contracts_commit() {
-        assert_eq!(GENERATED_CONTRACTS_COMMIT, "adcf51d25b4b99d35481ea1f7b3d9e5bda0abc11");
+        assert_eq!(GENERATED_CONTRACTS_COMMIT, "3167b40a5fbcc74faedb38792625fd2492a11f56");
         assert_eq!(
             sha256_hex(SCHEMA_BYTES),
-            "f0b02010bb6ffd82969cc875f65e301de705ad93f24a3a6b08dd0512466272f3"
+            "af50f6c976b287a27c039b540d6d7cbf073006b8f1a40a2f022c0cc9386a9bd9"
         );
         assert_eq!(
             sha256_hex(CORPUS_BYTES),
-            "5494eed832754f761ff18b6c8697b6a5bcb88c943d410fd394cb27aaa5a95b17"
+            "7d12255400457379c73220668c3d15a2e2d2031210599714a520cd623b2cb7db"
         );
         assert_eq!(
             sha256_hex(ARTIFACT_MANIFEST_BYTES),
-            "80b69bd2a9b574adcf7ed3129b3c00cf4000ea9e026342b2999dda584afc99cb"
+            "65120ba285937209a2a19b407ddfa8b1bc98fc37de16341ee775c026088c1c23"
         );
         assert_eq!(
             sha256_hex(SLOT_VECTOR_BYTES),
-            "3dcc66671011752c07a364384dc36dd01ef376c99030ccb4a167c1fe5556b0d0"
+            "15b8695a2ab404354f9d7c3adf45bf8da5c59cdceb49e450cdc90b8e078a1ac0"
         );
         assert_eq!(
             sha256_hex(STATE_VECTOR_BYTES),
-            "1916eca4f11f384a2af82848449fc38a33c8772ce76eb306ed80e5c30c9b2793"
+            "4c505b66ff3ca4e2aeefe657dc985cde870268b7fbca46ae9d74a3908f80cd0b"
         );
 
         let manifest: Value = serde_json::from_slice(ARTIFACT_MANIFEST_BYTES).unwrap();
@@ -675,17 +675,6 @@ mod tests {
             };
             let expected = vector.get("slot").unwrap_or(&vector["recordSlot"]);
             assert_eq!(actual, word(expected), "{name}");
-            if let Some(cutover) = vector.get("cutoverWordSlot") {
-                assert_eq!(
-                    checked_slot_offset(
-                        actual,
-                        schema::STORAGE_PATHS_FUNDING_FIELDS_COMPACT_CUTOVER_AT_RECORD_SLOT_OFFSET,
-                    )
-                    .unwrap(),
-                    word(cutover),
-                    "{name} cutover"
-                );
-            }
         }
 
         for vector in fixture["vectors"]["nestedMapping"].as_array().unwrap() {

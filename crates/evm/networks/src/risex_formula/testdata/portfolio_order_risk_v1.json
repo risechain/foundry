@@ -227,8 +227,8 @@
     "blobCodeHash": "0x14afad781b4af3cb77cbe7dc02cdeef706a124c43c343e8983abf078f9483b82",
     "create2Salt": "0xa0223a14173e459673b4318c2cb92ec4f90762a9cdf4e6bd28e7fcd95d9b9a07",
     "formulaSourceSha256": "0x03f181e005730a6856a7307681c0779bd90780affb3c142d088f578c131480fb",
-    "loaderSchemaHash": "0x333e0b49a3387e87d5ec96b040d522c7c46ddf29dacc85185277cb928a409dcb",
-    "loaderSourceSha256": "0x20239691025cff960dd963a39f074491ff9952c94001966924557eeca6d7b72d",
+    "loaderSchemaHash": "0x6e1807f7f9bd259e381edd8a3f7615664ca107a030bc91f4e9e5017ee53177b4",
+    "loaderSourceSha256": "0x29630a16e78c470dace1f8f7d6ab5974a94901b28dd5cc290eb598c4e4d03416",
     "normalizedSourceDigest": "0xa0223a14173e459673b4318c2cb92ec4f90762a9cdf4e6bd28e7fcd95d9b9a07"
   },
   "rowVectors": [

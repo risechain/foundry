@@ -1009,32 +1009,11 @@ fn load_funding<M: PhaseMeasurer>(
     market_id: u16,
 ) -> Result<i128, LoaderError> {
     let dependency = context.funding_dependency(caller)?;
-    let (compact, cutover_slot) = context.derive(|| {
-        let compact = mapping_slot(
+    let slot = context.derive(|| {
+        mapping_slot(
             U256::from(market_id),
             word(schema::STORAGE_NAMESPACES_FUNDING_RATE_COMPACT_FUNDING_STORAGE_ROOT),
-        );
-        let cutover_slot = checked_slot_offset(
-            compact,
-            schema::STORAGE_PATHS_FUNDING_FIELDS_COMPACT_CUTOVER_AT_RECORD_SLOT_OFFSET,
-        )?;
-        Ok::<_, LoaderError>((compact, cutover_slot))
-    })?;
-    let cutover_word = context.sload(dependency, cutover_slot)?;
-    let cutover = extract_unsigned_bytes(
-        cutover_word,
-        schema::STORAGE_PATHS_FUNDING_FIELDS_COMPACT_CUTOVER_AT_BYTE_OFFSET,
-        4,
-    )?;
-    let slot = context.derive(|| {
-        if cutover.is_zero() {
-            mapping_slot(
-                U256::from(market_id),
-                word(schema::STORAGE_NAMESPACES_FUNDING_RATE_STORAGE_ROOT),
-            )
-        } else {
-            compact
-        }
+        )
     });
     as_i128(extract_signed_bytes(context.sload(dependency, slot)?, 0, 16)?)
 }
@@ -1794,7 +1773,7 @@ mod tests {
         let fixture: Value =
             serde_json::from_slice(include_bytes!("../testdata/effective-market-v1.json")).unwrap();
         for name in [
-            "canonical_unready_risk_live_orders_legacy_funding",
+            "canonical_unready_risk_live_orders_compact_funding",
             "canonical_wrong_epoch_risk_live_fallback",
         ] {
             let case = fixture["cases"]
@@ -1890,12 +1869,10 @@ mod tests {
                 (Phase::JournalLoad, 2),
                 (Phase::KeyDerivation, 1),
                 (Phase::JournalLoad, 1),
-                (Phase::KeyDerivation, 1),
-                (Phase::JournalLoad, 1),
             ],
             "pin the live-fallback decode, normalization, and read chronology",
         );
-        assert_step_clock_durations(&phases, 260, 330, 600);
+        assert_step_clock_durations(&phases, 250, 320, 580);
     }
 
     #[test]
@@ -1925,7 +1902,7 @@ mod tests {
             serde_json::from_slice(include_bytes!("../testdata/effective-market-v1.json")).unwrap();
         for name in [
             "canonical_cross_ready_compact_funding",
-            "canonical_unready_risk_live_orders_legacy_funding",
+            "canonical_unready_risk_live_orders_compact_funding",
         ] {
             let case = fixture["cases"]
                 .as_array()
@@ -2165,6 +2142,35 @@ mod tests {
     }
 
     #[test]
+    fn funding_ignores_retired_cutover_and_legacy_words() {
+        let caller = Address::repeat_byte(0xc1);
+        let funding = Address::repeat_byte(0xf1);
+        let registry = word(schema::STORAGE_NAMESPACES_PERPS_MANAGER_REGISTRY_STORAGE_ROOT);
+        let compact = mapping_slot(
+            U256::ONE,
+            word(schema::STORAGE_NAMESPACES_FUNDING_RATE_COMPACT_FUNDING_STORAGE_ROOT),
+        );
+        let legacy =
+            mapping_slot(U256::ONE, word(schema::STORAGE_NAMESPACES_FUNDING_RATE_STORAGE_ROOT));
+        for retired_cutover in [U256::ZERO, U256::ONE << 224] {
+            let mut db = InMemoryDB::default();
+            install_zero_funding_dependency(&mut db, caller, registry);
+            db.insert_account_storage(funding, compact, U256::from(123)).unwrap();
+            db.insert_account_storage(funding, compact + U256::ONE, retired_cutover).unwrap();
+            db.insert_account_storage(funding, legacy, U256::from(999)).unwrap();
+            let mut context = EthEvmContext::new(db, Default::default());
+            let mut internals = EvmInternals::from_context(&mut context);
+            let mut reader = JournalReader::new(&mut internals);
+            let mut phases = CountingPhases::default();
+            assert_eq!(
+                load_funding(&mut LoaderContext::new(&mut reader, &mut phases), caller, 1),
+                Ok(123),
+            );
+            assert_eq!(reader.ordered_storage_reads(), &[(caller, registry), (funding, compact)]);
+        }
+    }
+
+    #[test]
     fn funding_dependency_is_validated_once_across_two_markets() {
         let caller = Address::repeat_byte(0xc1);
         let registry = word(schema::STORAGE_NAMESPACES_PERPS_MANAGER_REGISTRY_STORAGE_ROOT);
@@ -2194,11 +2200,11 @@ mod tests {
                 .count(),
             1,
         );
-        assert_eq!(phases.key_derivations, 5);
-        assert_eq!(phases.journal_loads, 6);
+        assert_eq!(phases.key_derivations, 3);
+        assert_eq!(phases.journal_loads, 4);
         assert_eq!(
             reader.stats(),
-            JournalReadStats { journal_reads: 6, unique_storage_keys: 5, state_access_gas: 13_100 },
+            JournalReadStats { journal_reads: 4, unique_storage_keys: 3, state_access_gas: 8_900 },
         );
     }
 

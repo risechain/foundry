@@ -12,4 +12,4 @@ pub(crate) use effective_market_v1::{
 };
 
 #[cfg(test)]
-pub(crate) const GENERATED_CONTRACTS_COMMIT: &str = "adcf51d25b4b99d35481ea1f7b3d9e5bda0abc11";
+pub(crate) const GENERATED_CONTRACTS_COMMIT: &str = "3167b40a5fbcc74faedb38792625fd2492a11f56";
