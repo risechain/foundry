@@ -34,7 +34,7 @@
     "fillSegments": 4,
     "restingOrderMetadata": 4,
     "tickBitmap": 9,
-    "hookAndPriceDirect": 6,
+    "hookAndPriceDirect": 5,
     "registry": 7,
     "blob": 2
   },
@@ -62,20 +62,22 @@
         "word1Slot": "0x070d838e6cf01e9c6eb39928c027eccbd1d49b55814644e6d99008b8bab8885b"
       },
       {
-        "name": "reduce_only_presence_one",
+        "name": "owner_side_buy_one",
         "protocolId": 1,
         "marketId": 1,
         "userId": 1,
-        "derivation": "prefix | protocolId << 48 | marketId << 32 | userId",
-        "slot": "0xa2f86ec60ebf83b376cbda250000000000000000000000000001000100000001"
+        "side": 0,
+        "derivation": "prefix | ((((protocolId << 16 | marketId) << 33) | userId << 1 | side) << 33)",
+        "slot": "0x11f561812c85b97c9c3d73c50000000000000000000400040000000400000000"
       },
       {
-        "name": "reduce_only_presence_max",
+        "name": "owner_side_sell_max",
         "protocolId": 4294967295,
         "marketId": 65535,
         "userId": 4294967295,
-        "derivation": "prefix | protocolId << 48 | marketId << 32 | userId",
-        "slot": "0xa2f86ec60ebf83b376cbda2500000000000000000000ffffffffffffffffffff"
+        "side": 1,
+        "derivation": "prefix | ((((protocolId << 16 | marketId) << 33) | userId << 1 | side) << 33)",
+        "slot": "0x11f561812c85b97c9c3d73c5000000000003fffffffffffffffffffe00000000"
       }
     ],
     "mapping": [
@@ -315,7 +317,6 @@
     },
     "hookAndPriceDirect": {
       "hookProtocolRegistrationSlot": "0xb184c3f23729764b32e853141e1ff2b7f3b0db62a426aed80bf8a622054a6b7b",
-      "hookActivationSlot": "0x8968aa8ebdb26f1e2af5359f45852953e93aebee96c764bf9ea4d83af902e801",
       "riskMarkControlSlot": "0xfdf686d1a90720564c9731684ba96b15b2ab49414a5983cf65d0ef53bd9fb100",
       "localizedImpact": [
         { "protocolId": 1, "marketId": 0, "stateSlot": "0x6df091490adb00b18ade339258b843d08f7b69b56773f3fc0000000000020000", "configSlot": "0x6df091490adb00b18ade339258b843d08f7b69b56773f3fc0000000000020001" },

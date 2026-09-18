@@ -8,8 +8,8 @@ use crate::risex_formula::{
     storage::{
         JournalReader, StorageKeyError, checked_slot_offset, extract_signed_bytes,
         extract_unsigned_bits, extract_unsigned_bytes, mapping_slot,
-        orders_market_book_slot_from_base, orders_market_books_slot, perps_market_slot,
-        portfolio_bitmap_bucket_slots_from_base, portfolio_slot, reduce_only_presence_slot,
+        orders_market_book_slot_from_base, orders_market_books_slot, owner_side_header_slot,
+        perps_market_slot, portfolio_bitmap_bucket_slots_from_base, portfolio_slot,
         risk_mark_snapshot_slots, trading_account_slot,
     },
 };
@@ -603,8 +603,11 @@ fn load_market_row_in_context<M: PhaseMeasurer>(
         } else {
             may_have_projected_fills(context, caller, request.user_id, book)?
         };
-        let (buy, sell, notional) =
-            load_empty_live_risk(context, caller, request.user_id, market_id, book, margin_mode)?;
+        let (buy, sell, notional) = if projected_candidate {
+            (U256::ZERO, U256::ZERO, U256::ZERO)
+        } else {
+            load_live_order_risk(context, caller, request.user_id, market_id, book, margin_mode)?
+        };
         (buy, sell, notional, projected_candidate)
     };
     let leverage = if stored_leverage == 0 {
@@ -673,14 +676,24 @@ fn load_market_row_in_context<M: PhaseMeasurer>(
                 return Err(error);
             }
         };
-        if projected_chunks != 0 && ready {
-            let (_, _, live_notional) = load_empty_live_risk(
+        if !ready {
+            (buy_size, sell_size, notional) = load_live_order_risk(
                 context,
                 caller,
                 request.user_id,
                 market_id,
                 book,
                 margin_mode,
+            )?;
+        } else if projected_chunks != 0 {
+            let (_, _, live_notional) = load_live_order_risk(
+                context,
+                caller,
+                request.user_id,
+                market_id,
+                book,
+                // The canonical refresh asks only for margin-accountable notional.
+                MarginMode::Isolated,
             )?;
             notional = live_notional;
         }
@@ -745,7 +758,7 @@ fn may_have_projected_fills<M: PhaseMeasurer>(
     Ok(!dirty.is_zero() && !open_orders.is_zero())
 }
 
-fn load_empty_live_risk<M: PhaseMeasurer>(
+fn load_live_order_risk<M: PhaseMeasurer>(
     context: &mut LoaderContext<'_, '_, '_, '_, M>,
     caller: Address,
     user_id: u32,
@@ -778,6 +791,54 @@ fn load_empty_live_risk<M: PhaseMeasurer>(
     })?;
     let open_orders = context.sload(orders, open_orders_slot)?;
     let config = context.sload(orders, config_slot)?;
+    let (buy, sell, notional) = if open_orders.is_zero() {
+        (U256::ZERO, U256::ZERO, U256::ZERO)
+    } else {
+        scan_live_risk_in_context(
+            context,
+            orders,
+            book,
+            open_orders,
+            false,
+            user_id,
+            margin_mode,
+            config,
+        )?
+    };
+    if margin_mode == MarginMode::Isolated {
+        return Ok((buy, sell, notional));
+    }
+    let reduce_only_orders =
+        load_reduce_only_orders(context, orders, caller, user_id, market_id, open_orders_slot)?;
+    if reduce_only_orders.is_zero() {
+        return Ok((buy, sell, notional));
+    }
+    let config = context.sload(orders, config_slot)?;
+    let (reduce_buy, reduce_sell, _) = scan_live_risk_in_context(
+        context,
+        orders,
+        book,
+        reduce_only_orders,
+        true,
+        user_id,
+        margin_mode,
+        config,
+    )?;
+    Ok((
+        buy.checked_add(reduce_buy).ok_or(LoaderError::Arithmetic)?,
+        sell.checked_add(reduce_sell).ok_or(LoaderError::Arithmetic)?,
+        notional,
+    ))
+}
+
+fn load_reduce_only_orders<M: PhaseMeasurer>(
+    context: &mut LoaderContext<'_, '_, '_, '_, M>,
+    orders: Address,
+    caller: Address,
+    user_id: u32,
+    market_id: u16,
+    open_orders_slot: U256,
+) -> Result<U256, LoaderError> {
     let orders_repeat_slot = context.derive(|| {
         checked_slot_offset(
             word(schema::STORAGE_NAMESPACES_PERPS_MANAGER_REGISTRY_STORAGE_ROOT),
@@ -786,54 +847,37 @@ fn load_empty_live_risk<M: PhaseMeasurer>(
         .map_err(LoaderError::from)
     })?;
     let _orders_repeat = address(context.sload(caller, orders_repeat_slot)?);
-    let (hook_root, activation_slot) = context.derive(|| {
-        let hook_root = word(schema::STORAGE_NAMESPACES_ORDERS_MANAGER_HOOK_STORAGE_ROOT);
-        let activation_slot = checked_slot_offset(
-            hook_root,
-            schema::STORAGE_PATHS_ORDERS_HOOK_REGISTRATION_FIELDS_LAST_PROTOCOL_ID_SLOT_OFFSET,
-        )?;
-        Ok::<_, LoaderError>((hook_root, activation_slot))
-    })?;
-    let activation = context.sload(orders, activation_slot)?;
-    let activation_repeat_slot = context.derive(|| {
-        checked_slot_offset(
-            hook_root,
-            schema::STORAGE_PATHS_ORDERS_HOOK_REGISTRATION_FIELDS_LAST_PROTOCOL_ID_SLOT_OFFSET,
+    let registration_slot = context.derive(|| {
+        mapping_slot(
+            U256::from_be_slice(caller.as_slice()),
+            word(schema::STORAGE_NAMESPACES_ORDERS_MANAGER_HOOK_STORAGE_ROOT),
         )
-        .map_err(LoaderError::from)
-    })?;
-    let _activation_repeat = context.sload(orders, activation_repeat_slot)?;
-    let protocol_ids_active = !extract_unsigned_bytes(
-        activation,
-        schema::STORAGE_PATHS_ORDERS_HOOK_REGISTRATION_FIELDS_PROTOCOL_IDS_ACTIVE_BYTE_OFFSET,
-        1,
-    )?
-    .is_zero();
-    let presence_active = !extract_unsigned_bytes(activation, schema::STORAGE_PATHS_ORDERS_HOOK_REGISTRATION_FIELDS_REDUCE_ONLY_PRESENCE_ACTIVE_BYTE_OFFSET, 1)?.is_zero();
-    let registration_slot =
-        context.derive(|| mapping_slot(U256::from_be_slice(caller.as_slice()), hook_root));
+    });
     let registration = context.sload(orders, registration_slot)?;
     let protocol_id = u32::try_from(registration >> 224).map_err(|_| LoaderError::StateLoad)?;
-    if protocol_ids_active && presence_active && protocol_id != 0 {
-        let presence_slot = context.derive(|| {
-            reduce_only_presence_slot(protocol_id, market_id, user_id).map_err(LoaderError::from)
+    let mut open_orders = context.sload(orders, open_orders_slot)?;
+    if protocol_id == 0 {
+        return Ok(open_orders);
+    }
+    let side_width = schema::STORAGE_DIRECT_ARENAS_ORDERS_MANAGER_STP_OWNERSHIP_PREFIX_WORD_REDUCE_ONLY_BITMAP_BIT_WIDTH;
+    let side_mask = (U256::ONE << side_width) - U256::ONE;
+    for side in 0_u8..=1 {
+        let shift = u64::from(side) * side_width;
+        if ((open_orders >> shift) & side_mask).is_zero() {
+            continue;
+        }
+        let header_slot = context.derive(|| {
+            owner_side_header_slot(protocol_id, market_id, user_id, side).map_err(LoaderError::from)
         })?;
-        let presence = context.sload(orders, presence_slot)?;
-        let _ = presence;
+        let header = context.sload(orders, header_slot)?;
+        if header.bit(
+            schema::STORAGE_DIRECT_ARENAS_ORDERS_MANAGER_STP_OWNERSHIP_PREFIX_WORD_READY_BIT_OFFSET
+                as usize,
+        ) {
+            open_orders = (open_orders & !(side_mask << shift)) | ((header & side_mask) << shift);
+        }
     }
-    if open_orders.is_zero() {
-        return Ok((U256::ZERO, U256::ZERO, U256::ZERO));
-    }
-    let (buy, sell, notional) = scan_live_risk_in_context(
-        context,
-        orders,
-        book,
-        open_orders,
-        user_id,
-        margin_mode,
-        config,
-    )?;
-    Ok((buy, sell, notional))
+    Ok(open_orders)
 }
 
 #[cfg(test)]
@@ -848,14 +892,25 @@ fn scan_live_risk(
 ) -> Result<(U256, U256, U256), LoaderError> {
     let mut phases = NoopPhaseMeasurer;
     let mut context = LoaderContext::new(reader, &mut phases);
-    scan_live_risk_in_context(&mut context, orders, book, open_orders, user_id, margin_mode, config)
+    scan_live_risk_in_context(
+        &mut context,
+        orders,
+        book,
+        open_orders,
+        false,
+        user_id,
+        margin_mode,
+        config,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_live_risk_in_context<M: PhaseMeasurer>(
     context: &mut LoaderContext<'_, '_, '_, '_, M>,
     orders: Address,
     book: U256,
     open_orders: U256,
+    reduce_only: bool,
     user_id: u32,
     margin_mode: MarginMode,
     config: U256,
@@ -911,7 +966,20 @@ fn scan_live_risk_in_context<M: PhaseMeasurer>(
             if size_steps == 0 {
                 continue;
             }
+            let flags = as_u8(extract_unsigned_bytes(
+                metadata,
+                schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_FLAGS_BYTE_OFFSET,
+                1,
+            )?)?;
+            let is_reduce_only =
+                flags & schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_ORDER_FLAGS_REDUCE_ONLY as u8 != 0;
+            if is_reduce_only != reduce_only {
+                continue;
+            }
             let queued = super::deferred::queued_steps(size_steps, filled_steps)?;
+            if queued == 0 {
+                continue;
+            }
             let tick = as_u32(extract_unsigned_bytes(
                 metadata,
                 schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_TICK_BYTE_OFFSET,
@@ -922,12 +990,6 @@ fn scan_live_risk_in_context<M: PhaseMeasurer>(
                 schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_SEQ_ID_BYTE_OFFSET,
                 schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_SEQ_ID_BYTE_WIDTH,
             )?)?;
-            if seq == 0 {
-                return Err(LoaderError::StateLoad);
-            }
-            if u64::from(seq) > schema::HARD_BOUNDS_MAX_TICK_LEVEL_SEQ_ID {
-                return Err(LoaderError::BoundExceeded);
-            }
             let (level, counters_slot) = context.derive(|| {
                 let level =
                     crate::risex_formula::storage::orders_tick_level_slot_from_book(book, tick)?;
@@ -940,25 +1002,22 @@ fn scan_live_risk_in_context<M: PhaseMeasurer>(
             let counters = context.sload(orders, counters_slot)?;
             let total_claimable = as_u64(extract_unsigned_bytes(counters, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_TICK_LEVEL_COUNTERS_TOTAL_CLAIMABLE_STEPS_BYTE_OFFSET, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_TICK_LEVEL_COUNTERS_TOTAL_CLAIMABLE_STEPS_BYTE_WIDTH)?)?;
             let total_settled = as_u64(extract_unsigned_bytes(counters, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_TICK_LEVEL_COUNTERS_TOTAL_SETTLED_STEPS_BYTE_OFFSET, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_TICK_LEVEL_COUNTERS_TOTAL_SETTLED_STEPS_BYTE_WIDTH)?)?;
-            let live_claimable =
-                total_claimable.checked_sub(total_settled).ok_or(LoaderError::StateLoad)?;
-            let prefix = super::deferred::prefix_before_in_context(
-                context,
-                orders,
-                book,
-                level,
-                metadata_seed,
-                seq,
-            )?;
-            let fifo = live_claimable.saturating_sub(prefix).min(queued);
-            let open_steps = queued.saturating_sub(fifo);
+            let live_claimable = total_claimable.saturating_sub(total_settled);
+            let open_steps = if live_claimable == 0 {
+                queued
+            } else {
+                let range_right = super::deferred::prefix_sum_in_context(
+                    context,
+                    orders,
+                    level,
+                    metadata_seed,
+                    u64::from(seq),
+                )?;
+                let range_left = range_right.checked_sub(queued).ok_or(LoaderError::Arithmetic)?;
+                queued - live_claimable.saturating_sub(range_left).min(queued)
+            };
             let order_size =
                 U256::from(open_steps).checked_mul(step_size).ok_or(LoaderError::Arithmetic)?;
-            let flags = as_u8(extract_unsigned_bytes(
-                metadata,
-                schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_FLAGS_BYTE_OFFSET,
-                1,
-            )?)?;
             if margin_mode == MarginMode::Cross {
                 if side == 0 {
                     buy = buy.checked_add(order_size).ok_or(LoaderError::Arithmetic)?;
@@ -966,7 +1025,7 @@ fn scan_live_risk_in_context<M: PhaseMeasurer>(
                     sell = sell.checked_add(order_size).ok_or(LoaderError::Arithmetic)?;
                 }
             }
-            if flags & schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_ORDER_FLAGS_REDUCE_ONLY as u8 == 0 {
+            if !reduce_only {
                 let price =
                     U256::from(tick).checked_mul(step_price).ok_or(LoaderError::Arithmetic)?;
                 let value = order_size
@@ -1119,27 +1178,13 @@ fn load_localized_mark<M: PhaseMeasurer>(
     if candidate <= I256::ZERO {
         return Err(LoaderError::Unavailable);
     }
-    let (hook_root, activation_slot) = context.derive(|| {
-        let hook_root = word(schema::STORAGE_NAMESPACES_ORDERS_MANAGER_HOOK_STORAGE_ROOT);
-        let activation_slot = checked_slot_offset(
-            hook_root,
-            schema::STORAGE_PATHS_ORDERS_HOOK_REGISTRATION_FIELDS_LAST_PROTOCOL_ID_SLOT_OFFSET,
-        )?;
-        Ok::<_, LoaderError>((hook_root, activation_slot))
-    })?;
     context.validate_orders(orders)?;
-    let activation = context.sload(orders, activation_slot)?;
-    if extract_unsigned_bytes(
-        activation,
-        schema::STORAGE_PATHS_ORDERS_HOOK_REGISTRATION_FIELDS_PROTOCOL_IDS_ACTIVE_BYTE_OFFSET,
-        1,
-    )?
-    .is_zero()
-    {
-        return Err(LoaderError::Unavailable);
-    }
-    let registration_slot =
-        context.derive(|| mapping_slot(U256::from_be_slice(caller.as_slice()), hook_root));
+    let registration_slot = context.derive(|| {
+        mapping_slot(
+            U256::from_be_slice(caller.as_slice()),
+            word(schema::STORAGE_NAMESPACES_ORDERS_MANAGER_HOOK_STORAGE_ROOT),
+        )
+    });
     let registration = context.sload(orders, registration_slot)?;
     let protocol_id = u32::try_from(registration >> 224).map_err(|_| LoaderError::StateLoad)?;
     if protocol_id == 0 {
@@ -1219,16 +1264,17 @@ mod tests {
 
     use super::{
         LoadProgress, LoadRowsError, LoaderContext, LoaderError, MarginMode, MarketRow,
-        load_funding, load_localized_mark, load_market_row, load_market_row_profiled, load_rows,
-        load_rows_profiled, perps_market_slot, pop_active_market, scan_live_risk, schema,
-        trading_account_slot, word,
+        load_funding, load_live_order_risk, load_localized_mark, load_market_row,
+        load_market_row_profiled, load_reduce_only_orders, load_rows, load_rows_profiled,
+        perps_market_slot, pop_active_market, scan_live_risk, schema, trading_account_slot, word,
     };
     use crate::risex_formula::{
         Request, Status,
         metrics::{Phase, PhaseMeasurer},
         storage::{
             JournalReadStats, JournalReader, checked_slot_offset, mapping_slot,
-            orders_market_book_slot, orders_tick_level_slot_from_book, risk_mark_snapshot_slots,
+            orders_market_book_slot, orders_tick_level_slot_from_book, owner_side_header_slot,
+            risk_mark_snapshot_slots,
         },
     };
 
@@ -1362,7 +1408,198 @@ mod tests {
     }
 
     #[test]
-    fn live_risk_high_open_order_prefix_work_is_index_depth_bounded() {
+    fn owner_side_headers_fall_back_independently_and_skip_empty_sides() {
+        let orders = Address::repeat_byte(0x15);
+        let caller = Address::repeat_byte(0x71);
+        let market_id = 9;
+        let user_id = 102;
+        let registry = word(schema::STORAGE_NAMESPACES_PERPS_MANAGER_REGISTRY_STORAGE_ROOT);
+        let orders_slot = checked_slot_offset(
+            registry,
+            schema::STORAGE_PATHS_PERPS_REGISTRY_FIELDS_ORDERS_MANAGER_SLOT_OFFSET,
+        )
+        .unwrap();
+        let hook_root = word(schema::STORAGE_NAMESPACES_ORDERS_MANAGER_HOOK_STORAGE_ROOT);
+        let registration_slot = mapping_slot(U256::from_be_slice(caller.as_slice()), hook_root);
+        let book = orders_market_book_slot(caller, market_id).unwrap();
+        let open_orders_seed = checked_slot_offset(book, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_ABSOLUTE_RECORD_OFFSETS_OPEN_ORDERS_BY_USER_ID_SEED).unwrap();
+        let open_orders_slot = mapping_slot(U256::from(user_id), open_orders_seed);
+        let ready = U256::ONE << 160;
+        let advisory = (U256::ONE << 128) | (U256::from(91) << 136) | (U256::from(17) << 161);
+        let buy = U256::ONE << 3;
+        let sell = U256::ONE << 5;
+        let narrowed_buy = U256::ONE << 7;
+        let narrowed_sell = U256::ONE << 9;
+        for (
+            protocol_id,
+            canonical_buy,
+            canonical_sell,
+            buy_header,
+            sell_header,
+            expected_buy,
+            expected_sell,
+        ) in [
+            (7, buy, sell, narrowed_buy, narrowed_sell, buy, sell),
+            (7, buy, sell, ready | advisory | narrowed_buy, narrowed_sell, narrowed_buy, sell),
+            (7, buy, sell, narrowed_buy, ready | advisory, buy, U256::ZERO),
+            (
+                7,
+                U256::ZERO,
+                sell,
+                ready | narrowed_buy,
+                ready | narrowed_sell,
+                U256::ZERO,
+                narrowed_sell,
+            ),
+            (7, buy, U256::ZERO, ready, ready | narrowed_sell, U256::ZERO, U256::ZERO),
+            (
+                7,
+                U256::ZERO,
+                U256::ZERO,
+                ready | narrowed_buy,
+                ready | narrowed_sell,
+                U256::ZERO,
+                U256::ZERO,
+            ),
+            (0, buy, sell, ready | narrowed_buy, ready | narrowed_sell, buy, sell),
+        ] {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(caller, AccountInfo::default());
+            db.insert_account_info(orders, AccountInfo::default());
+            let registration = (U256::from(protocol_id) << 224) | ((U256::ONE << 224) - U256::ONE);
+            db.insert_account_storage(orders, registration_slot, registration).unwrap();
+            let canonical = canonical_buy | (canonical_sell << 128);
+            db.insert_account_storage(orders, open_orders_slot, canonical).unwrap();
+            let mut expected_reads = vec![
+                (caller, orders_slot),
+                (orders, registration_slot),
+                (orders, open_orders_slot),
+            ];
+            for (side, canonical, header) in
+                [(0, canonical_buy, buy_header), (1, canonical_sell, sell_header)]
+            {
+                let slot = owner_side_header_slot(7, market_id, user_id, side).unwrap();
+                db.insert_account_storage(orders, slot, header).unwrap();
+                if protocol_id != 0 && !canonical.is_zero() {
+                    expected_reads.push((orders, slot));
+                }
+            }
+            let mut evm = EthEvmContext::new(db, Default::default());
+            let mut internals = EvmInternals::from_context(&mut evm);
+            let mut reader = JournalReader::new(&mut internals);
+            let mut phases = super::NoopPhaseMeasurer;
+            let mut context = LoaderContext::new(&mut reader, &mut phases);
+            let expected = expected_buy | (expected_sell << 128);
+            assert_eq!(
+                load_reduce_only_orders(
+                    &mut context,
+                    orders,
+                    caller,
+                    user_id,
+                    market_id,
+                    open_orders_slot
+                ),
+                Ok(expected)
+            );
+            assert_eq!(reader.ordered_storage_reads(), expected_reads);
+            for (side, header) in [(0, buy_header), (1, sell_header)] {
+                assert_eq!(
+                    reader
+                        .sload(orders, owner_side_header_slot(7, market_id, user_id, side).unwrap())
+                        .unwrap(),
+                    header
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_risk_keeps_normal_orders_and_filters_reduce_only_candidates() {
+        let orders = Address::repeat_byte(0x15);
+        let caller = Address::repeat_byte(0x71);
+        let user_id = 102;
+        let market_id = 9;
+        let book = orders_market_book_slot(caller, market_id).unwrap();
+        let metadata_seed = checked_slot_offset(book, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_ABSOLUTE_RECORD_OFFSETS_METADATA_BY_ORDER_ID_SEED).unwrap();
+        let registry = word(schema::STORAGE_NAMESPACES_PERPS_MANAGER_REGISTRY_STORAGE_ROOT);
+        let orders_slot = checked_slot_offset(
+            registry,
+            schema::STORAGE_PATHS_PERPS_REGISTRY_FIELDS_ORDERS_MANAGER_SLOT_OFFSET,
+        )
+        .unwrap();
+        let registration_slot = mapping_slot(
+            U256::from_be_slice(caller.as_slice()),
+            word(schema::STORAGE_NAMESPACES_ORDERS_MANAGER_HOOK_STORAGE_ROOT),
+        );
+        let open_orders_seed = checked_slot_offset(book, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_ABSOLUTE_RECORD_OFFSETS_OPEN_ORDERS_BY_USER_ID_SEED).unwrap();
+        let open_orders_slot = mapping_slot(U256::from(user_id), open_orders_seed);
+        let header_slot = owner_side_header_slot(7, market_id, user_id, 0).unwrap();
+        let config_slot = checked_slot_offset(
+            book,
+            schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_ABSOLUTE_RECORD_OFFSETS_QUEUE_CONFIG,
+        )
+        .unwrap();
+        let config =
+            U256::ONE | (U256::from(schema::IMPLEMENTATION_CONSTANTS_FIXED_POINT_WAD) << 64);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(orders, contract_account_info());
+        db.insert_account_info(caller, AccountInfo::default());
+        db.insert_account_storage(caller, orders_slot, U256::from_be_slice(orders.as_slice()))
+            .unwrap();
+        db.insert_account_storage(orders, registration_slot, U256::from(7) << 224).unwrap();
+        db.insert_account_storage(orders, open_orders_slot, U256::from(0b00111)).unwrap();
+        db.insert_account_storage(orders, header_slot, (U256::ONE << 160) | U256::from(0b11010))
+            .unwrap();
+        db.insert_account_storage(orders, config_slot, config).unwrap();
+        for (slot, size, reduce_only, sequence) in [
+            (0, 10, false, 1),
+            (1, 20, true, 1),
+            (2, 30, true, 0),
+            (3, 40, true, 1),
+            (4, 50, false, 0),
+        ] {
+            let order_id = (U256::from(slot) << 33) | (U256::from(user_id) << 1);
+            let metadata = U256::from(size)
+                | (U256::from(7) << 96)
+                | (U256::from(sequence) << 168)
+                | (U256::from(u8::from(reduce_only)) << 232);
+            db.insert_account_storage(orders, mapping_slot(order_id, metadata_seed), metadata)
+                .unwrap();
+        }
+        for (margin_mode, buy) in
+            [(MarginMode::Cross, U256::from(70)), (MarginMode::Isolated, U256::ZERO)]
+        {
+            let mut evm = EthEvmContext::new(db.clone(), Default::default());
+            let mut internals = EvmInternals::from_context(&mut evm);
+            let mut reader = JournalReader::new(&mut internals);
+            let mut phases = super::NoopPhaseMeasurer;
+            let mut context = LoaderContext::new(&mut reader, &mut phases);
+            assert_eq!(
+                load_live_order_risk(&mut context, caller, user_id, market_id, book, margin_mode),
+                Ok((buy, U256::ZERO, U256::from(70))),
+            );
+            assert_eq!(
+                reader.ordered_storage_reads().contains(&(orders, header_slot)),
+                margin_mode == MarginMode::Cross
+            );
+            assert_eq!(
+                reader.ordered_storage_reads().contains(&(orders, registration_slot)),
+                margin_mode == MarginMode::Cross
+            );
+            if margin_mode == MarginMode::Cross {
+                let reads = reader.ordered_storage_reads();
+                let normal_last =
+                    mapping_slot((U256::from(2) << 33) | (U256::from(user_id) << 1), metadata_seed);
+                assert!(
+                    reads.iter().position(|read| *read == (orders, normal_last)).unwrap()
+                        < reads.iter().position(|read| *read == (orders, header_slot)).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_risk_clean_high_open_order_count_skips_prefix_tree() {
         let orders = Address::repeat_byte(0x15);
         let protocol = Address::repeat_byte(0x71);
         let user_id = 102_u32;
@@ -1406,11 +1643,12 @@ mod tests {
         .unwrap();
         assert_eq!(buy, U256::from(1_280));
         assert!(sell.is_zero());
-        assert!(reader.ordered_storage_reads().len() <= 128 * 8);
+        assert_eq!(reader.ordered_storage_reads().len(), 128 * 2);
+        assert!(!reader.ordered_storage_reads().contains(&(orders, v2)));
     }
 
     #[test]
-    fn live_risk_zero_sequence_returns_typed_state_load_without_prefix_reads() {
+    fn live_risk_short_circuits_and_validates_the_inclusive_prefix() {
         let orders = Address::repeat_byte(0x15);
         let protocol = Address::repeat_byte(0x71);
         let user_id = 102_u32;
@@ -1419,35 +1657,104 @@ mod tests {
         let order_id = U256::from(user_id)
             << schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_RESTING_ORDER_ID_OWNER_BITS_0;
         let metadata_slot = mapping_slot(order_id, metadata_seed);
-        let mut db = InMemoryDB::default();
-        db.insert_account_info(orders, AccountInfo::default());
-        db.insert_account_storage(orders, metadata_slot, U256::from(10) | (U256::from(7) << 96))
-            .unwrap();
-        let mut context = EthEvmContext::new(db, Default::default());
-        let mut internals = EvmInternals::from_context(&mut context);
-        let mut reader = JournalReader::new(&mut internals);
-        assert_eq!(
-            scan_live_risk(
-                &mut reader,
+        let level = orders_tick_level_slot_from_book(book, 7).unwrap();
+        let counters_slot = checked_slot_offset(
+            level,
+            schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_COMPILED_OFFSETS_TICK_LEVEL_PACKED_COUNTERS,
+        )
+        .unwrap();
+        let root = checked_slot_offset(
+            level,
+            schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_MEMBER_OFFSET,
+        )
+        .unwrap();
+        let first_leaves = checked_slot_offset(
+            root,
+            schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_LEAVES_OFFSET,
+        )
+        .unwrap();
+        for (filled, claimable, settled, seq, mode, leaf, expected) in [
+            (10, 0, 1, 0, 7, 0, Ok(0)),
+            (0, 0, 0, 5, 7, 0, Ok(10)),
+            (0, 1, 2, u16::MAX, 7, 0, Ok(10)),
+            (0, 3, 0, 0, 7, 0, Err(LoaderError::Arithmetic)),
+            (0, 3, 0, 5, 1, 10, Ok(7)),
+            (0, 3, 0, 5, 1, 0, Err(LoaderError::Arithmetic)),
+            (0, 3, 0, 5, 2, 10, Err(LoaderError::StateLoad)),
+            (0, 3, 0, 5, 3, 10, Err(LoaderError::StateLoad)),
+            (0, 3, 0, 5, 4, 10, Err(LoaderError::StateLoad)),
+            (0, 3, 0, 5, 5, 10, Err(LoaderError::StateLoad)),
+            (0, 3, 0, 5, 6, 10, Err(LoaderError::StateLoad)),
+            (0, 3, 0, 5, 7, 10, Err(LoaderError::StateLoad)),
+            (0, 3, 0, 32_768, 1, 10, Ok(7)),
+        ] {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(orders, AccountInfo::default());
+            let metadata = U256::from(10)
+                | (U256::from(filled) << 32)
+                | (U256::from(7) << 96)
+                | (U256::from(seq) << 168);
+            db.insert_account_storage(orders, metadata_slot, metadata).unwrap();
+            db.insert_account_storage(
                 orders,
-                book,
-                U256::ONE,
-                user_id,
-                MarginMode::Cross,
-                U256::ONE
-            ),
-            Err(LoaderError::StateLoad)
-        );
-        assert_eq!(reader.ordered_storage_reads(), &[(orders, metadata_slot)]);
+                counters_slot,
+                (U256::from(claimable) << 16) | (U256::from(settled) << 80),
+            )
+            .unwrap();
+            db.insert_account_storage(orders, root, U256::from(mode) << 180).unwrap();
+            let leaf_index = u64::from(seq.saturating_sub(1));
+            let leaves_slot = checked_slot_offset(first_leaves, leaf_index / 8).unwrap();
+            db.insert_account_storage(
+                orders,
+                leaves_slot,
+                U256::from(leaf) << ((leaf_index % 8) * 32),
+            )
+            .unwrap();
+            let mut context = EthEvmContext::new(db, Default::default());
+            let mut internals = EvmInternals::from_context(&mut context);
+            let mut reader = JournalReader::new(&mut internals);
+            let expected = expected.map(|buy| (U256::from(buy), U256::ZERO, U256::ZERO));
+            assert_eq!(
+                scan_live_risk(
+                    &mut reader,
+                    orders,
+                    book,
+                    U256::ONE,
+                    user_id,
+                    MarginMode::Cross,
+                    U256::ONE
+                ),
+                expected,
+                "filled={filled} claimable={claimable} settled={settled} seq={seq} mode={mode}"
+            );
+            let mut reads = vec![(orders, metadata_slot)];
+            if filled != 10 {
+                reads.push((orders, counters_slot));
+                if claimable > settled && seq > 4 {
+                    reads.push((orders, root));
+                    if mode == 1 {
+                        if seq == 32_768 {
+                            for offset in [4, 24, 124, 712] {
+                                reads.push((orders, checked_slot_offset(root, offset).unwrap()));
+                            }
+                        }
+                        reads.push((orders, leaves_slot));
+                    }
+                }
+            }
+            assert_eq!(reader.ordered_storage_reads(), reads);
+        }
     }
 
     #[test]
-    fn active_dirty_rows_replay_approved_one_and_two_chunk_vectors() {
+    fn active_dirty_rows_replay_before_unready_live_risk() {
         let fixture: Value =
             serde_json::from_slice(include_bytes!("../testdata/effective-market-v1.json")).unwrap();
-        for name in [
-            "production_one_chunk_partial_close_rounding_legacy_prefix",
-            "production_two_chunks_full_close_flip_v2_empty_tail",
+        for (name, cache_ready) in [
+            ("production_one_chunk_partial_close_rounding_legacy_prefix", true),
+            ("production_two_chunks_full_close_flip_v2_empty_tail", true),
+            ("production_one_chunk_partial_close_rounding_legacy_prefix", false),
+            ("production_two_chunks_full_close_flip_v2_empty_tail", false),
         ] {
             let case = fixture["cases"]
                 .as_array()
@@ -1532,6 +1839,7 @@ mod tests {
                 << schema::STORAGE_PATHS_TRADING_ACCOUNT_ORDER_RISK_PACKING_INITIALIZED_BIT_OFFSET)
                 | (U256::ONE
                     << schema::STORAGE_PATHS_TRADING_ACCOUNT_ORDER_RISK_PACKING_EPOCH_BIT_OFFSET);
+            let ready = if cache_ready { ready } else { U256::ZERO };
             db.insert_account_storage(caller, checked_slot_offset(account, 2).unwrap(), ready)
                 .unwrap();
             db.insert_account_storage(caller, checked_slot_offset(account, 3).unwrap(), ready)
@@ -1589,6 +1897,24 @@ mod tests {
                 final_row["effectiveLastFundingPayment"].as_str().unwrap(),
                 "{name}"
             );
+            if !cache_ready {
+                let level = orders_tick_level_slot_from_book(book, 7).unwrap();
+                let segment_seed = checked_slot_offset(level, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_COMPILED_OFFSETS_TICK_LEVEL_FILL_SEGMENT_BY_INDEX).unwrap();
+                let first_segment = mapping_slot(U256::ZERO, segment_seed);
+                let registration_slot = mapping_slot(
+                    U256::from_be_slice(caller.as_slice()),
+                    word(schema::STORAGE_NAMESPACES_ORDERS_MANAGER_HOOK_STORAGE_ROOT),
+                );
+                let reads = reader.ordered_storage_reads();
+                assert!(
+                    reads.iter().position(|read| *read == (orders, first_segment)).unwrap()
+                        < reads
+                            .iter()
+                            .position(|read| *read == (orders, registration_slot))
+                            .unwrap(),
+                    "pending replay precedes unready live risk: {name}"
+                );
+            }
 
             let mut context = EthEvmContext::new(db.clone(), Default::default());
             let mut internals = EvmInternals::from_context(&mut context);
@@ -1612,6 +1938,63 @@ mod tests {
             assert_eq!(progress.projected_chunks, chunks, "{name}");
             assert!(phases.key_derivations > 0, "{name}");
             assert_eq!(phases.row_materializations, 1, "{name}");
+            if !cache_ready && name == "production_one_chunk_partial_close_rounding_legacy_prefix" {
+                // Malformed storage pins validation precedence: replay overflow must win over
+                // the later reduce-only candidate's out-of-bounds sequence.
+                let registration_slot = mapping_slot(
+                    U256::from_be_slice(caller.as_slice()),
+                    word(schema::STORAGE_NAMESPACES_ORDERS_MANAGER_HOOK_STORAGE_ROOT),
+                );
+                db.insert_account_storage(orders, registration_slot, U256::from(7) << 224).unwrap();
+                let header = owner_side_header_slot(7, market_id, user_id, 1).unwrap();
+                db.insert_account_storage(orders, header, (U256::ONE << 160) | U256::from(2))
+                    .unwrap();
+                let metadata_seed = checked_slot_offset(book, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_ABSOLUTE_RECORD_OFFSETS_METADATA_BY_ORDER_ID_SEED).unwrap();
+                let malformed_id = (U256::ONE << 33) | (U256::from(user_id) << 1) | U256::ONE;
+                let malformed = U256::ONE
+                    | (U256::from(7) << 96)
+                    | (U256::from(32_769) << 168)
+                    | (U256::ONE << 232);
+                db.insert_account_storage(
+                    orders,
+                    mapping_slot(malformed_id, metadata_seed),
+                    malformed,
+                )
+                .unwrap();
+                {
+                    let mut context = EthEvmContext::new(db.clone(), Default::default());
+                    let mut internals = EvmInternals::from_context(&mut context);
+                    let mut reader = JournalReader::new(&mut internals);
+                    let mut phases = super::NoopPhaseMeasurer;
+                    let mut context = LoaderContext::new(&mut reader, &mut phases);
+                    assert_eq!(
+                        load_live_order_risk(
+                            &mut context,
+                            caller,
+                            user_id,
+                            market_id,
+                            book,
+                            MarginMode::Cross
+                        ),
+                        Err(LoaderError::BoundExceeded),
+                    );
+                }
+                let last_funding = I256::unchecked_from(i128::MIN).into_raw() & mask128;
+                db.insert_account_storage(
+                    caller,
+                    checked_slot_offset(account, 1).unwrap(),
+                    last_funding | (U256::ONE << 128),
+                )
+                .unwrap();
+                let mut context = EthEvmContext::new(db, Default::default());
+                let mut internals = EvmInternals::from_context(&mut context);
+                let mut reader = JournalReader::new(&mut internals);
+                assert_eq!(
+                    load_market_row(&mut reader, caller, &request, market_id, 1),
+                    Err(LoaderError::Arithmetic)
+                );
+                assert!(!reader.ordered_storage_reads().contains(&(orders, registration_slot)));
+            }
         }
     }
 
@@ -1858,13 +2241,7 @@ mod tests {
                 (Phase::KeyDerivation, 1),
                 (Phase::JournalLoad, 1),
                 (Phase::KeyDerivation, 1),
-                (Phase::JournalLoad, 1),
-                (Phase::KeyDerivation, 1),
-                (Phase::JournalLoad, 1),
-                (Phase::KeyDerivation, 1),
-                (Phase::JournalLoad, 1),
-                (Phase::KeyDerivation, 1),
-                (Phase::JournalLoad, 1),
+                (Phase::JournalLoad, 2),
                 (Phase::KeyDerivation, 1),
                 (Phase::JournalLoad, 2),
                 (Phase::KeyDerivation, 1),
@@ -1872,7 +2249,7 @@ mod tests {
             ],
             "pin the live-fallback decode, normalization, and read chronology",
         );
-        assert_step_clock_durations(&phases, 250, 320, 580);
+        assert_step_clock_durations(&phases, 220, 300, 530);
     }
 
     #[test]
@@ -2073,7 +2450,7 @@ mod tests {
     }
 
     #[test]
-    fn approved_localized_snapshot_resolves_exact_non_target_mark() {
+    fn localized_snapshot_needs_protocol_id_without_activation_flags() {
         let fixture: Value =
             serde_json::from_slice(include_bytes!("../testdata/effective-market-v1.json")).unwrap();
         let case = fixture["cases"]
@@ -2082,13 +2459,42 @@ mod tests {
             .iter()
             .find(|case| case["name"] == "canonical_localized_ready_non_target_price")
             .unwrap();
-        let (caller, db, request) = fixture_world(case);
-        let mut context = EthEvmContext::new(db, Default::default());
-        let mut internals = EvmInternals::from_context(&mut context);
-        let mut reader = JournalReader::new(&mut internals);
-        let (row, _) = super::load_market_row(&mut reader, caller, &request, 2, 1).unwrap();
-        assert_eq!(row.market_id, 2);
-        assert_eq!(row.mark_price, U256::from_str_radix("4505000000000000000000", 10).unwrap());
+        let orders: Address = case["addresses"]["ordersManager"].as_str().unwrap().parse().unwrap();
+        let hook_root = word(schema::STORAGE_NAMESPACES_ORDERS_MANAGER_HOOK_STORAGE_ROOT);
+        let last_id_slot = checked_slot_offset(
+            hook_root,
+            schema::STORAGE_PATHS_ORDERS_HOOK_REGISTRATION_FIELDS_LAST_PROTOCOL_ID_SLOT_OFFSET,
+        )
+        .unwrap();
+        for registered in [true, false] {
+            let (caller, mut db, request) = fixture_world(case);
+            db.insert_account_storage(orders, last_id_slot, U256::ZERO).unwrap();
+            let registration_slot = mapping_slot(U256::from_be_slice(caller.as_slice()), hook_root);
+            if !registered {
+                let registration = fixture_storage_word(case, orders, registration_slot);
+                db.insert_account_storage(
+                    orders,
+                    registration_slot,
+                    registration & ((U256::ONE << 224) - U256::ONE),
+                )
+                .unwrap();
+            }
+            let mut context = EthEvmContext::new(db, Default::default());
+            let mut internals = EvmInternals::from_context(&mut context);
+            let mut reader = JournalReader::new(&mut internals);
+            let result = super::load_market_row(&mut reader, caller, &request, 2, 1);
+            if registered {
+                let (row, _) = result.unwrap();
+                assert_eq!(row.market_id, 2);
+                assert_eq!(
+                    row.mark_price,
+                    U256::from_str_radix("4505000000000000000000", 10).unwrap()
+                );
+            } else {
+                assert_eq!(result, Err(LoaderError::Unavailable));
+            }
+            assert!(!reader.ordered_storage_reads().contains(&(orders, last_id_slot)));
+        }
     }
 
     #[test]
@@ -2287,15 +2693,15 @@ mod tests {
             }
         }
 
-        assert_eq!(reader.ordered_storage_reads().len(), 18);
-        assert_eq!(phases.key_derivations, 12);
-        assert_eq!(phases.journal_loads, 20);
+        assert_eq!(reader.ordered_storage_reads().len(), 16);
+        assert_eq!(phases.key_derivations, 10);
+        assert_eq!(phases.journal_loads, 18);
         assert_eq!(
             reader.stats(),
             JournalReadStats {
-                journal_reads: 20,
-                unique_storage_keys: 9,
-                state_access_gas: 25_000
+                journal_reads: 18,
+                unique_storage_keys: 8,
+                state_access_gas: 22_800
             },
         );
     }

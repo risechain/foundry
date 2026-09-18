@@ -397,20 +397,23 @@ pub(crate) fn risk_mark_snapshot_slots(market_id: u16) -> Result<[U256; 2], Stor
     Ok([word0, word1])
 }
 
-pub(crate) fn reduce_only_presence_slot(
+pub(crate) fn owner_side_header_slot(
     protocol_id: u32,
     market_id: u16,
     user_id: u32,
+    side: u8,
 ) -> Result<U256, StorageKeyError> {
     if protocol_id == 0 {
         return Err(StorageKeyError::DisabledSlot);
     }
-    let prefix = schema_word(
-        schema::STORAGE_DIRECT_ARENAS_ORDERS_MANAGER_REDUCE_ONLY_PRESENCE_PREFIX_PREFIX,
-    );
-    let protocol = U256::from(protocol_id) << (u16::BITS + u32::BITS);
-    let market = U256::from(market_id) << u32::BITS;
-    Ok(prefix | protocol | market | U256::from(user_id))
+    if side > 1 {
+        return Err(StorageKeyError::IndexOutOfBounds);
+    }
+    let prefix =
+        schema_word(schema::STORAGE_DIRECT_ARENAS_ORDERS_MANAGER_STP_OWNERSHIP_PREFIX_PREFIX);
+    let book = (U256::from(protocol_id) << u16::BITS) | U256::from(market_id);
+    let owner_side = (book << 33) | (U256::from(user_id) << 1) | U256::from(side);
+    Ok(prefix | (owner_side << 33))
 }
 
 pub(crate) fn perps_market_slot(market_id: u16) -> Result<U256, StorageKeyError> {
@@ -583,9 +586,9 @@ mod tests {
         GasMeter, JournalReadStats, JournalReader, checked_slot_offset, dynamic_array_data_slot,
         extract_signed_bytes, extract_unsigned_bits, fixed_record_slot, formula_descriptor_slot,
         mapping_slot, orders_market_book_slot, orders_market_book_slot_from_base,
-        orders_market_books_slot, orders_tick_level_slot, packed_dynamic_array_element,
-        packed_order_id_element, perps_market_slot, portfolio_bitmap_slots,
-        portfolio_bitmap_slots_from_base, portfolio_slot, reduce_only_presence_slot,
+        orders_market_books_slot, orders_tick_level_slot, owner_side_header_slot,
+        packed_dynamic_array_element, packed_order_id_element, perps_market_slot,
+        portfolio_bitmap_slots, portfolio_bitmap_slots_from_base, portfolio_slot,
         risk_mark_snapshot_slots, trading_account_slot,
     };
     use crate::risex_formula::loader::{GENERATED_CONTRACTS_COMMIT, schema_generated as schema};
@@ -598,26 +601,26 @@ mod tests {
 
     #[test]
     fn journal_reader_generated_artifacts_match_the_pinned_contracts_commit() {
-        assert_eq!(GENERATED_CONTRACTS_COMMIT, "3167b40a5fbcc74faedb38792625fd2492a11f56");
+        assert_eq!(GENERATED_CONTRACTS_COMMIT, "d2aedb90f5e90ca20822525b2a1ef736e4834708");
         assert_eq!(
             sha256_hex(SCHEMA_BYTES),
-            "af50f6c976b287a27c039b540d6d7cbf073006b8f1a40a2f022c0cc9386a9bd9"
+            "285fc4803994fe863af05a9d503207e1331e75f39f43f7a37ebf1968e4002929"
         );
         assert_eq!(
             sha256_hex(CORPUS_BYTES),
-            "7d12255400457379c73220668c3d15a2e2d2031210599714a520cd623b2cb7db"
+            "28790e1eb1275f43c298889b1f017d24b6643b98357295f96eff4dfecaab9025"
         );
         assert_eq!(
             sha256_hex(ARTIFACT_MANIFEST_BYTES),
-            "65120ba285937209a2a19b407ddfa8b1bc98fc37de16341ee775c026088c1c23"
+            "a137d82fc14fbaec1737377a001aacbfc5c24f09d37f89516da21b9d0a7ae873"
         );
         assert_eq!(
             sha256_hex(SLOT_VECTOR_BYTES),
-            "15b8695a2ab404354f9d7c3adf45bf8da5c59cdceb49e450cdc90b8e078a1ac0"
+            "9c3270135136cf4749ee9455d3515e6e3ac72d8753b75d3ee01799d4ac11200f"
         );
         assert_eq!(
             sha256_hex(STATE_VECTOR_BYTES),
-            "4c505b66ff3ca4e2aeefe657dc985cde870268b7fbca46ae9d74a3908f80cd0b"
+            "d0b4dbfd482a6318e907e03ad7fd4a8ec5be5bb1d9fe86b69991677b3d3b7a21"
         );
 
         let manifest: Value = serde_json::from_slice(ARTIFACT_MANIFEST_BYTES).unwrap();
@@ -645,10 +648,11 @@ mod tests {
                 assert_eq!(word0, word(&vector["word0Slot"]), "{name} word 0");
                 assert_eq!(word1, word(&vector["word1Slot"]), "{name} word 1");
             } else {
-                let slot = reduce_only_presence_slot(
+                let slot = owner_side_header_slot(
                     vector["protocolId"].as_u64().unwrap() as u32,
                     vector["marketId"].as_u64().unwrap() as u16,
                     vector["userId"].as_u64().unwrap() as u32,
+                    vector["side"].as_u64().unwrap() as u8,
                 )
                 .unwrap();
                 assert_eq!(slot, word(&vector["slot"]), "{name}");
@@ -872,7 +876,8 @@ mod tests {
         assert!(extract_unsigned_bits(U256::ZERO, 0, 0).is_err());
         assert!(fixed_record_slot(U256::MAX, 1, 2, 0, 2).is_err());
         assert!(packed_dynamic_array_element(U256::ZERO, 0, 0).is_err());
-        assert!(reduce_only_presence_slot(0, u16::MAX, u32::MAX).is_err());
+        assert!(owner_side_header_slot(0, u16::MAX, u32::MAX, 0).is_err());
+        assert!(owner_side_header_slot(1, u16::MAX, u32::MAX, 2).is_err());
         assert!(orders_tick_level_slot(Address::ZERO, u16::MAX, 1 << (u8::BITS * 3)).is_err());
     }
 

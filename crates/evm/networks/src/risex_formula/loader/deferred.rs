@@ -341,6 +341,9 @@ fn discover_candidates<M: PhaseMeasurer>(
             let _ = context.sload(orders, metadata_slot)?;
             let size = field_u32(metadata, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_SIZE_STEPS_BYTE_OFFSET, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_SIZE_STEPS_BYTE_WIDTH)?;
             let filled = field_u32(metadata, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_FILLED_STEPS_BYTE_OFFSET, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_FILLED_STEPS_BYTE_WIDTH)?;
+            if filled >= size {
+                continue;
+            }
             let seq_id = u16::try_from(extract_unsigned_bytes(
                 metadata,
                 schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_SEQ_ID_BYTE_OFFSET,
@@ -356,9 +359,6 @@ fn discover_candidates<M: PhaseMeasurer>(
                 schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_TICK_BYTE_WIDTH,
             )?;
             let claimed_plus_one = field_u32(metadata, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_CLAIMED_STEPS_PLUS_ONE_BYTE_OFFSET, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_CLAIMED_STEPS_PLUS_ONE_BYTE_WIDTH)?;
-            if size == 0 {
-                continue;
-            }
             let queued = queued_steps(size, filled)?;
             if queued == 0 || seq_id == 0 {
                 continue;
@@ -552,7 +552,7 @@ pub(crate) fn prefix_before(
 pub(super) fn prefix_before_in_context<M: PhaseMeasurer>(
     context: &mut LoaderContext<'_, '_, '_, '_, M>,
     orders: Address,
-    book: U256,
+    _book: U256,
     level: U256,
     metadata_seed: U256,
     seq_id: u16,
@@ -563,7 +563,19 @@ pub(super) fn prefix_before_in_context<M: PhaseMeasurer>(
     if u64::from(seq_id) > schema::HARD_BOUNDS_MAX_TICK_LEVEL_SEQ_ID {
         return Err(LoaderError::BoundExceeded);
     }
-    let index = u64::from(seq_id - 1);
+    prefix_sum_in_context(context, orders, level, metadata_seed, u64::from(seq_id - 1))
+}
+
+pub(super) fn prefix_sum_in_context<M: PhaseMeasurer>(
+    context: &mut LoaderContext<'_, '_, '_, '_, M>,
+    orders: Address,
+    level: U256,
+    metadata_seed: U256,
+    index: u64,
+) -> Result<u64, LoaderError> {
+    if index > schema::HARD_BOUNDS_MAX_TICK_LEVEL_SEQ_ID {
+        return Err(LoaderError::BoundExceeded);
+    }
     if index == 0 {
         return Ok(0);
     }
@@ -618,7 +630,7 @@ pub(super) fn prefix_before_in_context<M: PhaseMeasurer>(
             + 1,
     )?)
     .map_err(|_| LoaderError::StateLoad)?;
-    if mode > schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_MODES_CLEARING {
+    if mode > schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_MODES_READY {
         return Err(LoaderError::StateLoad);
     }
     if root.bit(
@@ -627,7 +639,7 @@ pub(super) fn prefix_before_in_context<M: PhaseMeasurer>(
     ) {
         return Err(LoaderError::Unavailable);
     }
-    if matches!(mode, 1 | 2) {
+    if mode == schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_MODES_READY {
         let idx0 = index - 1;
         let quadrant_size = schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_LEAVES_NODE_COUNT
             / schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_SUM8192_NODE_COUNT;
@@ -838,7 +850,6 @@ pub(super) fn prefix_before_in_context<M: PhaseMeasurer>(
         let filled = field_u32(metadata, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_FILLED_STEPS_BYTE_OFFSET, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_PACKING_ORDER_METADATA_FILLED_STEPS_BYTE_WIDTH)?;
         sum = sum.checked_add(queued_steps(size, filled)?).ok_or(LoaderError::Arithmetic)?;
     }
-    let _ = book;
     Ok(sum)
 }
 
@@ -1184,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_prefix_modes_route_through_sum_tree_and_leaf_in_exact_order() {
+    fn lazy_prefix_modes_route_through_authoritative_index_in_exact_order() {
         let orders = Address::repeat_byte(0x15);
         let protocol = Address::repeat_byte(0x71);
         let book = orders_market_book_slot(protocol, 9).unwrap();
@@ -1212,10 +1223,9 @@ mod tests {
         .unwrap();
         let element = packed_order_id_element(order_ids, 16).unwrap();
         let order_id = U256::from(205);
-        for mode in [0_u64, 3, 4] {
+        {
             let mut db = InMemoryDB::default();
             db.insert_account_info(orders, AccountInfo::default());
-            db.insert_account_storage(orders, v2, U256::from(mode) << schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_ROOT_STATE_MODE_BITS_0).unwrap();
             db.insert_account_storage(orders, legacy_sum16, U256::from(10)).unwrap();
             db.insert_account_storage(orders, order_ids, U256::from(18)).unwrap();
             db.insert_account_storage(orders, element.slot, order_id << (element.byte_offset * 8))
@@ -1253,10 +1263,10 @@ mod tests {
                 << (index as u64
                     * schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_LEAVES_BIT_WIDTH))
         });
-        for mode in [1_u64, 2] {
+        {
             let mut db = InMemoryDB::default();
             db.insert_account_info(orders, AccountInfo::default());
-            db.insert_account_storage(orders, v2, U256::from(mode) << schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_ROOT_STATE_MODE_BITS_0).unwrap();
+            db.insert_account_storage(orders, v2, U256::ONE << schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_ROOT_STATE_MODE_BITS_0).unwrap();
             db.insert_account_storage(orders, leaves, packed_leaves).unwrap();
             let mut context = EthEvmContext::new(db, Default::default());
             let mut internals = EvmInternals::from_context(&mut context);
@@ -1264,17 +1274,21 @@ mod tests {
             assert_eq!(prefix_before(&mut reader, orders, book, level, metadata_seed, 6), Ok(15));
             assert_eq!(reader.ordered_storage_reads(), &[(orders, v2), (orders, leaves)]);
         }
-        let mut db = InMemoryDB::default();
-        db.insert_account_info(orders, AccountInfo::default());
-        db.insert_account_storage(orders, v2, U256::from(5) << schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_ROOT_STATE_MODE_BITS_0).unwrap();
-        let mut context = EthEvmContext::new(db, Default::default());
-        let mut internals = EvmInternals::from_context(&mut context);
-        let mut reader = JournalReader::new(&mut internals);
-        assert_eq!(
-            prefix_before(&mut reader, orders, book, level, metadata_seed, 18),
-            Err(LoaderError::StateLoad)
-        );
-        assert_eq!(reader.ordered_storage_reads(), &[(orders, v2)]);
+        for mode in 2_u64..=7 {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(orders, AccountInfo::default());
+            db.insert_account_storage(orders, v2, U256::from(mode) << schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_TICK_PREFIX_INDEXES_V2_ROOT_STATE_MODE_BITS_0).unwrap();
+            let mut context = EthEvmContext::new(db, Default::default());
+            let mut internals = EvmInternals::from_context(&mut context);
+            let mut reader = JournalReader::new(&mut internals);
+            assert_eq!(
+                prefix_before(&mut reader, orders, book, level, metadata_seed, 18),
+                Err(LoaderError::StateLoad)
+            );
+            assert_eq!(reader.ordered_storage_reads(), &[(orders, v2)]);
+            assert_eq!(prefix_before(&mut reader, orders, book, level, metadata_seed, 5), Ok(0));
+            assert_eq!(reader.ordered_storage_reads(), &[(orders, v2), (orders, order_ids)]);
+        }
 
         for (v2_state, legacy_state, reads) in [
             (
@@ -1341,6 +1355,75 @@ mod tests {
         assert!(reader.ordered_storage_reads().is_empty());
         assert_eq!(prefix_before(&mut reader, orders, book, level, metadata_seed, 32_768), Ok(0));
         assert!(reader.ordered_storage_reads().len() <= 6);
+    }
+
+    #[test]
+    fn projected_discovery_ignores_exhausted_metadata_without_level_reads() {
+        let orders = Address::repeat_byte(0x15);
+        let protocol = Address::repeat_byte(0x71);
+        let market_id = 9_u16;
+        let user_id = 102_u32;
+        let book = orders_market_book_slot(protocol, market_id).unwrap();
+        let count_slot = checked_slot_offset(book, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_ABSOLUTE_RECORD_OFFSETS_QUEUE_DIRTY_LEVEL_COUNT).unwrap();
+        let keys = checked_slot_offset(book, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_COMPILED_OFFSETS_PRICE_LEVEL_QUEUE_DIRTY_HEAD_HEAP_KEYS).unwrap();
+        let keys_data = crate::risex_formula::storage::dynamic_array_data_slot(keys);
+        let open_seed = checked_slot_offset(book, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_ABSOLUTE_RECORD_OFFSETS_OPEN_ORDERS_BY_USER_ID_SEED).unwrap();
+        let open_slot = mapping_slot(U256::from(user_id), open_seed);
+        let metadata_seed = checked_slot_offset(book, schema::STORAGE_PATHS_ORDERS_MARKET_BOOK_ABSOLUTE_RECORD_OFFSETS_METADATA_BY_ORDER_ID_SEED).unwrap();
+        let metadata_slot = mapping_slot(U256::from(205), metadata_seed);
+
+        for dirty_count in [1_u32, 2] {
+            for (size, filled) in [(1, 2), (1, 1), (0, 0), (0, 1)] {
+                for sequence in [1_u16, 32_769] {
+                    let mut db = InMemoryDB::default();
+                    db.insert_account_info(orders, AccountInfo::default());
+                    db.insert_account_storage(orders, count_slot, U256::from(dirty_count) << 32)
+                        .unwrap();
+                    db.insert_account_storage(orders, keys, U256::ONE).unwrap();
+                    db.insert_account_storage(orders, keys_data, (U256::ONE << 32) | U256::from(7))
+                        .unwrap();
+                    db.insert_account_storage(orders, open_slot, U256::ONE << 128).unwrap();
+                    db.insert_account_storage(
+                        orders,
+                        metadata_slot,
+                        pack_metadata(size, filled, 0, 7, sequence, 1, 0),
+                    )
+                    .unwrap();
+                    let mut context = EthEvmContext::new(db, Default::default());
+                    let mut internals = EvmInternals::from_context(&mut context);
+                    let mut reader = JournalReader::new(&mut internals);
+                    let mut sink_count = 0;
+                    assert_eq!(
+                        stream_projected_chunks(
+                            &mut reader,
+                            orders,
+                            protocol,
+                            market_id,
+                            user_id,
+                            |_| {
+                                sink_count += 1;
+                                Ok::<_, ()>(())
+                            },
+                        ),
+                        Ok(0),
+                        "dirty_count={dirty_count}, size={size}, filled={filled}, seq={sequence}"
+                    );
+                    assert_eq!(sink_count, 0);
+                    let mut expected = vec![(orders, count_slot)];
+                    if dirty_count == 1 {
+                        expected.extend([(orders, keys), (orders, keys), (orders, keys_data)]);
+                    }
+                    expected.extend([
+                        (orders, open_slot),
+                        (orders, metadata_slot),
+                        (orders, metadata_slot),
+                        (orders, metadata_slot),
+                        (orders, metadata_slot),
+                    ]);
+                    assert_eq!(reader.ordered_storage_reads(), expected);
+                }
+            }
+        }
     }
 
     #[test]

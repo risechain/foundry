@@ -7,4 +7,4 @@ foundry-evm-networks: minor
 ---
 
 Added an opt-in journal-aware RISEx risk-formula precompile to Forge.
-Added bounded `startFilteredStorageReadRecording` and `stopFilteredStorageReadRecording` cheatcodes.
+Added bounded `startFilteredStorageReadRecording` and `stopAndReturnFilteredStorageReadRecording` cheatcodes.
