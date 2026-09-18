@@ -315,6 +315,62 @@ pub struct RecordDebugStepInfo {
     pub original_tracer_config: TracingInspectorConfig,
 }
 
+/// Maximum number of effective storage accounts in a compact SLOAD filter.
+pub(crate) const MAX_FILTERED_STORAGE_READ_ACCOUNTS: usize = 32;
+/// Leading zero bytes required by canonical ABI address words.
+const FILTERED_STORAGE_READ_ADDRESS_PADDING_BYTES: usize = 12;
+/// Maximum number of compact ordered SLOAD results retained by one recording.
+pub(crate) const MAX_FILTERED_STORAGE_READS: usize = 65_536;
+
+/// Deterministic lifecycle and bound failures for compact SLOAD recording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FilteredStorageReadRecordingError {
+    /// Another recording is already active.
+    AlreadyStarted,
+    /// No recording is active.
+    NotStarted,
+    /// The requested account filter is empty.
+    EmptyAccountFilter,
+    /// The requested account filter exceeds its protocol-independent bound.
+    TooManyAccounts { count: U256 },
+    /// The requested account filter is not a set.
+    DuplicateAccount { account: Address },
+    /// A selected account is zero.
+    ZeroAccount { index: usize },
+    /// A selected raw word has nonzero address padding.
+    NonCanonicalAddress { index: usize, word: B256 },
+    /// An unused fixed-array entry is nonzero.
+    NonCanonicalTail { index: usize, word: B256 },
+    /// The ordered result exceeded its retained-read bound.
+    ResultOverflow,
+}
+
+#[derive(Clone, Debug)]
+struct FilteredStorageReadRecorder {
+    accounts: HashSet<Address>,
+    reads: Vec<Vm::FilteredStorageRead>,
+    error: Option<FilteredStorageReadRecordingError>,
+}
+
+impl FilteredStorageReadRecorder {
+    const fn new(accounts: HashSet<Address>) -> Self {
+        Self { accounts, reads: Vec::new(), error: None }
+    }
+
+    #[inline]
+    fn record(&mut self, account: Address, slot: U256) {
+        if self.error.is_some() || !self.accounts.contains(&account) {
+            return;
+        }
+        if self.reads.len() == MAX_FILTERED_STORAGE_READS {
+            self.reads = Vec::new();
+            self.error = Some(FilteredStorageReadRecordingError::ResultOverflow);
+            return;
+        }
+        self.reads.push(Vm::FilteredStorageRead { account, slot: B256::from(slot) });
+    }
+}
+
 /// Environment overrides applied at the opcode level.
 ///
 /// In isolation mode (and inside the synthetic transactions used by
@@ -423,6 +479,7 @@ struct ActiveStorageHook {
 struct StorageHookInspectorState {
     accesses: RecordAccess,
     recording_accesses: bool,
+    filtered_storage_read_recorder: Option<FilteredStorageReadRecorder>,
     mapping_slots: Option<AddressHashMap<MappingSlots>>,
     recorded_logs: Option<Vec<Vm::Log>>,
     mocked_calls: HashMap<Address, BTreeMap<MockCallDataContext, VecDeque<MockCallReturnData>>>,
@@ -847,6 +904,9 @@ pub struct Cheatcodes<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     /// Whether storage access recording is currently active
     pub recording_accesses: bool,
 
+    /// Compact ordered SLOAD recording for selected effective storage accounts.
+    filtered_storage_read_recorder: Option<FilteredStorageReadRecorder>,
+
     /// Recorded account accesses (calls, creates) organized by relative call depth, where the
     /// topmost vector corresponds to accesses at the depth at which account access recording
     /// began. Each vector in the matrix represents a list of accesses at a specific call
@@ -1066,6 +1126,7 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
             fork_revert_diagnostic: Default::default(),
             accesses: Default::default(),
             recording_accesses: Default::default(),
+            filtered_storage_read_recorder: Default::default(),
             recorded_account_diffs_stack: Default::default(),
             pending_account_diffs: Default::default(),
             recorded_account_diffs_prefix: Default::default(),
@@ -1126,6 +1187,71 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
     /// Enables cheatcode analysis capabilities by providing a solar compiler instance.
     pub fn set_analysis(&mut self, analysis: CheatcodeAnalysis) {
         self.analysis = Some(analysis);
+    }
+
+    /// Starts compact ordered SLOAD recording for `accounts`.
+    pub(crate) fn start_filtered_storage_read_recording(
+        &mut self,
+        accounts: &[B256; MAX_FILTERED_STORAGE_READ_ACCOUNTS],
+        count: U256,
+    ) -> std::result::Result<(), FilteredStorageReadRecordingError> {
+        if self.filtered_storage_read_recorder.is_some() {
+            return Err(FilteredStorageReadRecordingError::AlreadyStarted);
+        }
+        if count > U256::from(MAX_FILTERED_STORAGE_READ_ACCOUNTS) {
+            return Err(FilteredStorageReadRecordingError::TooManyAccounts { count });
+        }
+        let count = count.to::<usize>();
+        if count == 0 {
+            return Err(FilteredStorageReadRecordingError::EmptyAccountFilter);
+        }
+
+        let mut account_filter = HashSet::default();
+        account_filter.reserve(count);
+        for (index, word) in accounts[..count].iter().enumerate() {
+            if word.is_zero() {
+                return Err(FilteredStorageReadRecordingError::ZeroAccount { index });
+            }
+            if word.as_slice()[..FILTERED_STORAGE_READ_ADDRESS_PADDING_BYTES]
+                .iter()
+                .any(|byte| *byte != 0)
+            {
+                return Err(FilteredStorageReadRecordingError::NonCanonicalAddress {
+                    index,
+                    word: *word,
+                });
+            }
+            let account = Address::from_word(*word);
+            if !account_filter.insert(account) {
+                return Err(FilteredStorageReadRecordingError::DuplicateAccount { account });
+            }
+        }
+        for (index, word) in accounts[count..].iter().enumerate() {
+            if !word.is_zero() {
+                return Err(FilteredStorageReadRecordingError::NonCanonicalTail {
+                    index: count + index,
+                    word: *word,
+                });
+            }
+        }
+
+        self.filtered_storage_read_recorder =
+            Some(FilteredStorageReadRecorder::new(account_filter));
+        Ok(())
+    }
+
+    /// Stops compact ordered SLOAD recording and returns the complete result.
+    pub(crate) fn stop_filtered_storage_read_recording(
+        &mut self,
+    ) -> std::result::Result<Vec<Vm::FilteredStorageRead>, FilteredStorageReadRecordingError> {
+        let recorder = self
+            .filtered_storage_read_recorder
+            .take()
+            .ok_or(FilteredStorageReadRecordingError::NotStarted)?;
+        if let Some(error) = recorder.error {
+            return Err(error);
+        }
+        Ok(recorder.reads)
     }
 
     /// Starts an internal account diff recording session for test runner setup.
@@ -2174,6 +2300,7 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
             || self.gas_metering.paused
             || self.gas_metering.reset
             || self.recording_accesses
+            || self.filtered_storage_read_recorder.is_some()
             || self.recorded_account_diffs_stack.is_some()
             || !self.allowed_mem_writes.is_empty()
             || self.mapping_slots.is_some()
@@ -2198,8 +2325,8 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
     }
 
     #[inline(always)]
-    pub fn has_recording_accesses_only_step_hook(&self) -> bool {
-        self.recording_accesses
+    pub fn has_storage_access_recording_only_step_hook(&self) -> bool {
+        (self.recording_accesses || self.filtered_storage_read_recorder.is_some())
             && self.broadcast.is_none()
             && !self.gas_metering.paused
             && !self.gas_metering.reset
@@ -2276,6 +2403,10 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>> for Cheatcode
         // `record`: record storage reads and writes.
         if self.recording_accesses {
             self.record_accesses(interpreter);
+        }
+
+        if self.filtered_storage_read_recorder.is_some() {
+            self.record_filtered_storage_read(interpreter);
         }
 
         // `startStateDiffRecording`: record granular ordered storage accesses.
@@ -3510,6 +3641,7 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
         StorageHookInspectorState {
             accesses: std::mem::take(&mut self.accesses),
             recording_accesses: std::mem::replace(&mut self.recording_accesses, false),
+            filtered_storage_read_recorder: self.filtered_storage_read_recorder.take(),
             mapping_slots: self.mapping_slots.take(),
             recorded_logs: self.recorded_logs.take(),
             mocked_calls: std::mem::take(&mut self.mocked_calls),
@@ -3525,6 +3657,7 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
     fn restore_storage_hook_inspector_state(&mut self, state: StorageHookInspectorState) {
         self.accesses = state.accesses;
         self.recording_accesses = state.recording_accesses;
+        self.filtered_storage_read_recorder = state.filtered_storage_read_recorder;
         self.mapping_slots = state.mapping_slots;
         self.recorded_logs = state.recorded_logs;
         self.mocked_calls = state.mocked_calls;
@@ -3730,6 +3863,18 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
             }
             _ => {}
         }
+    }
+
+    #[cold]
+    fn record_filtered_storage_read(&mut self, interpreter: &mut Interpreter) {
+        if interpreter.bytecode.opcode() != op::SLOAD {
+            return;
+        }
+        let slot = try_or_return!(interpreter.stack.peek(0));
+        self.filtered_storage_read_recorder
+            .as_mut()
+            .expect("filtered storage read recorder is active")
+            .record(interpreter.input.target_address, slot);
     }
 
     #[cold]
@@ -4342,19 +4487,19 @@ mod tests {
         cheats.recording_accesses = true;
         assert!(cheats.has_step_hooks());
         assert!(!cheats.has_step_end_hooks());
-        assert!(cheats.has_recording_accesses_only_step_hook());
+        assert!(cheats.has_storage_access_recording_only_step_hook());
 
         cheats.recording_accesses = false;
         cheats.gas_metering.touched = true;
         assert!(!cheats.has_step_hooks());
         assert!(cheats.has_step_end_hooks());
-        assert!(!cheats.has_recording_accesses_only_step_hook());
+        assert!(!cheats.has_storage_access_recording_only_step_hook());
 
         cheats.gas_metering.touched = false;
         cheats.register_storage_load_hook(Address::ZERO, Address::ZERO, [0; 4]);
         assert!(cheats.has_step_hooks());
         assert!(cheats.has_step_end_hooks());
-        assert!(!cheats.has_recording_accesses_only_step_hook());
+        assert!(!cheats.has_storage_access_recording_only_step_hook());
     }
 
     #[test]
@@ -4363,11 +4508,123 @@ mod tests {
         cheats.recording_accesses = true;
 
         cheats.gas_metering.reset = true;
-        assert!(!cheats.has_recording_accesses_only_step_hook());
+        assert!(!cheats.has_storage_access_recording_only_step_hook());
 
         cheats.gas_metering.reset = false;
         cheats.env_overrides.insert(None, EnvOverrides { basefee: Some(1), ..Default::default() });
-        assert!(!cheats.has_recording_accesses_only_step_hook());
+        assert!(!cheats.has_storage_access_recording_only_step_hook());
+    }
+
+    #[test]
+    fn filtered_storage_read_filter_bounds_are_atomic() {
+        let mut cheats = Cheatcodes::<EthEvmNetwork>::new(Arc::default());
+        let mut accounts = [B256::ZERO; MAX_FILTERED_STORAGE_READ_ACCOUNTS];
+        assert_eq!(
+            cheats.start_filtered_storage_read_recording(&accounts, U256::ZERO),
+            Err(FilteredStorageReadRecordingError::EmptyAccountFilter)
+        );
+        assert!(cheats.filtered_storage_read_recorder.is_none());
+
+        accounts[0] = B256::from(U256::from(1));
+        accounts[1] = B256::from(U256::from(1));
+        assert_eq!(
+            cheats.start_filtered_storage_read_recording(&accounts, U256::from(2)),
+            Err(FilteredStorageReadRecordingError::DuplicateAccount {
+                account: Address::with_last_byte(1),
+            })
+        );
+        assert!(cheats.filtered_storage_read_recorder.is_none());
+
+        accounts[0] = B256::ZERO;
+        accounts[1] = B256::ZERO;
+        assert_eq!(
+            cheats.start_filtered_storage_read_recording(&accounts, U256::from(1)),
+            Err(FilteredStorageReadRecordingError::ZeroAccount { index: 0 })
+        );
+        assert!(cheats.filtered_storage_read_recorder.is_none());
+
+        let noncanonical_address = B256::from((U256::from(1) << 160) | U256::from(1));
+        accounts[0] = noncanonical_address;
+        assert_eq!(
+            cheats.start_filtered_storage_read_recording(&accounts, U256::from(1)),
+            Err(FilteredStorageReadRecordingError::NonCanonicalAddress {
+                index: 0,
+                word: noncanonical_address,
+            })
+        );
+        assert!(cheats.filtered_storage_read_recorder.is_none());
+
+        accounts[0] = B256::from(U256::from(1));
+        accounts[1] = B256::from(U256::from(2));
+        assert_eq!(
+            cheats.start_filtered_storage_read_recording(&accounts, U256::from(1)),
+            Err(FilteredStorageReadRecordingError::NonCanonicalTail {
+                index: 1,
+                word: B256::from(U256::from(2)),
+            })
+        );
+        assert!(cheats.filtered_storage_read_recorder.is_none());
+
+        let accounts = std::array::from_fn(|index| B256::from(U256::from(index + 1)));
+        cheats.start_filtered_storage_read_recording(&accounts, U256::from(32)).unwrap();
+        assert!(cheats.record_debug_steps_info.is_none());
+        assert!(cheats.has_step_hooks());
+        assert!(cheats.has_storage_access_recording_only_step_hook());
+        assert_eq!(
+            cheats.start_filtered_storage_read_recording(&accounts, U256::from(32)),
+            Err(FilteredStorageReadRecordingError::AlreadyStarted)
+        );
+        assert!(cheats.stop_filtered_storage_read_recording().unwrap().is_empty());
+
+        assert_eq!(
+            cheats.start_filtered_storage_read_recording(&accounts, U256::from(33)),
+            Err(FilteredStorageReadRecordingError::TooManyAccounts {
+                count: U256::from(MAX_FILTERED_STORAGE_READ_ACCOUNTS + 1),
+            })
+        );
+        assert!(cheats.filtered_storage_read_recorder.is_none());
+    }
+
+    #[test]
+    fn filtered_storage_read_result_bound_is_terminal() {
+        let account = Address::with_last_byte(1);
+        let mut accounts = HashSet::default();
+        accounts.insert(account);
+        let mut recorder = FilteredStorageReadRecorder::new(accounts);
+
+        for slot in 0..MAX_FILTERED_STORAGE_READS {
+            recorder.record(account, U256::from(slot));
+        }
+        assert_eq!(recorder.reads.len(), MAX_FILTERED_STORAGE_READS);
+        assert_eq!(recorder.error, None);
+
+        recorder.record(account, U256::from(MAX_FILTERED_STORAGE_READS));
+        assert!(recorder.reads.is_empty());
+        assert_eq!(recorder.error, Some(FilteredStorageReadRecordingError::ResultOverflow));
+
+        let mut cheats = Cheatcodes::<EthEvmNetwork>::new(Arc::default());
+        cheats.filtered_storage_read_recorder = Some(recorder);
+        assert_eq!(
+            cheats.stop_filtered_storage_read_recording().unwrap_err(),
+            FilteredStorageReadRecordingError::ResultOverflow
+        );
+        assert_eq!(
+            cheats.stop_filtered_storage_read_recording().unwrap_err(),
+            FilteredStorageReadRecordingError::NotStarted
+        );
+    }
+
+    #[test]
+    fn filtered_storage_read_recording_is_suspended_during_storage_hooks() {
+        let mut cheats = Cheatcodes::<EthEvmNetwork>::new(Arc::default());
+        let mut accounts = [B256::ZERO; MAX_FILTERED_STORAGE_READ_ACCOUNTS];
+        accounts[0] = B256::from(U256::from(1));
+        cheats.start_filtered_storage_read_recording(&accounts, U256::from(1)).unwrap();
+
+        let state = cheats.take_storage_hook_inspector_state();
+        assert!(cheats.filtered_storage_read_recorder.is_none());
+        cheats.restore_storage_hook_inspector_state(state);
+        assert!(cheats.filtered_storage_read_recorder.is_some());
     }
 
     #[test]

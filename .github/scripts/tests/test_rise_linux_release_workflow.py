@@ -58,6 +58,15 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
                     r"(?m)^(?:\s*RUST_FEATURES:|\s*FEATURES \?=).*\bmonad\b",
                 )
 
+    def test_packaged_builds_include_risex_risk_precompile(self):
+        for build_path in (WORKFLOW, RELEASE_WORKFLOW, DOCKER_WORKFLOW, MAKEFILE):
+            with self.subTest(build=build_path.name):
+                build_config = build_path.read_text(encoding="utf-8")
+                self.assertRegex(
+                    build_config,
+                    r"(?m)^(?:\s*RUST_FEATURES:|\s*FEATURES \?=).*\brisex-risk-precompile\b",
+                )
+
     def test_validates_cpu_trace_and_builds_dist_binaries(self):
         workflow = self.workflow()
 

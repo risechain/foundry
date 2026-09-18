@@ -1576,7 +1576,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
             && cheats.has_step_hooks()
         {
             let opcode = interpreter.bytecode.opcode();
-            if !cheats.has_recording_accesses_only_step_hook()
+            if !cheats.has_storage_access_recording_only_step_hook()
                 || matches!(opcode, op::SLOAD | op::SSTORE)
             {
                 crate::utils::cold_path();

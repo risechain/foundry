@@ -99,6 +99,9 @@ impl GasSnapshotArgs {
     }
 
     pub async fn run(mut self) -> Result<()> {
+        #[cfg(feature = "risex-risk-precompile")]
+        self.test.ensure_risex_flags_supported("snapshot")?;
+
         // Default to a static fuzz seed so gas snapshots are deterministic,
         // but allow the user to override it via `--fuzz-seed`.
         if self.test.fuzz_seed.is_none() {

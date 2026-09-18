@@ -137,6 +137,8 @@ impl CoverageArgs {
     }
 
     pub(crate) fn ensure_mode_compatible(&self) -> Result<()> {
+        #[cfg(feature = "risex-risk-precompile")]
+        self.test.ensure_risex_flags_supported("coverage")?;
         self.test.ensure_coverage_mode_compatible()
     }
 

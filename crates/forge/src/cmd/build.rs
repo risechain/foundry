@@ -273,7 +273,6 @@ impl BuildArgs {
             return;
         }
 
-        // Note: read_lockfile returns Ok with empty entries for malformed files
         let Ok(lockfile) = soldeer_core::lock::read_lockfile(&soldeer_lock_path) else {
             return;
         };

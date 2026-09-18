@@ -7,7 +7,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
   RUST_PROFILE: dist
-  RUST_FEATURES: aws-kms,gcp-kms,turnkey,cli,asm-keccak,js-tracer,optimism
+  RUST_FEATURES: aws-kms,gcp-kms,turnkey,cli,asm-keccak,js-tracer,optimism,risex-risk-precompile
   SVM_TARGET_PLATFORM: "linux-amd64"
   TARGET: x86_64-unknown-linux-gnu
   OUT_DIR: target/x86_64-unknown-linux-gnu/dist

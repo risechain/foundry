@@ -155,3 +155,7 @@ optimism = [
     "forge-lint/optimism",
     "forge-sol-macro-gen/optimism",
 ]
+risex-risk-precompile = [
+    "foundry-evm/risex-risk-precompile",
+    "foundry-evm-networks/risex-risk-precompile",
+]

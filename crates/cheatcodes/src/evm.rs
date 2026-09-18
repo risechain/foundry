@@ -2,7 +2,11 @@
 
 use crate::{
     BroadcastableTransaction, Cheatcode, Cheatcodes, CheatcodesExecutor, CheatsCtxt, Error, Result,
-    Vm::*, inspector::RecordDebugStepInfo,
+    Vm::*,
+    inspector::{
+        FilteredStorageReadRecordingError, MAX_FILTERED_STORAGE_READ_ACCOUNTS,
+        MAX_FILTERED_STORAGE_READS, RecordDebugStepInfo,
+    },
 };
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_evm::FromRecoveredTx;
@@ -13,7 +17,7 @@ use alloy_primitives::{
     map::{B256Map, HashMap},
 };
 use alloy_rlp::Decodable;
-use alloy_sol_types::SolValue;
+use alloy_sol_types::{SolError, SolValue};
 use foundry_common::{
     TransactionMaybeSigned,
     fs::{read_json_file, write_json_file},
@@ -450,6 +454,65 @@ impl Cheatcode for accessesCall {
         );
         Ok(result.abi_encode_params())
     }
+}
+
+impl Cheatcode for startFilteredStorageReadRecordingCall {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
+        let Self { accounts, count } = self;
+        state
+            .start_filtered_storage_read_recording(accounts, *count)
+            .map_err(encode_filtered_storage_read_error)?;
+        Ok(Default::default())
+    }
+}
+
+impl Cheatcode for stopAndReturnFilteredStorageReadRecordingCall {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
+        let reads = state
+            .stop_filtered_storage_read_recording()
+            .map_err(encode_filtered_storage_read_error)?;
+        Ok(reads.abi_encode())
+    }
+}
+
+fn encode_filtered_storage_read_error(error: FilteredStorageReadRecordingError) -> Error {
+    let data = match error {
+        FilteredStorageReadRecordingError::AlreadyStarted => {
+            FilteredStorageReadRecordingAlreadyStarted {}.abi_encode()
+        }
+        FilteredStorageReadRecordingError::NotStarted => {
+            FilteredStorageReadRecordingNotStarted {}.abi_encode()
+        }
+        FilteredStorageReadRecordingError::EmptyAccountFilter => {
+            FilteredStorageReadAccountFilterEmpty {}.abi_encode()
+        }
+        FilteredStorageReadRecordingError::TooManyAccounts { count } => {
+            FilteredStorageReadAccountFilterTooLarge {
+                count,
+                max: U256::from(MAX_FILTERED_STORAGE_READ_ACCOUNTS),
+            }
+            .abi_encode()
+        }
+        FilteredStorageReadRecordingError::DuplicateAccount { account } => {
+            FilteredStorageReadAccountFilterDuplicate { account }.abi_encode()
+        }
+        FilteredStorageReadRecordingError::ZeroAccount { index } => {
+            FilteredStorageReadAccountFilterZero { index: U256::from(index) }.abi_encode()
+        }
+        FilteredStorageReadRecordingError::NonCanonicalAddress { index, word } => {
+            FilteredStorageReadAccountFilterNonCanonicalAddress { index: U256::from(index), word }
+                .abi_encode()
+        }
+        FilteredStorageReadRecordingError::NonCanonicalTail { index, word } => {
+            FilteredStorageReadAccountFilterNonCanonicalTail { index: U256::from(index), word }
+                .abi_encode()
+        }
+        FilteredStorageReadRecordingError::ResultOverflow => {
+            FilteredStorageReadResultOverflow { max: U256::from(MAX_FILTERED_STORAGE_READS) }
+                .abi_encode()
+        }
+    };
+    Error::from(data)
 }
 
 impl Cheatcode for registerSloadHookCall {

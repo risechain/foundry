@@ -26,6 +26,8 @@ mod json;
 mod lint;
 mod multi_script;
 mod precompiles;
+#[cfg(feature = "risex-risk-precompile")]
+mod risex_formula_precompile;
 mod script;
 mod soldeer;
 mod svm;

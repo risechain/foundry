@@ -24,6 +24,33 @@ interface Vm {
     /// Error thrown by cheatcodes.
     error CheatcodeError(string message);
 
+    /// Another compact ordered SLOAD recording is already active.
+    error FilteredStorageReadRecordingAlreadyStarted();
+
+    /// No compact ordered SLOAD recording is active.
+    error FilteredStorageReadRecordingNotStarted();
+
+    /// A compact ordered SLOAD recording requires at least one storage account.
+    error FilteredStorageReadAccountFilterEmpty();
+
+    /// The requested storage-account filter exceeds the supported bound.
+    error FilteredStorageReadAccountFilterTooLarge(uint256 count, uint256 max);
+
+    /// The requested storage-account filter contains a duplicate account.
+    error FilteredStorageReadAccountFilterDuplicate(address account);
+
+    /// The requested storage-account filter contains a zero selected account.
+    error FilteredStorageReadAccountFilterZero(uint256 index);
+
+    /// The requested selected-account word has nonzero address padding.
+    error FilteredStorageReadAccountFilterNonCanonicalAddress(uint256 index, bytes32 word);
+
+    /// The requested storage-account filter has a nonzero unused fixed-array entry.
+    error FilteredStorageReadAccountFilterNonCanonicalTail(uint256 index, bytes32 word);
+
+    /// The compact ordered SLOAD result exceeded the supported bound.
+    error FilteredStorageReadResultOverflow(uint256 max);
+
     /// A modification applied to either `msg.sender` or `tx.origin`. Returned by `readCallers`.
     enum CallerMode {
         /// No caller modification is currently active.
@@ -306,6 +333,14 @@ interface Vm {
         address contractAddr;
     }
 
+    /// An ordered SLOAD captured for an explicitly selected effective storage account.
+    struct FilteredStorageRead {
+        /// The effective storage account read by the SLOAD.
+        address account;
+        /// The exact 256-bit storage slot read by the SLOAD.
+        bytes32 slot;
+    }
+
     /// The transaction type (`txType`) of the broadcast.
     enum BroadcastTxType {
         /// Represents a CALL broadcast tx.
@@ -415,6 +450,18 @@ interface Vm {
     /// Gets all accessed reads and write slot from a `vm.record` session, for a given address.
     #[cheatcode(group = Evm, safety = Safe)]
     function accesses(address target) external view returns (bytes32[] memory readSlots, bytes32[] memory writeSlots);
+
+    /// Starts compact ordered SLOAD recording for an explicit set of effective storage accounts.
+    /// `count` must be 1 through 32. Each selected prefix word must be a unique nonzero canonical
+    /// address and every unused fixed-array word must be zero. At most 65,536 reads are retained.
+    #[cheatcode(group = Evm, safety = Safe)]
+    function startFilteredStorageReadRecording(bytes32[32] calldata accounts, uint256 count) external;
+
+    /// Stops compact ordered SLOAD recording and returns every selected read in execution order.
+    #[cheatcode(group = Evm, safety = Safe)]
+    function stopAndReturnFilteredStorageReadRecording()
+        external
+        returns (FilteredStorageRead[] memory reads);
 
     /// Registers a callback invoked after each SLOAD against `target`'s effective storage account,
     /// including when its code runs by delegatecall.
@@ -3508,6 +3555,45 @@ impl fmt::Display for Vm::VmErrors {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CheatcodeError(err) => err.fmt(f),
+            Self::FilteredStorageReadRecordingAlreadyStarted(_) => {
+                f.write_str("filtered storage read recording was already started")
+            }
+            Self::FilteredStorageReadRecordingNotStarted(_) => {
+                f.write_str("filtered storage read recording was not started")
+            }
+            Self::FilteredStorageReadAccountFilterEmpty(_) => {
+                f.write_str("filtered storage read account filter is empty")
+            }
+            Self::FilteredStorageReadAccountFilterTooLarge(err) => {
+                write!(
+                    f,
+                    "filtered storage read account filter has {} accounts; max {}",
+                    err.count, err.max
+                )
+            }
+            Self::FilteredStorageReadAccountFilterDuplicate(err) => {
+                write!(f, "filtered storage read account filter duplicates {}", err.account)
+            }
+            Self::FilteredStorageReadAccountFilterZero(err) => {
+                write!(f, "filtered storage read account filter has zero account at {}", err.index)
+            }
+            Self::FilteredStorageReadAccountFilterNonCanonicalAddress(err) => {
+                write!(
+                    f,
+                    "filtered storage read account filter has noncanonical address word {} at {}",
+                    err.word, err.index
+                )
+            }
+            Self::FilteredStorageReadAccountFilterNonCanonicalTail(err) => {
+                write!(
+                    f,
+                    "filtered storage read account filter has noncanonical tail word {} at {}",
+                    err.word, err.index
+                )
+            }
+            Self::FilteredStorageReadResultOverflow(err) => {
+                write!(f, "filtered storage read result exceeds {} reads", err.max)
+            }
         }
     }
 }

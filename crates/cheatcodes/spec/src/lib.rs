@@ -91,6 +91,7 @@ impl Cheatcodes<'static> {
                 Vm::StorageAccess::STRUCT.clone(),
                 Vm::Gas::STRUCT.clone(),
                 Vm::DebugStep::STRUCT.clone(),
+                Vm::FilteredStorageRead::STRUCT.clone(),
                 Vm::BroadcastTxSummary::STRUCT.clone(),
                 Vm::SignedDelegation::STRUCT.clone(),
                 Vm::PotentialRevert::STRUCT.clone(),

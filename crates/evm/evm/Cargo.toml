@@ -86,3 +86,4 @@ optimism = [
     "foundry-evm-fuzz/optimism",
     "foundry-evm-traces/optimism",
 ]
+risex-risk-precompile = ["foundry-evm-networks/risex-risk-precompile"]

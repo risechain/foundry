@@ -5004,6 +5004,34 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
     );
 });
 
+forgetest_init!(filtered_storage_read_recording, |prj, cmd| {
+    prj.initialize_default_contracts();
+    prj.add_test(
+        "FilteredStorageReadRecording.t.sol",
+        include_str!("../../../../../testdata/default/cheats/FilteredStorageReadRecording.t.sol"),
+    );
+
+    cmd.args([
+        "test",
+        "--match-contract",
+        "FilteredStorageReadRecordingTest",
+        "--no-match-test",
+        "testFilteredRecordingCoexistsWithDebugTrace",
+    ])
+    .assert_success();
+});
+
+forgetest_init!(filtered_storage_read_recording_coexists_with_debug_trace, |prj, cmd| {
+    prj.initialize_default_contracts();
+    prj.add_test(
+        "FilteredStorageReadRecording.t.sol",
+        include_str!("../../../../../testdata/default/cheats/FilteredStorageReadRecording.t.sol"),
+    );
+
+    cmd.args(["test", "--match-test", "testFilteredRecordingCoexistsWithDebugTrace", "-vvvv"])
+        .assert_success();
+});
+
 forgetest_init!(colored_traces, |prj, cmd| {
     prj.initialize_default_contracts();
     cmd.args([
