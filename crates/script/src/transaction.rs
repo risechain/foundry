@@ -5,10 +5,12 @@ use alloy_network::{Network, TransactionBuilder};
 use alloy_primitives::{Address, B256, Selector, hex};
 use eyre::Result;
 use forge_script_sequence::TransactionWithMetadata;
-use foundry_common::{ContractData, SELECTOR_LEN, TransactionMaybeSigned, fmt::format_token_raw};
-use foundry_evm::traces::CallTraceDecoder;
+use foundry_cli::utils::apply_gas_estimate_multiplier;
+use foundry_common::{
+    ContractData, ContractsByArtifact, SELECTOR_LEN, TransactionMaybeSigned, fmt::format_token_raw,
+};
+use foundry_evm::traces::{CallKind, CallTraceDecoder};
 use itertools::Itertools;
-use revm_inspectors::tracing::types::CallKind;
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
@@ -30,24 +32,33 @@ impl<N: Network> ScriptTransactionBuilder<N> {
     pub fn set_call(
         &mut self,
         local_contracts: &BTreeMap<Address, &ContractData>,
+        known_contracts: &ContractsByArtifact,
         decoder: &CallTraceDecoder,
         create2_deployer: Address,
     ) -> Result<()> {
         if let Some(to) = self.transaction.transaction.to() {
+            self.transaction.call_kind = CallKind::Call;
+            self.transaction.contract_address = Some(to);
+
             if to == create2_deployer {
-                if let Some(input) = self.transaction.transaction.input() {
+                if let Some(input) = self.transaction.transaction.input()
+                    && input.len() >= 32
+                {
                     let (salt, init_code) = input.split_at(32);
 
                     self.set_create(
                         true,
                         create2_deployer.create2_from_code(B256::from_slice(salt), init_code),
-                        local_contracts,
+                        known_contracts,
+                    )?;
+                } else {
+                    let input_len =
+                        self.transaction.transaction.input().map_or(0, |input| input.len());
+                    sh_warn!(
+                        "Skipping CREATE2 decoding for call to deployer {create2_deployer}: input length {input_len} is shorter than the 32-byte salt prefix"
                     )?;
                 }
             } else {
-                self.transaction.call_kind = CallKind::Call;
-                self.transaction.contract_address = Some(to);
-
                 let Some(data) = self.transaction.transaction.input() else { return Ok(()) };
 
                 if data.len() < SELECTOR_LEN {
@@ -99,7 +110,7 @@ impl<N: Network> ScriptTransactionBuilder<N> {
         &mut self,
         is_create2: bool,
         address: Address,
-        contracts: &BTreeMap<Address, &ContractData>,
+        contracts: &ContractsByArtifact,
     ) -> Result<()> {
         if is_create2 {
             self.transaction.call_kind = CallKind::Create2;
@@ -107,13 +118,9 @@ impl<N: Network> ScriptTransactionBuilder<N> {
             self.transaction.call_kind = CallKind::Create;
         }
 
-        let info = contracts.get(&address);
-        self.transaction.contract_name = info.map(|info| info.name.clone());
         self.transaction.contract_address = Some(address);
 
         let Some(data) = self.transaction.transaction.input() else { return Ok(()) };
-        let Some(info) = info else { return Ok(()) };
-        let Some(bytecode) = info.bytecode() else { return Ok(()) };
 
         // `create2` transactions are prefixed by a 32 byte salt.
         let creation_code = if is_create2 {
@@ -124,6 +131,16 @@ impl<N: Network> ScriptTransactionBuilder<N> {
         } else {
             data
         };
+        let artifact = contracts.find_by_creation_code_prefix(creation_code);
+        self.transaction.contract_name = artifact
+            .or_else(|| contracts.find_by_creation_code(creation_code))
+            .map(|(id, _)| id.name.clone());
+        // Script verification skips Vyper, so a Vyper deployment never has to match on resume.
+        self.transaction.exact_artifact_match =
+            artifact.is_some_and(|(id, _)| !id.source.extension().is_some_and(|ext| ext == "vy"));
+
+        let Some((_, info)) = artifact else { return Ok(()) };
+        let Some(bytecode) = info.bytecode() else { return Ok(()) };
 
         // The constructor args start after bytecode.
         let contains_constructor_args = creation_code.len() > bytecode.len();
@@ -154,7 +171,7 @@ impl<N: Network> ScriptTransactionBuilder<N> {
         result: &ScriptResult<N>,
         gas_estimate_multiplier: u64,
         linked_build_data: &LinkedBuildData,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut created_contracts =
             result.get_created_contracts(&linked_build_data.known_contracts);
 
@@ -170,10 +187,13 @@ impl<N: Network> ScriptTransactionBuilder<N> {
             && let Some(unsigned) = self.transaction.transaction.as_unsigned_mut()
         {
             // We inflate the gas used by the user specified percentage
-            unsigned.set_gas_limit(result.gas_used * gas_estimate_multiplier / 100);
+            unsigned.set_gas_limit(apply_gas_estimate_multiplier(
+                result.gas_used,
+                Some(gas_estimate_multiplier),
+            )?);
         }
 
-        self
+        Ok(self)
     }
 
     pub fn build(self) -> TransactionWithMetadata<N> {
@@ -187,8 +207,58 @@ impl<N: Network> From<TransactionWithMetadata<N>> for ScriptTransactionBuilder<N
     }
 }
 
-#[cfg(all(test, feature = "monad"))]
+#[cfg(test)]
 mod tests {
+    use super::*;
+    use alloy_network::Ethereum;
+    use alloy_primitives::{Bytes, address};
+    use alloy_rpc_types::TransactionRequest;
+
+    fn call_to_create2_deployer(input: Option<Bytes>) -> TransactionWithMetadata<Ethereum> {
+        let create2_deployer = address!("0000000000000000000000000000000000001234");
+        let mut transaction = TransactionRequest::default()
+            .with_from(Address::repeat_byte(0x11))
+            .with_to(create2_deployer)
+            .with_nonce(0);
+        if let Some(input) = input {
+            transaction = transaction.with_input(input);
+        }
+        let mut builder = ScriptTransactionBuilder::<Ethereum>::new(
+            TransactionMaybeSigned::new(transaction),
+            "http://localhost:8545".to_string(),
+        );
+        let decoder = CallTraceDecoder::new();
+        builder
+            .set_call(&BTreeMap::new(), &ContractsByArtifact::default(), decoder, create2_deployer)
+            .unwrap();
+        builder.build()
+    }
+
+    #[test]
+    fn short_create2_input_is_classified_as_call() {
+        let create2_deployer = address!("0000000000000000000000000000000000001234");
+        for input in [None, Some(Bytes::new()), Some(Bytes::from(vec![0xab; 31]))] {
+            let transaction = call_to_create2_deployer(input);
+            assert_eq!(transaction.call_kind, CallKind::Call);
+            assert_eq!(transaction.contract_address, Some(create2_deployer));
+        }
+    }
+
+    #[test]
+    fn valid_create2_input_is_classified_as_create2() {
+        let create2_deployer = address!("0000000000000000000000000000000000001234");
+        for input in [Bytes::from(vec![0xab; 32]), Bytes::from(vec![0xab; 33])] {
+            let expected = create2_deployer
+                .create2_from_code(B256::repeat_byte(0xab), input.get(32..).unwrap());
+            let transaction = call_to_create2_deployer(Some(input));
+            assert_eq!(transaction.call_kind, CallKind::Create2);
+            assert_eq!(transaction.contract_address, Some(expected));
+        }
+    }
+}
+
+#[cfg(all(test, feature = "monad"))]
+mod monad_tests {
     use super::*;
     use alloy_network::Ethereum;
     use alloy_primitives::{Bytes, address, keccak256};
@@ -203,7 +273,7 @@ mod tests {
         CallTraceDecoderBuilder::new()
             .with_networks(NetworkConfigs::with_monad())
             .with_chain_id(Some(143))
-            .with_monad_hardfork(Some(hardfork))
+            .with_hardfork(Some(hardfork.into()))
             .build()
     }
 
@@ -228,7 +298,9 @@ mod tests {
             TransactionMaybeSigned::new(transaction),
             "http://localhost:8545".to_string(),
         );
-        builder.set_call(&BTreeMap::new(), &decoder, Address::ZERO).unwrap();
+        builder
+            .set_call(&BTreeMap::new(), &ContractsByArtifact::default(), &decoder, Address::ZERO)
+            .unwrap();
         builder.build()
     }
 

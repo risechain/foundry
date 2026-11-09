@@ -20,6 +20,8 @@ use serde::Serialize;
 use tempo_revm::TempoInvalidTransaction;
 use tokio::time::Duration;
 
+#[cfg(feature = "base")]
+mod base;
 #[cfg(feature = "optimism")]
 mod optimism;
 
@@ -35,6 +37,8 @@ pub enum BlockchainError {
     ChainIdNotAvailable,
     #[error("Invalid input: `max_priority_fee_per_gas` greater than `max_fee_per_gas`")]
     InvalidFeeInput,
+    #[error("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified")]
+    ConflictingFeeFields,
     #[error("Transaction data is empty")]
     EmptyRawTransactionData,
     #[error("Failed to decode signed transaction")]
@@ -43,6 +47,8 @@ pub enum BlockchainError {
     FailedToDecodeTransaction,
     #[error("Failed to decode receipt")]
     FailedToDecodeReceipt,
+    #[error("Cannot EIP-2718 encode transaction type 0x{0:x}")]
+    UnsupportedTransactionEncoding(u8),
     #[error("Failed to decode state")]
     FailedToDecodeStateDump,
     #[error("Prevrandao not in the EVM's environment after merge")]
@@ -84,6 +90,9 @@ pub enum BlockchainError {
     TransactionNotFound,
     #[error("Required data unavailable")]
     DataUnavailable,
+    /// Thrown when replaying a mined block requires a parent state that is no longer stored.
+    #[error("historical state needed to replay block {0} is not available")]
+    HistoricalStateUnavailable(u64),
     #[error("Trie error: {0}")]
     TrieError(String),
     #[error("{0}")]
@@ -110,14 +119,34 @@ pub enum BlockchainError {
         "EIP-7702 fields received but is not supported by the current hardfork.\n\nYou can use it by running anvil with '--hardfork prague' or later."
     )]
     EIP7702TransactionUnsupportedAtHardfork,
-    #[error(
-        "op-stack deposit tx received but is not supported.\n\nYou can use it by running anvil with '--optimism'."
+    // Base is an OP-stack chain and uses the same deposit envelope, so only the hint that names
+    // the flags able to enable it varies with the compiled-in families.
+    #[cfg_attr(
+        all(feature = "base", feature = "optimism"),
+        error(
+            "op-stack deposit tx received but is not supported.\n\nYou can use it by running anvil with '--optimism' or '--network base'."
+        )
+    )]
+    #[cfg_attr(
+        all(feature = "base", not(feature = "optimism")),
+        error(
+            "op-stack deposit tx received but is not supported.\n\nYou can use it by running anvil with '--network base'."
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "base"),
+        error(
+            "op-stack deposit tx received but is not supported.\n\nYou can use it by running anvil with '--optimism'."
+        )
     )]
     DepositTransactionUnsupported,
     #[error(
         "tempo transaction received but is not supported.\n\nYou can use it by running anvil with '--tempo'."
     )]
     TempoTransactionUnsupported,
+    #[cfg(feature = "base")]
+    #[error("Base transactions require native Base execution; run Anvil with --network base")]
+    BaseTransactionUnsupported,
     #[error("Unknown transaction type not supported")]
     UnknownTransactionType,
     #[error("Excess blob gas not set.")]
@@ -133,6 +162,9 @@ pub enum BlockchainError {
     },
     #[error("Invalid transaction request: {0}")]
     InvalidTransactionRequest(String),
+    #[cfg(feature = "base")]
+    #[error("EIP-8130 transaction rejected: {0}")]
+    Eip8130TransactionRejected(String),
     #[error("filter not found")]
     FilterNotFound,
 }
@@ -228,6 +260,8 @@ pub enum PoolError {
 pub enum FeeHistoryError {
     #[error("requested block range is out of bounds")]
     InvalidBlockRange,
+    #[error("reward percentiles must be strictly increasing and between 0 and 100")]
+    InvalidRewardPercentiles,
     #[error("could not find block number requested: {0}")]
     BlockNotFound(BlockNumberOrTag),
 }
@@ -340,15 +374,26 @@ pub enum InvalidTransactionError {
     /// Missing enveloped transaction
     #[error("missing enveloped transaction")]
     MissingEnvelopedTx,
+    /// EIP-8130 transaction failed block-inclusion validation.
+    #[cfg(feature = "base")]
+    #[error("EIP-8130 transaction rejected: {0}")]
+    Eip8130(String),
     /// Native ETH value transfers are not allowed in Tempo mode
     #[error("native value transfer not allowed in Tempo mode")]
     TempoNativeValueTransfer,
     /// Tempo transaction valid_before is expired or too close to current time
     #[error("Tempo tx valid_before ({valid_before}) must be > current time + 3s ({min_allowed})")]
     TempoValidBeforeExpired { valid_before: u64, min_allowed: u64 },
+    /// Tempo expiring nonce transaction valid_before is too far in the future.
+    #[error(
+        "Tempo expiring nonce tx valid_before ({valid_before}) must be <= current time + {max_expiry_secs}s ({max_allowed})"
+    )]
+    TempoValidBeforeTooFar { valid_before: u64, max_expiry_secs: u64, max_allowed: u64 },
     /// Tempo transaction valid_after is too far in the future
-    #[error("Tempo tx valid_after ({valid_after}) must be <= current time + 1h ({max_allowed})")]
-    TempoValidAfterTooFar { valid_after: u64, max_allowed: u64 },
+    #[error(
+        "Tempo tx valid_after ({valid_after}) must be <= current time + {max_valid_after_secs}s ({max_allowed})"
+    )]
+    TempoValidAfterTooFar { valid_after: u64, max_valid_after_secs: u64, max_allowed: u64 },
     /// Tempo transaction has too many authorizations
     #[error("Tempo tx has too many authorizations ({count}), max allowed is {max}")]
     TempoTooManyAuthorizations { count: usize, max: usize },
@@ -420,7 +465,7 @@ pub(crate) trait ToRpcResponseResult {
 
 /// Converts a serializable value into a `ResponseResult`
 pub fn to_rpc_result<T: Serialize>(val: T) -> ResponseResult {
-    match serde_json::to_value(val) {
+    match serde_json::value::to_raw_value(&val) {
         Ok(success) => ResponseResult::Success(success),
         Err(err) => {
             error!(%err, "Failed serialize rpc response");
@@ -433,192 +478,191 @@ impl<T: Serialize> ToRpcResponseResult for Result<T> {
     fn to_rpc_result(self) -> ResponseResult {
         match self {
             Ok(val) => to_rpc_result(val),
-            Err(err) => match err {
-                BlockchainError::Pool(err) => {
-                    error!(%err, "txpool error");
-                    match err {
-                        PoolError::CyclicTransaction => {
-                            RpcError::transaction_rejected("Cyclic transaction detected")
-                        }
-                        PoolError::ReplacementUnderpriced(_) => {
-                            RpcError::transaction_rejected("replacement transaction underpriced")
-                        }
-                        PoolError::AlreadyImported(_) => {
-                            RpcError::transaction_rejected("transaction already imported")
-                        }
-                    }
-                }
-                BlockchainError::NoSignerAvailable => {
-                    RpcError::invalid_params("No Signer available")
-                }
-                BlockchainError::ChainIdNotAvailable => {
-                    RpcError::invalid_params("Chain Id not available")
-                }
-                BlockchainError::TransactionConfirmationTimeout { hash, .. } => RpcError {
-                    code: ErrorCode::ServerError(4),
-                    message: "Transaction confirmation timeout".into(),
-                    data: Some(serde_json::Value::String(hash.to_string())),
-                },
-                BlockchainError::InvalidTransaction(err) => match err {
-                    InvalidTransactionError::Revert(data) => {
-                        // this mimics geth revert error
-                        let mut msg = "execution reverted".to_string();
-                        if let Some(reason) = data
-                            .as_ref()
-                            .and_then(|data| RevertDecoder::new().maybe_decode(data, None))
-                        {
-                            msg = format!("{msg}: {reason}");
-                        }
-                        RpcError {
-                            // geth returns this error code on reverts, See <https://eips.ethereum.org/EIPS/eip-1474#specification>
-                            code: ErrorCode::ExecutionError,
-                            message: msg.into(),
-                            data: serde_json::to_value(data).ok(),
-                        }
-                    }
-                    InvalidTransactionError::GasTooLow => {
-                        // <https://eips.ethereum.org/EIPS/eip-1898>
-                        RpcError {
-                            code: ErrorCode::ServerError(-32000),
-                            message: err.to_string().into(),
-                            data: None,
-                        }
-                    }
-                    InvalidTransactionError::GasTooHigh(_) => {
-                        // <https://eips.ethereum.org/EIPS/eip-1898>
-                        RpcError {
-                            code: ErrorCode::ServerError(-32000),
-                            message: err.to_string().into(),
-                            data: None,
-                        }
-                    }
-                    _ => RpcError::transaction_rejected(err.to_string()),
-                },
-                BlockchainError::FeeHistory(err) => RpcError::invalid_params(err.to_string()),
-                BlockchainError::EmptyRawTransactionData => {
-                    RpcError::invalid_params("Empty transaction data")
-                }
-                BlockchainError::FailedToDecodeSignedTransaction => {
-                    RpcError::invalid_params("Failed to decode transaction")
-                }
-                BlockchainError::FailedToDecodeTransaction => {
-                    RpcError::invalid_params("Failed to decode transaction")
-                }
-                BlockchainError::FailedToDecodeReceipt => {
-                    RpcError::invalid_params("Failed to decode receipt")
-                }
-                BlockchainError::FailedToDecodeStateDump => {
-                    RpcError::invalid_params("Failed to decode state dump")
-                }
-                BlockchainError::SignerError(err) => RpcError::invalid_params(err.to_string()),
-                BlockchainError::SignatureError(err) => RpcError::invalid_params(err.to_string()),
-                BlockchainError::RpcUnimplemented => {
-                    RpcError::internal_error_with("Not implemented")
-                }
-                BlockchainError::PrevrandaoNotSet => RpcError::internal_error_with(err.to_string()),
-                BlockchainError::RpcError(err) => err,
-                BlockchainError::InvalidFeeInput => RpcError::invalid_params(
-                    "Invalid input: `max_priority_fee_per_gas` greater than `max_fee_per_gas`",
-                ),
-                BlockchainError::AlloyForkProvider(err) => {
-                    error!(target: "backend", %err, "fork provider error");
-                    match err {
-                        TransportError::ErrorResp(err) => RpcError {
-                            code: ErrorCode::from(err.code),
-                            message: err.message,
-                            data: err.data.and_then(|data| serde_json::to_value(data).ok()),
-                        },
-                        err => RpcError::internal_error_with(format!("Fork Error: {err:?}")),
-                    }
-                }
-                err @ BlockchainError::EvmError(_) => RpcError {
-                    // VM halts are execution failures, not JSON-RPC server faults. REVERT has a
-                    // dedicated code/data path above; other halts, such as invalid opcode, do not.
-                    code: ErrorCode::TransactionRejected,
-                    message: err.to_string().into(),
-                    data: None,
-                },
-                err @ BlockchainError::EvmOverrideError(_) => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::InvalidUrl(_) => RpcError::invalid_params(err.to_string()),
-                err @ BlockchainError::UnsupportedForkNetwork { .. } => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                BlockchainError::Internal(err) => RpcError::internal_error_with(err),
-                err @ BlockchainError::BlockOutOfRange(_, _) => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::BlockNotFound => RpcError {
-                    // <https://eips.ethereum.org/EIPS/eip-1898>
-                    code: ErrorCode::ServerError(-32001),
-                    message: err.to_string().into(),
-                    data: None,
-                },
-                err @ BlockchainError::TransactionNotFound => RpcError {
-                    code: ErrorCode::ServerError(-32001),
-                    message: err.to_string().into(),
-                    data: None,
-                },
-                err @ BlockchainError::DataUnavailable => {
-                    RpcError::internal_error_with(err.to_string())
-                }
-                err @ BlockchainError::TrieError(_) => {
-                    RpcError::internal_error_with(err.to_string())
-                }
-                BlockchainError::UintConversion(err) => RpcError::invalid_params(err),
-                err @ BlockchainError::StateOverrideError(_) => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::TimestampError(_) => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                BlockchainError::DatabaseError(err) => {
-                    RpcError::internal_error_with(err.to_string())
-                }
-                err @ BlockchainError::EIP1559TransactionUnsupportedAtHardfork => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::EIP2930TransactionUnsupportedAtHardfork => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::EIP4844TransactionUnsupportedAtHardfork => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::EIP7702TransactionUnsupportedAtHardfork => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::DepositTransactionUnsupported => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::TempoTransactionUnsupported => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::ExcessBlobGasNotSet => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::Message(_) => RpcError::internal_error_with(err.to_string()),
-                err @ BlockchainError::UnknownTransactionType => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::InvalidTransactionRequest(_) => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                err @ BlockchainError::RecoveryError(_) => {
-                    RpcError::invalid_params(err.to_string())
-                }
-                BlockchainError::FilterNotFound => RpcError {
-                    code: ErrorCode::ServerError(-32000),
-                    message: "filter not found".into(),
-                    data: None,
-                },
-                err @ BlockchainError::UnknownBlock => RpcError {
-                    code: ErrorCode::ServerError(-32000),
-                    message: err.to_string().into(),
-                    data: None,
-                },
-            }
-            .into(),
+            Err(err) => blockchain_error_to_rpc_result(err),
         }
     }
+}
+
+/// Converts a [`BlockchainError`] into a `ResponseResult`.
+///
+/// This is not generic so that the error mapping is only compiled once.
+fn blockchain_error_to_rpc_result(err: BlockchainError) -> ResponseResult {
+    match err {
+        BlockchainError::Pool(err) => {
+            error!(%err, "txpool error");
+            match err {
+                PoolError::CyclicTransaction => {
+                    RpcError::transaction_rejected("Cyclic transaction detected")
+                }
+                PoolError::ReplacementUnderpriced(_) => {
+                    RpcError::transaction_rejected("replacement transaction underpriced")
+                }
+                PoolError::AlreadyImported(_) => {
+                    RpcError::transaction_rejected("transaction already imported")
+                }
+            }
+        }
+        BlockchainError::NoSignerAvailable => RpcError::invalid_params("No Signer available"),
+        BlockchainError::ChainIdNotAvailable => RpcError::invalid_params("Chain Id not available"),
+        BlockchainError::TransactionConfirmationTimeout { hash, .. } => RpcError {
+            code: ErrorCode::ServerError(4),
+            message: "Transaction confirmation timeout".into(),
+            data: Some(serde_json::Value::String(hash.to_string())),
+        },
+        BlockchainError::InvalidTransaction(err) => match err {
+            InvalidTransactionError::Revert(data) => {
+                // this mimics geth revert error
+                let mut msg = "execution reverted".to_string();
+                if let Some(reason) =
+                    data.as_ref().and_then(|data| RevertDecoder::new().maybe_decode(data, None))
+                {
+                    msg = format!("{msg}: {reason}");
+                }
+                RpcError {
+                    // geth returns this error code on reverts, See <https://eips.ethereum.org/EIPS/eip-1474#specification>
+                    code: ErrorCode::ExecutionError,
+                    message: msg.into(),
+                    data: serde_json::to_value(data).ok(),
+                }
+            }
+            InvalidTransactionError::GasTooLow => {
+                // <https://eips.ethereum.org/EIPS/eip-1898>
+                RpcError {
+                    code: ErrorCode::ServerError(-32000),
+                    message: err.to_string().into(),
+                    data: None,
+                }
+            }
+            InvalidTransactionError::GasTooHigh(_) => {
+                // <https://eips.ethereum.org/EIPS/eip-1898>
+                RpcError {
+                    code: ErrorCode::ServerError(-32000),
+                    message: err.to_string().into(),
+                    data: None,
+                }
+            }
+            _ => RpcError::transaction_rejected(err.to_string()),
+        },
+        BlockchainError::FeeHistory(err) => RpcError::invalid_params(err.to_string()),
+        BlockchainError::EmptyRawTransactionData => {
+            RpcError::invalid_params("Empty transaction data")
+        }
+        BlockchainError::FailedToDecodeSignedTransaction => {
+            RpcError::invalid_params("Failed to decode transaction")
+        }
+        BlockchainError::FailedToDecodeTransaction => {
+            RpcError::invalid_params("Failed to decode transaction")
+        }
+        BlockchainError::FailedToDecodeReceipt => {
+            RpcError::invalid_params("Failed to decode receipt")
+        }
+        BlockchainError::UnsupportedTransactionEncoding(_) => {
+            RpcError::internal_error_with(err.to_string())
+        }
+        BlockchainError::FailedToDecodeStateDump => {
+            RpcError::invalid_params("Failed to decode state dump")
+        }
+        BlockchainError::SignerError(err) => RpcError::invalid_params(err.to_string()),
+        BlockchainError::SignatureError(err) => RpcError::invalid_params(err.to_string()),
+        BlockchainError::RpcUnimplemented => RpcError::internal_error_with("Not implemented"),
+        BlockchainError::PrevrandaoNotSet => RpcError::internal_error_with(err.to_string()),
+        BlockchainError::RpcError(err) => err,
+        BlockchainError::InvalidFeeInput => RpcError::invalid_params(
+            "Invalid input: `max_priority_fee_per_gas` greater than `max_fee_per_gas`",
+        ),
+        err @ BlockchainError::ConflictingFeeFields => RpcError::invalid_params(err.to_string()),
+        BlockchainError::AlloyForkProvider(err) => {
+            error!(target: "backend", %err, "fork provider error");
+            match err {
+                TransportError::ErrorResp(err) => RpcError {
+                    code: ErrorCode::from(err.code),
+                    message: err.message,
+                    data: err.data.and_then(|data| serde_json::to_value(data).ok()),
+                },
+                err => RpcError::internal_error_with(format!("Fork Error: {err:?}")),
+            }
+        }
+        err @ BlockchainError::EvmError(_) => RpcError {
+            // VM halts are execution failures, not JSON-RPC server faults. REVERT has a
+            // dedicated code/data path above; other halts, such as invalid opcode, do not.
+            code: ErrorCode::TransactionRejected,
+            message: err.to_string().into(),
+            data: None,
+        },
+        #[cfg(feature = "base")]
+        err @ BlockchainError::Eip8130TransactionRejected(_) => RpcError {
+            code: ErrorCode::TransactionRejected,
+            message: err.to_string().into(),
+            data: None,
+        },
+        err @ BlockchainError::EvmOverrideError(_) => RpcError::invalid_params(err.to_string()),
+        err @ BlockchainError::InvalidUrl(_) => RpcError::invalid_params(err.to_string()),
+        err @ BlockchainError::UnsupportedForkNetwork { .. } => {
+            RpcError::invalid_params(err.to_string())
+        }
+        BlockchainError::Internal(err) => RpcError::internal_error_with(err),
+        err @ BlockchainError::BlockOutOfRange(_, _) => RpcError::invalid_params(err.to_string()),
+        err @ BlockchainError::BlockNotFound => RpcError {
+            // <https://eips.ethereum.org/EIPS/eip-1898>
+            code: ErrorCode::ServerError(-32001),
+            message: err.to_string().into(),
+            data: None,
+        },
+        err @ BlockchainError::TransactionNotFound => RpcError {
+            code: ErrorCode::ServerError(-32001),
+            message: err.to_string().into(),
+            data: None,
+        },
+        err @ BlockchainError::DataUnavailable => RpcError::internal_error_with(err.to_string()),
+        err @ BlockchainError::HistoricalStateUnavailable(_) => RpcError {
+            code: ErrorCode::ServerError(-32000),
+            message: err.to_string().into(),
+            data: None,
+        },
+        err @ BlockchainError::TrieError(_) => RpcError::internal_error_with(err.to_string()),
+        BlockchainError::UintConversion(err) => RpcError::invalid_params(err),
+        err @ BlockchainError::StateOverrideError(_) => RpcError::invalid_params(err.to_string()),
+        err @ BlockchainError::TimestampError(_) => RpcError::invalid_params(err.to_string()),
+        BlockchainError::DatabaseError(err) => RpcError::internal_error_with(err.to_string()),
+        err @ BlockchainError::EIP1559TransactionUnsupportedAtHardfork => {
+            RpcError::invalid_params(err.to_string())
+        }
+        err @ BlockchainError::EIP2930TransactionUnsupportedAtHardfork => {
+            RpcError::invalid_params(err.to_string())
+        }
+        err @ BlockchainError::EIP4844TransactionUnsupportedAtHardfork => {
+            RpcError::invalid_params(err.to_string())
+        }
+        err @ BlockchainError::EIP7702TransactionUnsupportedAtHardfork => {
+            RpcError::invalid_params(err.to_string())
+        }
+        err @ BlockchainError::DepositTransactionUnsupported => {
+            RpcError::invalid_params(err.to_string())
+        }
+        #[cfg(feature = "base")]
+        err @ BlockchainError::BaseTransactionUnsupported => {
+            RpcError::invalid_params(err.to_string())
+        }
+        err @ BlockchainError::TempoTransactionUnsupported => {
+            RpcError::invalid_params(err.to_string())
+        }
+        err @ BlockchainError::ExcessBlobGasNotSet => RpcError::invalid_params(err.to_string()),
+        err @ BlockchainError::Message(_) => RpcError::internal_error_with(err.to_string()),
+        err @ BlockchainError::UnknownTransactionType => RpcError::invalid_params(err.to_string()),
+        err @ BlockchainError::InvalidTransactionRequest(_) => {
+            RpcError::invalid_params(err.to_string())
+        }
+        err @ BlockchainError::RecoveryError(_) => RpcError::invalid_params(err.to_string()),
+        BlockchainError::FilterNotFound => RpcError {
+            code: ErrorCode::ServerError(-32000),
+            message: "filter not found".into(),
+            data: None,
+        },
+        err @ BlockchainError::UnknownBlock => RpcError {
+            code: ErrorCode::ServerError(-32000),
+            message: err.to_string().into(),
+            data: None,
+        },
+    }
+    .into()
 }

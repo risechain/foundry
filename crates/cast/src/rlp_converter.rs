@@ -76,28 +76,20 @@ impl Item {
     pub(crate) fn value_to_item(value: &Value) -> eyre::Result<Self> {
         match value {
             Value::Null => Ok(Self::Data(vec![])),
-            Value::Bool(_) => {
-                eyre::bail!("RLP input can not contain booleans");
-            }
+            Value::Bool(_) => eyre::bail!("RLP input can not contain booleans"),
             Value::Number(n) => {
                 Ok(Self::Data(n.to_string().parse::<U256>()?.to_be_bytes_trimmed_vec()))
             }
             Value::String(s) => Ok(Self::Data(hex::decode(s).wrap_err("Could not decode hex")?)),
-            Value::Array(values) => values.iter().map(Self::value_to_item).collect(),
-            Value::Object(_) => {
-                eyre::bail!("RLP input can not contain objects");
+            Value::Array(values) => {
+                values.iter().map(Self::value_to_item).collect::<Result<_, _>>().map(Self::Array)
             }
+            Value::Object(_) => eyre::bail!("RLP input can not contain objects"),
         }
     }
 }
 
-impl FromIterator<Self> for Item {
-    fn from_iter<T: IntoIterator<Item = Self>>(iter: T) -> Self {
-        Self::Array(Vec::from_iter(iter))
-    }
-}
-
-// Display as hex values
+/// Displays the items as nested JSON arrays of hex strings.
 impl fmt::Display for Item {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
         enum Task<'a> {
@@ -109,7 +101,7 @@ impl fmt::Display for Item {
         let mut tasks = vec![Task::Item(self)];
         while let Some(task) = tasks.pop() {
             match task {
-                Task::Item(Self::Data(data)) => write!(f, "\"0x{}\"", hex::encode(data))?,
+                Task::Item(Self::Data(data)) => write!(f, "\"{}\"", hex::encode_prefixed(data))?,
                 Task::Item(Self::Array(items)) => {
                     f.write_str("[")?;
                     tasks.push(Task::Close);
@@ -133,6 +125,7 @@ mod test {
     use crate::rlp_converter::Item;
     use alloy_primitives::hex;
     use alloy_rlp::{Bytes, Decodable};
+    use foundry_cli::utils::parse_json;
     use serde_json::Result as JsonResult;
 
     // https://en.wikipedia.org/wiki/Set-theoretic_definition_of_natural_numbers
@@ -145,7 +138,6 @@ mod test {
     }
 
     #[test]
-    #[expect(clippy::disallowed_macros)]
     fn encode_decode_test() -> alloy_rlp::Result<()> {
         let parameters = vec![
             (1, b"\xc0".to_vec(), Item::Array(vec![])),
@@ -180,14 +172,12 @@ mod test {
             assert_eq!(Item::decode(&mut &encoded[..])?, params.2);
             let decoded = Item::decode(&mut &params.1[..])?;
             assert_eq!(alloy_rlp::encode(&decoded), params.1);
-            println!("case {} validated", params.0)
         }
 
         Ok(())
     }
 
     #[test]
-    #[expect(clippy::disallowed_macros)]
     fn deserialize_from_str_test_hex() -> JsonResult<()> {
         let parameters = vec![
             (1, "[\"\"]", Item::Array(vec![Item::Data(vec![])])),
@@ -208,10 +198,9 @@ mod test {
             (6, "[[],[[]],[[],[[]]]]", array_von_neuman()),
         ];
         for params in parameters {
-            let val = serde_json::from_str(params.1)?;
+            let val = parse_json(params.1)?;
             let item = Item::value_to_item(&val).unwrap();
             assert_eq!(item, params.2);
-            println!("case {} validated", params.0);
         }
 
         Ok(())

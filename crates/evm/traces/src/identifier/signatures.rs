@@ -146,7 +146,7 @@ impl SignaturesCache {
                 Some((SelectorKind::Error(e.selector()), e.signature()))
             }
             alloy_json_abi::AbiItem::Event(e) => {
-                Some((SelectorKind::Event(e.selector()), e.full_signature()))
+                Some((SelectorKind::Event(e.selector()), event_cache_signature(&e)))
             }
             _ => None,
         })
@@ -172,6 +172,31 @@ impl SignaturesCache {
     pub fn contains_key(&self, key: &SelectorKind) -> bool {
         self.signatures.contains_key(key)
     }
+}
+
+/// Returns the event signature stored in the cache: like [`Event::full_signature`], with indexed
+/// flags and parameter names, but with struct parameters written as plain tuples, because
+/// [`Event::parse`] rejects named tuple components.
+fn event_cache_signature(event: &Event) -> String {
+    let mut sig = format!("event {}(", event.name);
+    for (i, input) in event.inputs.iter().enumerate() {
+        if i > 0 {
+            sig.push_str(", ");
+        }
+        input.selector_type_raw(&mut sig);
+        if input.indexed {
+            sig.push_str(" indexed");
+        }
+        if !input.name.is_empty() {
+            sig.push(' ');
+            sig.push_str(&input.name);
+        }
+    }
+    sig.push(')');
+    if event.anonymous {
+        sig.push_str(" anonymous");
+    }
+    sig
 }
 
 /// An identifier that tries to identify functions and events using signatures found at
@@ -341,20 +366,25 @@ impl SignaturesIdentifier {
         trace!(target: "evm::traces", ?selectors, "identifying selectors");
 
         let mut cache_r = self.0.cache.read().await;
-        if let Some(client) = &self.0.client {
-            let query =
-                selectors.iter().copied().filter(|v| !cache_r.contains_key(v)).collect::<Vec<_>>();
-            if !query.is_empty() {
-                drop(cache_r);
-                let mut cache_w = self.0.cache.write().await;
-                if let Ok(res) = client.decode_selectors(&query).await {
-                    for (selector, signatures) in std::iter::zip(query, res) {
-                        cache_w.signatures.insert(selector, signatures.into_iter().next());
-                    }
+        if let Some(client) = &self.0.client
+            && selectors.iter().any(|selector| !cache_r.contains_key(selector))
+        {
+            drop(cache_r);
+            let mut cache_w = self.0.cache.write().await;
+            let query = selectors
+                .iter()
+                .copied()
+                .filter(|selector| !cache_w.contains_key(selector))
+                .collect::<Vec<_>>();
+            if !query.is_empty()
+                && let Ok(res) = client.decode_selectors(&query).await
+            {
+                for (selector, signatures) in std::iter::zip(query, res) {
+                    cache_w.signatures.insert(selector, signatures.into_iter().next());
                 }
-                drop(cache_w);
-                cache_r = self.0.cache.read().await;
             }
+            drop(cache_w);
+            cache_r = self.0.cache.read().await;
         }
         selectors.iter().map(|selector| cache_r.get(selector).unwrap_or_default()).collect()
     }
@@ -431,7 +461,7 @@ mod tests {
     async fn abi_seeded_signatures_are_not_persisted_to_disk() {
         let temp = tempfile::tempdir().unwrap();
         let event = Event::parse("event CodexEphemeral(uint256 indexed value)").unwrap();
-        let mut abi = JsonAbi::default();
+        let mut abi = JsonAbi::new();
         abi.events.insert(event.name.clone(), vec![event.clone()]);
 
         {
@@ -451,9 +481,9 @@ mod tests {
         let first = Event::parse("event CodexCollision(uint256 indexed value)").unwrap();
         let second = Event::parse("event CodexCollision(uint256 value)").unwrap();
 
-        let mut first_abi = JsonAbi::default();
+        let mut first_abi = JsonAbi::new();
         first_abi.events.insert(first.name.clone(), vec![first.clone()]);
-        let mut second_abi = JsonAbi::default();
+        let mut second_abi = JsonAbi::new();
         second_abi.events.insert(second.name.clone(), vec![second]);
 
         let mut cache = SignaturesCache::default();
@@ -473,9 +503,9 @@ mod tests {
             Event::parse("event CodexIndexedCount(uint256 indexed marker, uint256 indexed value)")
                 .unwrap();
 
-        let mut one_topic_abi = JsonAbi::default();
+        let mut one_topic_abi = JsonAbi::new();
         one_topic_abi.events.insert(one_topic.name.clone(), vec![one_topic.clone()]);
-        let mut two_topics_abi = JsonAbi::default();
+        let mut two_topics_abi = JsonAbi::new();
         two_topics_abi.events.insert(two_topics.name.clone(), vec![two_topics.clone()]);
 
         let identifier = SignaturesIdentifier::new_offline_with_abis_from_cache(
@@ -490,5 +520,35 @@ mod tests {
 
         assert_eq!(decoded_one_topic.full_signature(), one_topic.full_signature());
         assert_eq!(decoded_two_topics.full_signature(), two_topics.full_signature());
+    }
+
+    #[tokio::test]
+    async fn abi_seeded_events_with_struct_params_are_identified() {
+        let event: Event = serde_json::from_str(
+            r#"{"type":"event","name":"Placed","anonymous":false,"inputs":[
+                {"name":"by","type":"address","indexed":true},
+                {"name":"order","type":"tuple","indexed":false,"components":[
+                    {"name":"who","type":"address"},{"name":"amount","type":"uint256"}]},
+                {"name":"orders","type":"tuple[]","indexed":false,"components":[
+                    {"name":"who","type":"address"},{"name":"amount","type":"uint256"}]}]}"#,
+        )
+        .unwrap();
+        let mut abi = JsonAbi::new();
+        abi.events.insert(event.name.clone(), vec![event.clone()]);
+
+        let mut cache = SignaturesCache::default();
+        cache.extend_from_abi(&abi);
+        assert_eq!(
+            cache.get(&SelectorKind::Event(event.selector())),
+            Some(Some(
+                "event Placed(address indexed by, (address,uint256) order, (address,uint256)[] orders)"
+                    .into()
+            ))
+        );
+
+        let identifier = SignaturesIdentifier::from_cache((cache, None), None);
+        let decoded = identifier.identify_event(event.selector()).await.unwrap();
+        assert_eq!(decoded.selector(), event.selector());
+        assert_eq!(decoded.inputs.iter().filter(|i| i.indexed).count(), 1);
     }
 }

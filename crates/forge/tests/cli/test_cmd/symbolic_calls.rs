@@ -1,16 +1,181 @@
-use super::symbolic_helpers::assert_relevant_lines;
+use super::symbolic_helpers::{assert_symbolic, assert_symbolic_witness, z3_available};
+use crate::skip_unless_z3;
 use foundry_common::sh_eprintln;
-use foundry_test_utils::{forgetest_init, util::OutputExt};
+use foundry_test_utils::{forgetest_init, snapbox::IntoData, str, util::OutputExt};
 
-use super::symbolic_helpers::z3_available;
-
-forgetest_init!(symbolic_calldataload_accepts_symbolic_offset, |prj, cmd| {
+#[forgetest_init]
+fn symbolic_call_contains_invalid_child_halt(prj: _, cmd: _) {
     if !z3_available() {
         let _ = sh_eprintln!(
-            "skipping symbolic_calldataload_accepts_symbolic_offset because z3 is not available"
+            "skipping symbolic_call_contains_invalid_child_halt because z3 is not available"
         );
         return;
     }
+
+    prj.add_test(
+        "SymbolicInvalidChildCall.t.sol",
+        r#"
+contract InvalidChild {
+    fallback() external {
+        assembly ("memory-safe") {
+            invalid()
+        }
+    }
+}
+
+contract SymbolicInvalidChildCall {
+    uint256 marker;
+
+    function checkInvalidChildCall() public {
+        InvalidChild child = new InvalidChild();
+        marker = 17;
+        (bool success, bytes memory output) = address(child).call("");
+        assert(!success);
+        assert(output.length == 0);
+        assert(marker == 17);
+    }
+}
+"#,
+    );
+
+    cmd.args(["test", "--symbolic", "--match-test", "checkInvalidChildCall"]).assert_success();
+}
+
+// A callee that stops, by STOP or by running past the end of its code, after a call of its own
+// returns no data, not the return data of that call. Initcode that does the same deploys no code,
+// and a callee that hits INVALID after a call reverts with no data.
+#[forgetest_init]
+fn symbolic_stopped_callee_returns_no_data(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_stopped_callee_returns_no_data");
+
+    prj.add_test(
+        "SymbolicStoppedCallee.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract Inner {
+    function value() external pure returns (uint256) {
+        return 1;
+    }
+}
+
+contract Outer {
+    function callInner(Inner inner) external {
+        inner.value();
+    }
+
+    function callInnerThenInvalid(Inner inner) external {
+        inner.value();
+        assembly ("memory-safe") {
+            invalid()
+        }
+    }
+}
+
+contract SymbolicStoppedCallee is Test {
+    function checkStoppedCalleeReturnsNoData(uint256 size) public {
+        Outer outer = new Outer();
+        Inner inner = new Inner();
+        (bool success, bytes memory output) =
+            address(outer).call(abi.encodeCall(Outer.callInner, (inner)));
+        assert(success);
+        assert(output.length == 0);
+
+        vm.expectRevert(bytes(""));
+        outer.callInnerThenInvalid(inner);
+
+        // Runtime code that calls the identity precompile with 32 bytes, then runs past its end.
+        bytes memory initcode = hex"6012600c60003960126000f3602a600052600060006020600060045afa50";
+        address endless;
+        assembly ("memory-safe") {
+            endless := create(0, add(initcode, 0x20), mload(initcode))
+        }
+        (success, output) = endless.call("");
+        assert(success);
+        assert(output.length == 0);
+
+        // Initcode `staticcall(gas(), 4, 3, 2, 1, 0)` to the identity precompile, which returns
+        // 2 bytes, then STOP.
+        initcode = hex"58585858585afa5000";
+        address created;
+        assembly ("memory-safe") {
+            created := create(0, add(initcode, 0x20), mload(initcode))
+        }
+        assert(created != address(0));
+        assert(created.code.length == 0);
+
+        // The same call with a symbolic initcode size: at size 8 the initcode runs past its end,
+        // and at size 9 it reaches INVALID. Bounds, not equalities, keep the size symbolic.
+        initcode = hex"58585858585afa50fe";
+        vm.assume(size >= 8);
+        vm.assume(size <= 9);
+        assembly ("memory-safe") {
+            created := create(0, add(initcode, 0x20), size)
+        }
+        assert(size == 9 || created != address(0));
+        assert(created.code.length == 0);
+    }
+}
+"#,
+    );
+
+    cmd.args(["test", "--symbolic", "--match-test", "checkStoppedCalleeReturnsNoData"])
+        .assert_success();
+}
+
+#[forgetest_init]
+fn symbolic_assume_no_revert_does_not_prune_invalid_child_halt(prj: _, cmd: _) {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping symbolic_assume_no_revert_does_not_prune_invalid_child_halt because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "SymbolicAssumeNoRevertInvalidChild.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract InvalidAssumeNoRevertChild {
+    fallback() external {
+        assembly ("memory-safe") {
+            invalid()
+        }
+    }
+}
+
+contract SymbolicAssumeNoRevertInvalidChild is Test {
+    function checkAssumeNoRevertInvalidChild() public {
+        InvalidAssumeNoRevertChild child = new InvalidAssumeNoRevertChild();
+        vm.assumeNoRevert();
+        (bool success,) = address(child).call("");
+        assertTrue(success);
+    }
+}
+"#,
+    );
+
+    assert_symbolic_witness(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "checkAssumeNoRevertInvalidChild",
+    ]))
+    .failure()
+    .stdout_eq(str![[r#"
+...
+Ran 1 test for test/SymbolicAssumeNoRevertInvalidChild.t.sol:SymbolicAssumeNoRevertInvalidChild
+[FAIL: assertion failed; counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkAssumeNoRevertInvalidChild() ([METRICS])
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+...
+"#]]);
+}
+
+// CALLDATALOAD and CALLDATACOPY with symbolic offsets, destination and size are modeled.
+#[forgetest_init]
+fn symbolic_calldata_ops_accept_symbolic_operands(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_calldata_ops_accept_symbolic_operands");
 
     prj.add_test(
         "SymbolicCalldataLoad.t.sol",
@@ -32,29 +197,6 @@ contract SymbolicCalldataLoad {
 }
 "#,
     );
-
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSymbolicCalldataLoad"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSymbolicCalldataLoad(uint16,uint256)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALLDATALOAD offset"), "{stdout}");
-});
-
-forgetest_init!(symbolic_calldatacopy_accepts_symbolic_offset, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_calldatacopy_accepts_symbolic_offset because z3 is not available"
-        );
-        return;
-    }
 
     prj.add_test(
         "SymbolicCalldataCopy.t.sol",
@@ -78,29 +220,6 @@ contract SymbolicCalldataCopy {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSymbolicCalldataCopy"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSymbolicCalldataCopy(uint16,uint256)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALLDATACOPY offset"), "{stdout}");
-});
-
-forgetest_init!(symbolic_calldatacopy_accepts_symbolic_dest, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_calldatacopy_accepts_symbolic_dest because z3 is not available"
-        );
-        return;
-    }
-
     prj.add_test(
         "SymbolicCalldataCopyDest.t.sol",
         r#"
@@ -119,29 +238,6 @@ contract SymbolicCalldataCopyDest {
 }
 "#,
     );
-
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSymbolicCalldataCopyDest"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSymbolicCalldataCopyDest(uint16,uint256)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALLDATACOPY dest"), "{stdout}");
-});
-
-forgetest_init!(symbolic_calldatacopy_accepts_bounded_symbolic_size, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_calldatacopy_accepts_bounded_symbolic_size because z3 is not available"
-        );
-        return;
-    }
 
     prj.add_test(
         "SymbolicCalldataCopySize.t.sol",
@@ -168,29 +264,6 @@ contract SymbolicCalldataCopySize {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSymbolicCalldataCopySize"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSymbolicCalldataCopySize(uint8)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALLDATACOPY size"), "{stdout}");
-});
-
-forgetest_init!(symbolic_calldatacopy_accepts_symbolic_dest_and_size, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_calldatacopy_accepts_symbolic_dest_and_size because z3 is not available"
-        );
-        return;
-    }
-
     prj.add_test(
         "SymbolicCalldataCopyDestAndSize.t.sol",
         r#"
@@ -214,29 +287,52 @@ contract SymbolicCalldataCopyDestAndSize {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkCalldataCopyDestAndSize"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
+    let stdout = assert_symbolic(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "^(checkSymbolicCalldataLoad|checkSymbolicCalldataCopy|checkSymbolicCalldataCopyDest|checkSymbolicCalldataCopySize|checkCalldataCopyDestAndSize)\\(",
+    ]))
+    .success()
+    .stdout_eq(str![[r#"
+...
+Ran 1 test for test/SymbolicCalldataCopySize.t.sol:SymbolicCalldataCopySize
+[PASS] checkSymbolicCalldataCopySize(uint8) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkCalldataCopyDestAndSize(uint8,uint8,bytes32)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALLDATACOPY dest"), "{stdout}");
-    assert!(!stdout.contains("symbolic CALLDATACOPY size"), "{stdout}");
-});
+Ran 1 test for test/SymbolicCalldataLoad.t.sol:SymbolicCalldataLoad
+[PASS] checkSymbolicCalldataLoad(uint16,uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 
-forgetest_init!(symbolic_call_accepts_symbolic_input_offset, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_call_accepts_symbolic_input_offset because z3 is not available"
-        );
-        return;
+Ran 1 test for test/SymbolicCalldataCopyDest.t.sol:SymbolicCalldataCopyDest
+[PASS] checkSymbolicCalldataCopyDest(uint16,uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test for test/SymbolicCalldataCopy.t.sol:SymbolicCalldataCopy
+[PASS] checkSymbolicCalldataCopy(uint16,uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test for test/SymbolicCalldataCopyDestAndSize.t.sol:SymbolicCalldataCopyDestAndSize
+[PASS] checkCalldataCopyDestAndSize(uint8,uint8,bytes32) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]].unordered())
+    .get_output()
+    .stdout_lossy();
+    for reason in [
+        "symbolic CALLDATACOPY dest",
+        "symbolic CALLDATACOPY offset",
+        "symbolic CALLDATACOPY size",
+        "symbolic CALLDATALOAD offset",
+    ] {
+        assert!(!stdout.contains(reason), "{stdout}");
     }
+}
+
+// CALL with a symbolic input offset and bounded symbolic input and output sizes is modeled.
+#[forgetest_init]
+fn symbolic_call_accepts_symbolic_memory_operands(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_call_accepts_symbolic_memory_operands");
 
     prj.add_test(
         "SymbolicCallInputOffset.t.sol",
@@ -275,29 +371,6 @@ contract SymbolicCallInputOffset {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSymbolicCallInputOffset"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSymbolicCallInputOffset(uint16,uint256)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALL input offset"), "{stdout}");
-});
-
-forgetest_init!(symbolic_call_accepts_bounded_symbolic_output_size, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_call_accepts_bounded_symbolic_output_size because z3 is not available"
-        );
-        return;
-    }
-
     prj.add_test(
         "SymbolicCallOutputSize.t.sol",
         r#"
@@ -334,29 +407,6 @@ contract SymbolicCallOutputSize {
 }
 "#,
     );
-
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSymbolicCallOutputSize"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSymbolicCallOutputSize(uint8)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALL output size"), "{stdout}");
-});
-
-forgetest_init!(symbolic_call_accepts_bounded_symbolic_input_size, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_call_accepts_bounded_symbolic_input_size because z3 is not available"
-        );
-        return;
-    }
 
     prj.add_test(
         "SymbolicCallInputSize.t.sol",
@@ -395,22 +445,42 @@ contract SymbolicCallInputSize {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSymbolicCallInputSize"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
+    let stdout = assert_symbolic(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "^(checkSymbolicCallInputOffset|checkSymbolicCallOutputSize|checkSymbolicCallInputSize)\\(",
+    ]))
+    .success()
+    .stdout_eq(
+        str![[r#"
+...
+Ran 1 test for test/SymbolicCallInputSize.t.sol:SymbolicCallInputSize
+[PASS] checkSymbolicCallInputSize(uint8,uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSymbolicCallInputSize(uint8,uint256)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALL input size"), "{stdout}");
-});
+Ran 1 test for test/SymbolicCallOutputSize.t.sol:SymbolicCallOutputSize
+[PASS] checkSymbolicCallOutputSize(uint8) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 
-forgetest_init!(symbolic_executes_typed_external_call, |prj, cmd| {
+Ran 1 test for test/SymbolicCallInputOffset.t.sol:SymbolicCallInputOffset
+[PASS] checkSymbolicCallInputOffset(uint16,uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]]
+        .unordered(),
+    )
+    .get_output()
+    .stdout_lossy();
+    for reason in
+        ["symbolic CALL input offset", "symbolic CALL input size", "symbolic CALL output size"]
+    {
+        assert!(!stdout.contains(reason), "{stdout}");
+    }
+}
+
+#[forgetest_init]
+fn symbolic_executes_typed_external_call(prj: _, cmd: _) {
     if !z3_available() {
         let _ = sh_eprintln!(
             "skipping symbolic_executes_typed_external_call because z3 is not available"
@@ -441,28 +511,24 @@ contract SymbolicExternalCall {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkExternal"])
-        .assert_failure()
-        .get_output()
-        .stdout_lossy();
+    let stdout =
+        assert_symbolic_witness(cmd.args(["test", "--symbolic", "--match-test", "checkExternal"]))
+            .failure()
+            .stdout_eq(str![[r#"
+...
+Ran 1 test for test/SymbolicExternalCall.t.sol:SymbolicExternalCall
+[FAIL: panic: assertion failed (0x01); counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkExternal(uint256) ([METRICS])
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+...
+"#]])
+            .get_output()
+            .stdout_lossy();
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[FAIL:
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-checkExternal(uint256)
-"#]],
-    );
     assert!(!stdout.contains("unsupported symbolic execution feature: external CALL"), "{stdout}");
-});
+}
 
-forgetest_init!(symbolic_executes_low_level_external_call, |prj, cmd| {
+#[forgetest_init]
+fn symbolic_executes_low_level_external_call(prj: _, cmd: _) {
     if !z3_available() {
         let _ = sh_eprintln!(
             "skipping symbolic_executes_low_level_external_call because z3 is not available"
@@ -497,28 +563,24 @@ contract SymbolicLowLevelCall {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkLowLevel"])
-        .assert_failure()
-        .get_output()
-        .stdout_lossy();
+    let stdout =
+        assert_symbolic_witness(cmd.args(["test", "--symbolic", "--match-test", "checkLowLevel"]))
+            .failure()
+            .stdout_eq(str![[r#"
+...
+Ran 1 test for test/SymbolicLowLevelCall.t.sol:SymbolicLowLevelCall
+[FAIL: panic: assertion failed (0x01); counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkLowLevel(uint256) ([METRICS])
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+...
+"#]])
+            .get_output()
+            .stdout_lossy();
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[FAIL:
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-checkLowLevel(uint256)
-"#]],
-    );
     assert!(!stdout.contains("unsupported symbolic execution feature: external CALL"), "{stdout}");
-});
+}
 
-forgetest_init!(symbolic_external_call_with_symbolic_selector_finds_backdoor, |prj, cmd| {
+#[forgetest_init]
+fn symbolic_external_call_with_symbolic_selector_finds_backdoor(prj: _, cmd: _) {
     if !z3_available() {
         let _ = sh_eprintln!(
             "skipping symbolic_external_call_with_symbolic_selector_finds_backdoor because z3 is not available"
@@ -558,34 +620,28 @@ contract SymbolicSelectorBackdoor {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkNoBackdoor"])
-        .assert_failure()
-        .get_output()
-        .stdout_lossy();
+    let stdout = assert_symbolic_witness(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "checkNoBackdoor",
+    ]))
+    .failure()
+    .stdout_eq(str![[r#"
+...
+Ran 1 test for test/SymbolicSelectorBackdoor.t.sol:SymbolicSelectorBackdoor
+[FAIL: panic: assertion failed (0x01); counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkNoBackdoor(bytes4,uint256) ([METRICS])
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+...
+"#]])
+    .get_output()
+    .stdout_lossy();
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[FAIL:
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-checkNoBackdoor(bytes4,uint256)
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-args=
-"#]],
-    );
     assert!(!stdout.contains("symbolic external CALL selector"), "{stdout}");
-});
+}
 
-forgetest_init!(symbolic_external_call_with_symbolic_target_finds_backdoor, |prj, cmd| {
+#[forgetest_init]
+fn symbolic_external_call_with_symbolic_target_finds_backdoor(prj: _, cmd: _) {
     if !z3_available() {
         let _ = sh_eprintln!(
             "skipping symbolic_external_call_with_symbolic_target_finds_backdoor because z3 is not available"
@@ -632,40 +688,172 @@ contract SymbolicTargetBackdoor is Test {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkNoBadTarget"])
-        .assert_failure()
-        .get_output()
-        .stdout_lossy();
+    let stdout = assert_symbolic_witness(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "checkNoBadTarget",
+    ]))
+    .failure()
+    .stdout_eq(str![[r#"
+...
+Ran 1 test for test/SymbolicTargetBackdoor.t.sol:SymbolicTargetBackdoor
+[FAIL: panic: assertion failed (0x01); counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkNoBadTarget(address,uint256) ([METRICS])
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+...
+"#]])
+    .get_output()
+    .stdout_lossy();
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[FAIL:
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-checkNoBadTarget(address,uint256)
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-args=
-"#]],
-    );
     assert!(!stdout.contains("symbolic CALL target outside known contracts"), "{stdout}");
-});
+}
 
-forgetest_init!(symbolic_external_call_with_single_known_target_auto_expands, |prj, cmd| {
+#[forgetest_init]
+fn symbolic_call_target_explores_mock_mismatch(prj: _, cmd: _) {
     if !z3_available() {
         let _ = sh_eprintln!(
-            "skipping symbolic_external_call_with_single_known_target_auto_expands because z3 is not available"
+            "skipping symbolic_call_target_explores_mock_mismatch because z3 is not available"
         );
         return;
     }
+
+    prj.add_test(
+        "SymbolicTargetMockMismatch.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract RealToken {
+    function balanceOf(address) external pure returns (uint256) {
+        return 7;
+    }
+}
+
+contract FiveToken {
+    function balanceOf(address) external pure returns (uint256) {
+        return 5;
+    }
+}
+
+contract SymbolicTargetMockMismatch is Test {
+    RealToken real;
+    FiveToken five;
+
+    function setUp() public {
+        real = new RealToken();
+        five = new FiveToken();
+    }
+
+    // The mock only covers `balanceOf(user)`; for `user != this` the real code answers 7.
+    function checkMockedSymbolicTargetMayMiss(address callee, address user) public {
+        vm.assume(callee == address(real) || callee == address(five));
+        vm.mockCall(
+            address(real),
+            abi.encodeWithSelector(RealToken.balanceOf.selector, user),
+            abi.encode(uint256(5))
+        );
+        assert(RealToken(callee).balanceOf(address(this)) == 5);
+    }
+
+    function checkMockedSymbolicTargetAlwaysHits(address callee) public {
+        vm.assume(callee == address(real) || callee == address(five));
+        vm.mockCall(
+            address(real),
+            abi.encodeWithSelector(RealToken.balanceOf.selector, address(this)),
+            abi.encode(uint256(5))
+        );
+        assert(RealToken(callee).balanceOf(address(this)) == 5);
+    }
+}
+"#,
+    );
+
+    assert_symbolic_witness(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-contract",
+        "SymbolicTargetMockMismatch",
+    ]))
+    .failure()
+    .stdout_eq(str![[r#"
+...
+Ran 2 tests for test/SymbolicTargetMockMismatch.t.sol:SymbolicTargetMockMismatch
+[PASS] checkMockedSymbolicTargetAlwaysHits(address) ([METRICS])
+[FAIL: panic: assertion failed (0x01); counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkMockedSymbolicTargetMayMiss(address,address) ([METRICS])
+Suite result: FAILED. 1 passed; 1 failed; 0 skipped; [ELAPSED]
+...
+"#]]);
+}
+
+// A failure inside one symbolic-target candidate must keep that candidate's constraints, so the
+// counterexample picks the failing target and inputs and replays.
+#[forgetest_init]
+fn symbolic_call_target_failure_keeps_candidate_state(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_call_target_failure_keeps_candidate_state");
+
+    prj.add_test(
+        "SymbolicTargetFailureState.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract Good {
+    function f(uint256 x) external pure returns (bool) {
+        if (x != 12345) revert();
+        return true;
+    }
+}
+
+contract Bad {
+    function f(uint256) external pure returns (bool) {
+        revert();
+    }
+}
+
+contract SymbolicTargetFailureState is Test {
+    Good good;
+    Bad bad;
+
+    function setUp() public {
+        good = new Good();
+        bad = new Bad();
+    }
+
+    function checkExpectRevertOnSymbolicTarget(address target, uint256 x) public {
+        vm.assume(target == address(good) || target == address(bad));
+        vm.expectRevert();
+        Good(target).f(x);
+    }
+
+    function checkForbiddenCallOnSymbolicTarget(address target, uint256 x) public {
+        vm.assume(target == address(good) || target == address(bad));
+        vm.expectCall(address(good), abi.encodeCall(Good.f, (12345)), 0);
+        (bool ok,) = target.call(abi.encodeCall(Good.f, (x)));
+        ok;
+    }
+}
+"#,
+    );
+
+    assert_symbolic_witness(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-contract",
+        "SymbolicTargetFailureState",
+    ]))
+    .failure()
+    .stdout_eq(str![[r#"
+...
+Ran 2 tests for test/SymbolicTargetFailureState.t.sol:SymbolicTargetFailureState
+[FAIL: next call did not revert as expected; counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkExpectRevertOnSymbolicTarget(address,uint256) ([METRICS])
+[FAIL: expected call to 0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f with data 0xb3de648b0000000000000000000000000000000000000000000000000000000000003039 to be called 0 times, but was called 1 time; counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkForbiddenCallOnSymbolicTarget(address,uint256) ([METRICS])
+Suite result: FAILED. 0 passed; 2 failed; 0 skipped; [ELAPSED]
+...
+"#]]);
+}
+
+// Call targets: known and symbolic targets, unknown selectors and failing callees.
+#[forgetest_init]
+fn symbolic_call_targets_and_dispatch(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_call_targets_and_dispatch");
 
     prj.add_test(
         "SymbolicTargetDefaultAuto.t.sol",
@@ -696,127 +884,6 @@ contract SymbolicTargetDefaultAuto is Test {
 }
 "#,
     );
-
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkTarget"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkTarget(address,uint256)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALL target"), "{stdout}");
-});
-
-forgetest_init!(
-    symbolic_external_call_with_unbounded_symbolic_target_requires_config,
-    |prj, cmd| {
-        if !z3_available() {
-            let _ = sh_eprintln!(
-                "skipping symbolic_external_call_with_unbounded_symbolic_target_requires_config because z3 is not available"
-            );
-            return;
-        }
-
-        prj.add_test(
-            "SymbolicTargetDefaultOff.t.sol",
-            r#"
-contract SymbolicTargetDefaultOff {
-    function checkTarget(address target) public {
-        (bool ok,) = target.call("");
-        require(ok);
-    }
-}
-"#,
-        );
-
-        let stdout = cmd
-            .args(["test", "--symbolic", "--match-test", "checkTarget"])
-            .assert_failure()
-            .get_output()
-            .stdout_lossy();
-
-        assert_relevant_lines(
-            &stdout,
-            foundry_test_utils::str![[r#"
-symbolic CALL target
-"#]],
-        );
-    }
-);
-
-forgetest_init!(symbolic_external_call_with_empty_unknown_target_is_modeled, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_external_call_with_empty_unknown_target_is_modeled because z3 is not available"
-        );
-        return;
-    }
-
-    prj.add_test(
-        "SymbolicUnboundedTarget.t.sol",
-        r#"
-import "forge-std/Test.sol";
-
-contract SymbolicUnboundedTarget is Test {
-    /// forge-config: default.symbolic.symbolic_call_targets = true
-    function checkUnbounded(address target) public {
-        if (uint160(target) <= 9 || target == address(this)) {
-            return;
-        }
-        bool ok;
-        assembly {
-            ok := call(gas(), target, 0, 0, 0, 0, 0)
-        }
-        require(ok);
-    }
-
-    /// forge-config: default.symbolic.symbolic_call_targets = true
-    function checkUnboundedInsufficientValue(address target) public {
-        vm.assume(uint160(target) > 9 && target != address(this));
-        vm.deal(address(this), 0);
-        bool ok;
-        assembly {
-            ok := call(gas(), target, 1, 0, 0, 0, 0)
-        }
-        assert(!ok);
-    }
-}
-"#,
-    );
-
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkUnbounded"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkUnbounded(address)
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkUnboundedInsufficientValue(address)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALL target outside known contracts"), "{stdout}");
-});
-
-forgetest_init!(symbolic_delegatecall_with_symbolic_target_executes, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_delegatecall_with_symbolic_target_executes because z3 is not available"
-        );
-        return;
-    }
 
     prj.add_test(
         "SymbolicDelegateTarget.t.sol",
@@ -857,35 +924,6 @@ contract SymbolicDelegateTarget is Test {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkDelegateTarget"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkDelegateTarget(address,uint256)
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-checkDelegateTarget(address,uint256)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic CALL target"), "{stdout}");
-});
-
-forgetest_init!(symbolic_external_unknown_selector_returns_call_failure, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_external_unknown_selector_returns_call_failure because z3 is not available"
-        );
-        return;
-    }
-
     prj.add_test(
         "SymbolicUnknownSelector.t.sol",
         r#"
@@ -914,22 +952,169 @@ contract SymbolicUnknownSelector {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkUnknownSelector"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
+    prj.add_test(
+        "SymbolicExternalRequire.t.sol",
+        r#"
+contract Helper {
+    function rejectFortyTwo(uint256 x) external pure returns (bool) {
+        require(x != 42, "hit");
+        return true;
+    }
+}
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkUnknownSelector(bytes4)
-"#]],
+contract SymbolicExternalRequire {
+    Helper helper;
+
+    function setUp() public {
+        helper = new Helper();
+    }
+
+    function checkRequireCall(uint256 x) public {
+        (bool ok,) = address(helper).call(
+            abi.encodeWithSelector(Helper.rejectFortyTwo.selector, x)
+        );
+        if (x == 42) {
+            assert(!ok);
+        } else {
+            assert(ok);
+        }
+    }
+}
+"#,
     );
-    assert!(!stdout.contains("symbolic external CALL selector"), "{stdout}");
-});
 
-forgetest_init!(symbolic_svm_create_bytes4_can_drive_selector_dispatch, |prj, cmd| {
+    let stdout = assert_symbolic(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "^(checkTarget|checkDelegateTarget|checkUnknownSelector|checkRequireCall)\\(",
+    ]))
+    .success()
+    .stdout_eq(
+        str![[r#"
+...
+Ran 1 test for test/SymbolicTargetDefaultAuto.t.sol:SymbolicTargetDefaultAuto
+[PASS] checkTarget(address,uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test for test/SymbolicExternalRequire.t.sol:SymbolicExternalRequire
+[PASS] checkRequireCall(uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test for test/SymbolicDelegateTarget.t.sol:SymbolicDelegateTarget
+[PASS] checkDelegateTarget(address,uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test for test/SymbolicUnknownSelector.t.sol:SymbolicUnknownSelector
+[PASS] checkUnknownSelector(bytes4) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]]
+        .unordered(),
+    )
+    .get_output()
+    .stdout_lossy();
+    for reason in [
+        "symbolic CALL target",
+        "symbolic external CALL selector",
+        "unsupported symbolic execution feature: external CALL",
+    ] {
+        assert!(!stdout.contains(reason), "{stdout}");
+    }
+}
+
+#[forgetest_init]
+fn symbolic_external_call_with_unbounded_symbolic_target_requires_config(prj: _, cmd: _) {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping symbolic_external_call_with_unbounded_symbolic_target_requires_config because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "SymbolicTargetDefaultOff.t.sol",
+        r#"
+contract SymbolicTargetDefaultOff {
+    function checkTarget(address target) public {
+        (bool ok,) = target.call("");
+        require(ok);
+    }
+}
+"#,
+    );
+
+    assert_symbolic_witness(cmd.args(["test", "--symbolic", "--match-test", "checkTarget"]))
+        .failure()
+        .stdout_eq(str![[r#"
+...
+Ran 1 test for test/SymbolicTargetDefaultOff.t.sol:SymbolicTargetDefaultOff
+[FAIL: incomplete symbolic execution (Stuck): unsupported symbolic execution feature: symbolic CALL target] checkTarget(address) ([METRICS])
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+...
+"#]]);
+}
+
+#[forgetest_init]
+fn symbolic_external_call_with_empty_unknown_target_is_modeled(prj: _, cmd: _) {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping symbolic_external_call_with_empty_unknown_target_is_modeled because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "SymbolicUnboundedTarget.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract SymbolicUnboundedTarget is Test {
+    /// forge-config: default.symbolic.symbolic_call_targets = true
+    function checkUnbounded(address target) public {
+        if (uint160(target) <= 9 || target == address(this)) {
+            return;
+        }
+        bool ok;
+        assembly {
+            ok := call(gas(), target, 0, 0, 0, 0, 0)
+        }
+        require(ok);
+    }
+
+    /// forge-config: default.symbolic.symbolic_call_targets = true
+    function checkUnboundedInsufficientValue(address target) public {
+        vm.assume(uint160(target) > 9 && target != address(this));
+        vm.deal(address(this), 0);
+        bool ok;
+        assembly {
+            ok := call(gas(), target, 1, 0, 0, 0, 0)
+        }
+        assert(!ok);
+    }
+}
+"#,
+    );
+
+    let stdout =
+        assert_symbolic_witness(cmd.args(["test", "--symbolic", "--match-test", "checkUnbounded"]))
+            .success()
+            .stdout_eq(str![[r#"
+...
+Ran 2 tests for test/SymbolicUnboundedTarget.t.sol:SymbolicUnboundedTarget
+[PASS] checkUnbounded(address) ([METRICS])
+[PASS] checkUnboundedInsufficientValue(address) ([METRICS])
+Suite result: ok. 2 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]])
+            .get_output()
+            .stdout_lossy();
+
+    assert!(!stdout.contains("symbolic CALL target outside known contracts"), "{stdout}");
+}
+
+#[forgetest_init]
+fn symbolic_svm_create_bytes4_can_drive_selector_dispatch(prj: _, cmd: _) {
     if !z3_available() {
         let _ = sh_eprintln!(
             "skipping symbolic_svm_create_bytes4_can_drive_selector_dispatch because z3 is not available"
@@ -971,22 +1156,28 @@ contract SymbolicSvmBytes4Selector {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSvmBytes4Selector"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
+    let stdout = assert_symbolic_witness(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "checkSvmBytes4Selector",
+    ]))
+    .success()
+    .stdout_eq(str![[r#"
+...
+Ran 1 test for test/SymbolicSvmBytes4Selector.t.sol:SymbolicSvmBytes4Selector
+[PASS] checkSvmBytes4Selector() ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]])
+    .get_output()
+    .stdout_lossy();
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSvmBytes4Selector()
-"#]],
-    );
     assert!(!stdout.contains("symbolic external CALL selector"), "{stdout}");
-});
+}
 
-forgetest_init!(symbolic_svm_create_calldata_generates_bounded_dispatch, |prj, cmd| {
+#[forgetest_init]
+fn symbolic_svm_create_calldata_generates_bounded_dispatch(prj: _, cmd: _) {
     if !z3_available() {
         let _ = sh_eprintln!(
             "skipping symbolic_svm_create_calldata_generates_bounded_dispatch because z3 is not available"
@@ -1035,82 +1226,30 @@ contract SymbolicSvmCreateCalldata {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSvmCreateCalldata"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
+    let stdout = assert_symbolic_witness(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "checkSvmCreateCalldata",
+    ]))
+    .success()
+    .stdout_eq(str![[r#"
+...
+Ran 1 test for test/SymbolicSvmCreateCalldata.t.sol:SymbolicSvmCreateCalldata
+[PASS] checkSvmCreateCalldata() ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]])
+    .get_output()
+    .stdout_lossy();
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSvmCreateCalldata()
-"#]],
-    );
     assert!(!stdout.contains("symbolic external CALL selector"), "{stdout}");
-});
-
-forgetest_init!(symbolic_external_require_is_call_failure, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_external_require_is_call_failure because z3 is not available"
-        );
-        return;
-    }
-
-    prj.add_test(
-        "SymbolicExternalRequire.t.sol",
-        r#"
-contract Helper {
-    function rejectFortyTwo(uint256 x) external pure returns (bool) {
-        require(x != 42, "hit");
-        return true;
-    }
 }
 
-contract SymbolicExternalRequire {
-    Helper helper;
-
-    function setUp() public {
-        helper = new Helper();
-    }
-
-    function checkRequireCall(uint256 x) public {
-        (bool ok,) = address(helper).call(
-            abi.encodeWithSelector(Helper.rejectFortyTwo.selector, x)
-        );
-        if (x == 42) {
-            assert(!ok);
-        } else {
-            assert(ok);
-        }
-    }
-}
-"#,
-    );
-
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkRequireCall"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkRequireCall(uint256)
-"#]],
-    );
-    assert!(!stdout.contains("unsupported symbolic execution feature: external CALL"), "{stdout}");
-});
-
-forgetest_init!(symbolic_staticcall_rejects_storage_write, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_staticcall_rejects_storage_write because z3 is not available"
-        );
-        return;
-    }
+// STATICCALL and DELEGATECALL context rules.
+#[forgetest_init]
+fn symbolic_call_context_semantics(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_call_context_semantics");
 
     prj.add_test(
         "SymbolicStaticCall.t.sol",
@@ -1139,28 +1278,6 @@ contract SymbolicStaticCall {
 }
 "#,
     );
-
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkStatic"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkStatic(uint256)
-"#]],
-    );
-});
-
-forgetest_init!(symbolic_static_call_splits_symbolic_value, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_static_call_splits_symbolic_value because z3 is not available"
-        );
-        return;
-    }
 
     prj.add_test(
         "SymbolicStaticCallValue.t.sol",
@@ -1199,28 +1316,6 @@ contract SymbolicStaticCallValue is Test {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkStaticCallValue"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkStaticCallValue(uint256)
-"#]],
-    );
-});
-
-forgetest_init!(symbolic_delegatecall_writes_caller_storage, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_delegatecall_writes_caller_storage because z3 is not available"
-        );
-        return;
-    }
-
     prj.add_test(
         "SymbolicDelegateCall.t.sol",
         r#"
@@ -1251,27 +1346,37 @@ contract SymbolicDelegateCall {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkDelegate"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
+    assert_symbolic(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "^(checkStatic|checkStaticCallValue|checkDelegate)\\(",
+    ]))
+    .success()
+    .stdout_eq(
+        str![[r#"
+...
+Ran 1 test for test/SymbolicDelegateCall.t.sol:SymbolicDelegateCall
+[PASS] checkDelegate(uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkDelegate(uint256)
-"#]],
+Ran 1 test for test/SymbolicStaticCall.t.sol:SymbolicStaticCall
+[PASS] checkStatic(uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test for test/SymbolicStaticCallValue.t.sol:SymbolicStaticCallValue
+[PASS] checkStaticCallValue(uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]]
+        .unordered(),
     );
-});
+}
 
-forgetest_init!(symbolic_call_transfers_value_and_checks_balance, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_call_transfers_value_and_checks_balance because z3 is not available"
-        );
-        return;
-    }
+// CALL with concrete and insufficient symbolic value.
+#[forgetest_init]
+fn symbolic_call_value_transfers(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_call_value_transfers");
 
     prj.add_test(
         "SymbolicValueCall.t.sol",
@@ -1304,21 +1409,64 @@ contract SymbolicValueCall is Test {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkValueTransfer"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
+    prj.add_test(
+        "SymbolicInsufficientValueCall.t.sol",
+        r#"
+import "forge-std/Test.sol";
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkValueTransfer()
-"#]],
+contract SymbolicValueSink {
+    receive() external payable {}
+}
+
+contract SymbolicInsufficientValueCall is Test {
+    SymbolicValueSink sink;
+
+    function setUp() public {
+        sink = new SymbolicValueSink();
+    }
+
+    function checkSymbolicInsufficientValue(uint256 amount) public {
+        vm.assume(amount <= 2);
+        vm.deal(address(this), 1);
+
+        (bool ok,) = address(sink).call{value: amount}("");
+
+        assert(ok == (amount <= 1));
+        assertEq(address(sink).balance, ok ? amount : 0);
+        assertEq(address(this).balance, ok ? 1 - amount : 1);
+    }
+}
+"#,
     );
-});
 
-forgetest_init!(symbolic_call_accepts_symbolic_value, |prj, cmd| {
+    let stdout = assert_symbolic(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "^(checkValueTransfer|checkSymbolicInsufficientValue)\\(",
+    ]))
+    .success()
+    .stdout_eq(
+        str![[r#"
+...
+Ran 1 test for test/SymbolicValueCall.t.sol:SymbolicValueCall
+[PASS] checkValueTransfer() ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test for test/SymbolicInsufficientValueCall.t.sol:SymbolicInsufficientValueCall
+[PASS] checkSymbolicInsufficientValue(uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]]
+        .unordered(),
+    )
+    .get_output()
+    .stdout_lossy();
+    assert!(!stdout.contains("symbolic external CALL value"), "{stdout}");
+}
+
+#[forgetest_init]
+fn symbolic_call_accepts_symbolic_value(prj: _, cmd: _) {
     if !z3_available() {
         let _ = sh_eprintln!(
             "skipping symbolic_call_accepts_symbolic_value because z3 is not available"
@@ -1365,75 +1513,28 @@ contract SymbolicValueCall is Test {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSymbolicValueTransfer"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
+    let stdout = assert_symbolic_witness(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "checkSymbolicValueTransfer",
+    ]))
+    .success()
+    .stdout_eq(str![[r#"
+...
+Ran 1 test for test/SymbolicValueCall.t.sol:SymbolicValueCall
+[PASS] checkSymbolicValueTransfer(uint256) ([METRICS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]])
+    .get_output()
+    .stdout_lossy();
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSymbolicValueTransfer(uint256)
-"#]],
-    );
     assert!(!stdout.contains("symbolic external CALL value"), "{stdout}");
-});
-
-forgetest_init!(symbolic_call_splits_symbolic_insufficient_value, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_call_splits_symbolic_insufficient_value because z3 is not available"
-        );
-        return;
-    }
-
-    prj.add_test(
-        "SymbolicInsufficientValueCall.t.sol",
-        r#"
-import "forge-std/Test.sol";
-
-contract SymbolicValueSink {
-    receive() external payable {}
 }
 
-contract SymbolicInsufficientValueCall is Test {
-    SymbolicValueSink sink;
-
-    function setUp() public {
-        sink = new SymbolicValueSink();
-    }
-
-    function checkSymbolicInsufficientValue(uint256 amount) public {
-        vm.assume(amount <= 2);
-        vm.deal(address(this), 1);
-
-        (bool ok,) = address(sink).call{value: amount}("");
-
-        assert(ok == (amount <= 1));
-        assertEq(address(sink).balance, ok ? amount : 0);
-        assertEq(address(this).balance, ok ? 1 - amount : 1);
-    }
-}
-"#,
-    );
-
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSymbolicInsufficientValue"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSymbolicInsufficientValue(uint256)
-"#]],
-    );
-    assert!(!stdout.contains("symbolic external CALL value"), "{stdout}");
-});
-
-forgetest_init!(symbolic_callcode_accepts_symbolic_value, |prj, cmd| {
+#[forgetest_init]
+fn symbolic_callcode_accepts_symbolic_value(prj: _, cmd: _) {
     if !z3_available() {
         let _ = sh_eprintln!(
             "skipping symbolic_callcode_accepts_symbolic_value because z3 is not available"
@@ -1551,35 +1652,393 @@ contract SymbolicCallcodeValue is Test {
 "#,
     );
 
-    let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "check.*Callcode"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
+    let stdout = assert_symbolic_witness(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "check.*Callcode",
+    ]))
+    .success()
+    .stdout_eq(str![[r#"
+...
+Ran 4 tests for test/SymbolicCallcodeValue.t.sol:SymbolicCallcodeValue
+[PASS] checkMockedPrankedCallcodeValue() ([METRICS])
+[PASS] checkPrankedCallcodeOverflow() ([METRICS])
+[PASS] checkPrankedCallcodeValue(uint256) ([METRICS])
+[PASS] checkSymbolicCallcodeValue(uint256) ([METRICS])
+Suite result: ok. 4 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]])
+    .get_output()
+    .stdout_lossy();
 
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkSymbolicCallcodeValue(uint256)
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkPrankedCallcodeValue(uint256)
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkPrankedCallcodeOverflow()
-"#]],
-    );
-    assert_relevant_lines(
-        &stdout,
-        foundry_test_utils::str![[r#"
-[PASS] checkMockedPrankedCallcodeValue()
-"#]],
-    );
     assert!(!stdout.contains("symbolic CALLCODE value"), "{stdout}");
-});
+}
+
+// An undefined opcode or one that underflows the stack halts its frame exceptionally, so the
+// call or create that ran it fails instead of the symbolic run stopping.
+#[forgetest_init]
+fn symbolic_invalid_opcode_halts_frame(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_invalid_opcode_halts_frame");
+
+    prj.add_test(
+        "SymbolicInvalidOpcode.t.sol",
+        &r#"
+import "forge-std/Test.sol";
+
+contract SymbolicInvalidOpcode is Test {
+    uint256 marker;
+
+    function checkCallToStackOverflowFails(uint256 value) public {
+        // Init code that returns a runtime of one PUSH0 more than the stack holds.
+        bytes memory init = hex"61040180600a5f395ff3PUSH0S";
+        address child;
+        assembly ("memory-safe") {
+            child := create(0, add(init, 0x20), mload(init))
+        }
+        assertEq(child.code.length, 1025);
+        marker = value;
+        (bool ok, bytes memory output) = child.call("");
+        assert(!ok);
+        assertEq(output.length, 0);
+        assertEq(marker, value);
+    }
+
+    function checkCallToFullStackSucceeds() public {
+        // Init code that returns a runtime that fills the stack and stops.
+        bytes memory init = hex"61040180600a5f395ff3FULL_STACK";
+        address child;
+        assembly ("memory-safe") {
+            child := create(0, add(init, 0x20), mload(init))
+        }
+        assertEq(child.code.length, 1025);
+        (bool ok,) = child.call("");
+        assert(ok);
+    }
+
+    function checkCallToStackUnderflowFails(uint256 value) public {
+        address child = address(0xC0DE);
+        // ADD with an empty stack.
+        vm.etch(child, hex"01");
+        marker = value;
+        (bool ok, bytes memory output) = child.call("");
+        assert(!ok);
+        assertEq(output.length, 0);
+        assertEq(marker, value);
+    }
+
+    function checkCallToUndefinedOpcodeFails(uint256 value) public {
+        address child = address(0xC0DE);
+        // 0xCC is not an opcode.
+        vm.etch(child, hex"cc");
+        marker = value;
+        (bool ok, bytes memory output) = child.call("");
+        assert(!ok);
+        assertEq(output.length, 0);
+        assertEq(marker, value);
+    }
+
+    function checkCreateWithStackUnderflowFails(uint256 value) public {
+        // ADDMOD with two of its three operands.
+        bytes memory initcode = hex"6001600208";
+        uint64 nonce = vm.getNonce(address(this));
+        marker = value;
+        address created;
+        assembly ("memory-safe") {
+            created := create(0, add(initcode, 0x20), mload(initcode))
+        }
+        assertEq(created, address(0));
+        assertEq(vm.getNonce(address(this)), nonce + 1);
+        assertEq(marker, value);
+    }
+}
+"#
+        .replace("PUSH0S", &"5f".repeat(1025))
+        .replace("FULL_STACK", &format!("{}00", "5f".repeat(1024))),
+    );
+
+    assert_symbolic(cmd.args(["test", "--symbolic", "--match-test", "check.*(Fails|Succeeds)"]))
+        .success()
+        .stdout_eq(str![[r#"
+...
+Ran 5 tests for test/SymbolicInvalidOpcode.t.sol:SymbolicInvalidOpcode
+[PASS] checkCallToFullStackSucceeds() ([METRICS])
+[PASS] checkCallToStackOverflowFails(uint256) ([METRICS])
+[PASS] checkCallToStackUnderflowFails(uint256) ([METRICS])
+[PASS] checkCallToUndefinedOpcodeFails(uint256) ([METRICS])
+[PASS] checkCreateWithStackUnderflowFails(uint256) ([METRICS])
+Suite result: ok. 5 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]]);
+}
+
+// A call or create beyond the EVM call depth limit fails, so self-call recursion unwinds after
+// 1024 nested frames, as on a node, instead of exhausting the native stack. As in concrete Forge,
+// the depth counts from the first frame of the transaction or `vm.deployCode` constructor.
+#[forgetest_init]
+fn symbolic_call_depth_limit_stops_recursion(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_call_depth_limit_stops_recursion");
+
+    prj.add_test(
+        "SymbolicCallDepth.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract SelfCaller {
+    uint256 public frames;
+
+    fallback() external {
+        frames += 1;
+        (bool ok,) = address(this).call("");
+        ok;
+    }
+}
+
+// Returns how many frames its self-STATICCALL recursion nests.
+contract StaticDepth {
+    function depth() external view returns (uint256) {
+        try this.depth() returns (uint256 inner) {
+            return inner + 1;
+        } catch {
+            return 1;
+        }
+    }
+}
+
+// Its constructor starts self-call recursion.
+contract Launcher {
+    constructor(SelfCaller target) {
+        (bool ok,) = address(target).call("");
+        require(ok);
+    }
+}
+
+// Deploys a Launcher with `vm.deployCode` from below the test frame.
+contract NestedDeployer {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
+    function deploy(SelfCaller target) external {
+        vm.deployCode("SymbolicCallDepth.t.sol:Launcher", abi.encode(target));
+    }
+}
+
+// The deepest frame's self-call fails, so it tries a CREATE at the depth limit.
+contract DeepCreator {
+    address public created = address(1);
+
+    function descend() external {
+        (bool ok,) = address(this).call(abi.encodeCall(this.descend, ()));
+        if (!ok) {
+            address child;
+            assembly {
+                child := create(0, 0, 0)
+            }
+            created = child;
+        }
+    }
+}
+
+// The deepest frame calls an address outside the known contracts.
+contract DeepSymbolicCaller {
+    address public to;
+    bool public reached;
+
+    function aim(address target) external {
+        to = target;
+    }
+
+    function descend() external {
+        (bool ok,) = address(this).call(abi.encodeCall(this.descend, ()));
+        if (!ok) {
+            (bool sent,) = to.call("");
+            reached = sent;
+        }
+    }
+}
+
+// The deepest frame expects its repeated self-call to fail at the depth limit.
+contract DeepExpectRevert {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    bool public caughtExpected;
+    uint256 public outputLength;
+
+    function descend() external {
+        (bool ok,) = address(this).call(abi.encodeCall(this.descend, ()));
+        if (!ok) {
+            vm.expectRevert();
+            bytes memory output;
+            (caughtExpected, output) = address(this).call(abi.encodeCall(this.descend, ()));
+            outputLength = output.length;
+        }
+    }
+}
+
+// The deepest frame expects its CREATE to fail at the depth limit.
+contract DeepExpectRevertCreator {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    address public created = address(1);
+
+    function descend() external {
+        (bool ok,) = address(this).call(abi.encodeCall(this.descend, ()));
+        if (!ok) {
+            vm.expectRevert();
+            address child;
+            assembly {
+                child := create(0, 0, 0)
+            }
+            created = child;
+        }
+    }
+}
+
+// Isolation runs a CALL or CREATE, but not a STATICCALL or CREATE2, from the test as its own
+// transaction, whose first frame is at depth 0. A `vm.deployCode` constructor always starts at
+// depth 0.
+abstract contract CallDepthFrames is Test {
+    function checkSelfCallsStopAtTheCallDepthLimit(uint256) public {
+        SelfCaller target = new SelfCaller();
+        (bool ok,) = address(target).call("");
+        assertTrue(ok);
+        assertEq(target.frames(), vm.isIsolateMode() ? 1025 : 1024);
+    }
+
+    function checkStaticCallsStopAtTheCallDepthLimit(uint256) public {
+        assertEq(new StaticDepth().depth(), 1024);
+    }
+
+    function checkConstructorSelfCallsStopAtTheCallDepthLimit(uint256) public {
+        SelfCaller target = new SelfCaller();
+        new Launcher(target);
+        assertEq(target.frames(), vm.isIsolateMode() ? 1024 : 1023);
+    }
+
+    function checkCreate2ConstructorSelfCallsStopAtTheCallDepthLimit(uint256) public {
+        SelfCaller target = new SelfCaller();
+        new Launcher{salt: bytes32(0)}(target);
+        assertEq(target.frames(), 1023);
+    }
+
+    function checkDeployCodeSelfCallsStopAtTheCallDepthLimit(uint256) public {
+        SelfCaller target = new SelfCaller();
+        vm.deployCode("SymbolicCallDepth.t.sol:Launcher", abi.encode(target));
+        assertEq(target.frames(), 1024);
+    }
+
+    function checkNestedDeployCodeSelfCallsStopAtTheCallDepthLimit(uint256) public {
+        SelfCaller target = new SelfCaller();
+        new NestedDeployer().deploy(target);
+        assertEq(target.frames(), 1024);
+    }
+}
+
+contract SymbolicCallDepth is CallDepthFrames {
+    function checkExpectedRevertOnCreateBeyondDepthLimit(uint256) public {
+        DeepExpectRevertCreator target = new DeepExpectRevertCreator();
+        target.descend();
+        assertTrue(target.created() != address(0));
+    }
+
+    function checkExpectedRevertAtTheCallDepthLimitSucceeds(uint256) public {
+        DeepExpectRevert target = new DeepExpectRevert();
+        target.descend();
+        assertTrue(target.caughtExpected());
+        // Forge answers a call that met its expected revert with 8192 zero bytes.
+        assertEq(target.outputLength(), 8192);
+    }
+
+    function checkSymbolicTargetAtTheCallDepthLimitFails(address to) public {
+        DeepSymbolicCaller target = new DeepSymbolicCaller();
+        vm.assume(to != address(target) && to != address(this) && uint160(to) > 0xffff);
+        target.aim(to);
+        target.descend();
+        assertFalse(target.reached());
+    }
+
+    function checkCreateAtTheCallDepthLimitFails(uint256) public {
+        DeepCreator target = new DeepCreator();
+        target.descend();
+        assertEq(target.created(), address(0));
+        assertEq(vm.getNonce(address(target)), 1);
+    }
+}
+
+/// forge-config: default.isolate = false
+contract SymbolicCallDepthNoIsolation is CallDepthFrames {}
+"#,
+    );
+
+    assert_symbolic(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-contract",
+        "^SymbolicCallDepth$",
+        "--match-test",
+        "check.*AtTheCallDepthLimit",
+        "--symbolic-call-targets",
+        // Every nested frame completes a path for each outcome of the deepest call, and the
+        // depth budget spans all 1024 frames.
+        "--symbolic-max-paths",
+        "16384",
+        "--symbolic-max-depth",
+        "1000000",
+    ]))
+    .success()
+    .stdout_eq(str![[r#"
+...
+Ran 9 tests for test/SymbolicCallDepth.t.sol:SymbolicCallDepth
+[PASS] checkConstructorSelfCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkCreate2ConstructorSelfCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkCreateAtTheCallDepthLimitFails(uint256) ([METRICS])
+[PASS] checkDeployCodeSelfCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkExpectedRevertAtTheCallDepthLimitSucceeds(uint256) ([METRICS])
+[PASS] checkNestedDeployCodeSelfCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkSelfCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkStaticCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkSymbolicTargetAtTheCallDepthLimitFails(address) ([METRICS])
+Suite result: ok. 9 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]]);
+
+    assert_symbolic(cmd.forge_fuse().args([
+        "test",
+        "--symbolic",
+        "--match-contract",
+        "SymbolicCallDepthNoIsolation",
+        "--symbolic-max-paths",
+        "16384",
+        "--symbolic-max-depth",
+        "1000000",
+    ]))
+    .success()
+    .stdout_eq(str![[r#"
+...
+Ran 6 tests for test/SymbolicCallDepth.t.sol:SymbolicCallDepthNoIsolation
+[PASS] checkConstructorSelfCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkCreate2ConstructorSelfCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkDeployCodeSelfCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkNestedDeployCodeSelfCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkSelfCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+[PASS] checkStaticCallsStopAtTheCallDepthLimit(uint256) ([METRICS])
+Suite result: ok. 6 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]]);
+
+    // Concrete Forge fails a default `vm.expectRevert` on a CREATE rejected at the depth limit,
+    // which the symbolic engine does not model, so the result is incomplete instead of a proof.
+    assert_symbolic(cmd.forge_fuse().args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "checkExpectedRevertOnCreateBeyondDepthLimit",
+        "--symbolic-max-paths",
+        "16384",
+        "--symbolic-max-depth",
+        "1000000",
+    ]))
+    .failure()
+    .stdout_eq(str![[r#"
+...
+[FAIL: incomplete symbolic execution (Stuck): unsupported symbolic execution feature: revert cheatcode on a CREATE beyond the call depth limit] checkExpectedRevertOnCreateBeyondDepthLimit(uint256) ([METRICS])
+...
+"#]]);
+}

@@ -39,7 +39,8 @@ get_latest_rev() {
   gh api repos/tempoxyz/tempo/commits/main --jq '.sha'
 }
 
-# Generate changelog between two revisions
+# Generate changelog between two revisions.
+# Use redirect.github.com links to avoid backlinks on upstream PR timelines.
 generate_changelog() {
   local old_rev="$1"
   local new_rev="$2"
@@ -50,12 +51,12 @@ generate_changelog() {
   local commits
   # shellcheck disable=SC2016 # Single quotes intentional for jq expression
   commits=$(gh api "repos/tempoxyz/tempo/compare/${old_rev}...${new_rev}" \
-    --jq '.commits[] | "- [`\(.sha[0:7])`](https://github.com/tempoxyz/tempo/commit/\(.sha)) \(.commit.message | split("\n")[0] | gsub("#(?<number>[0-9]+)"; "[#\(.number)](https://github.com/tempoxyz/tempo/issues/\(.number))"))"')
+    --jq '.commits[] | "- [`\(.sha[0:7])`](https://redirect.github.com/tempoxyz/tempo/commit/\(.sha)) \(.commit.message | split("\n")[0] | gsub("#(?<number>[0-9]+)"; "[#\(.number)](https://redirect.github.com/tempoxyz/tempo/issues/\(.number))"))"')
 
   {
     echo "## Tempo Dependency Updates"
     echo ""
-    echo "Bumped all \`tempo*\` dependencies from [\`${old_rev:0:7}\`](https://github.com/tempoxyz/tempo/commit/${old_rev}) to [\`${new_rev:0:7}\`](https://github.com/tempoxyz/tempo/commit/${new_rev})."
+    echo "Bumped all \`tempo*\` dependencies from [\`${old_rev:0:7}\`](https://redirect.github.com/tempoxyz/tempo/commit/${old_rev}) to [\`${new_rev:0:7}\`](https://redirect.github.com/tempoxyz/tempo/commit/${new_rev})."
     echo ""
     echo "### Commits"
     echo ""
@@ -74,16 +75,17 @@ update_cargo_toml() {
   echo "Updated Cargo.toml: $old_rev -> $new_rev"
 }
 
-# Regenerate Cargo.lock (may fail if dependencies don't build)
+# Resolve the new revision while preserving unrelated locked dependencies.
 regenerate_lockfile() {
   echo ""
-  echo "Regenerating Cargo.lock..."
-  if cargo generate-lockfile 2>&1; then
-    echo "Cargo.lock regenerated successfully"
+  echo "Updating Cargo.lock..."
+  if cargo update --workspace 2>&1; then
+    echo "Cargo.lock updated successfully"
     set_output "lockfile_updated" "true"
   else
-    echo "WARNING: Failed to regenerate Cargo.lock (dependencies may not build)"
+    echo "ERROR: Failed to update Cargo.lock"
     set_output "lockfile_updated" "false"
+    return 1
   fi
 }
 
@@ -129,7 +131,7 @@ main() {
   if [[ "$DRY_RUN" == "true" ]]; then
     echo ""
     echo "[DRY RUN] Would update Cargo.toml"
-    echo "[DRY RUN] Would regenerate Cargo.lock"
+    echo "[DRY RUN] Would update Cargo.lock, preserving unrelated dependencies"
     echo ""
     echo "=== Changelog Preview ==="
     cat "$CHANGELOG_FILE"

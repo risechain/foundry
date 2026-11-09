@@ -1,6 +1,7 @@
 //! general eth api tests
 
 use crate::abi::Greeter;
+use alloy_eips::BlockNumberOrTag;
 use alloy_network::{ReceiptResponse, TransactionBuilder};
 use alloy_primitives::{Address, B256, Bytes, U256, Uint, address, b256, bytes, utils::Unit};
 use alloy_provider::Provider;
@@ -17,12 +18,12 @@ use revm::{
     primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE,
 };
 use serde_json::{Value, json};
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn executes_rpc_notification_without_response() {
     let (_api, handle) = spawn(NodeConfig::test()).await;
-    let account = address!("0000000000000000000000000000000000000001");
+    let account = Address::with_last_byte(1);
     let balance = U256::from(42);
 
     let response = reqwest::Client::new()
@@ -354,11 +355,40 @@ async fn test_load_state_stale_blocks_preserve_canonical_head() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_state_removes_canonical_mappings_above_restored_head() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    api.mine_one().await.unwrap();
+    let older_dump = api.anvil_dump_state(None).await.unwrap();
+
+    let receipt = handle
+        .http_provider()
+        .send_transaction(WithOtherFields::new(
+            TransactionRequest::default()
+                .with_from(address!("f39fd6e51aad88f6f4ce6ab8827279cfffb92266"))
+                .with_to(Address::ZERO),
+        ))
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    let block_hash = receipt.block_hash.unwrap();
+    let transaction_hash = receipt.transaction_hash;
+
+    assert!(api.anvil_load_state(older_dump).await.unwrap());
+    assert_eq!(api.block_number().unwrap(), U256::ONE);
+    assert!(api.block_by_number(2.into()).await.unwrap().is_none());
+    assert!(api.block_transaction_count_by_number(2.into()).await.unwrap().is_none());
+    assert!(api.transaction_by_block_number_and_index(2.into(), 0.into()).await.unwrap().is_none());
+
+    assert!(api.block_by_hash(block_hash).await.unwrap().is_some());
+    assert!(api.transaction_by_hash(transaction_hash).await.unwrap().is_some());
+}
+
 // <https://github.com/foundry-rs/foundry/issues/12645>
 #[tokio::test(flavor = "multi_thread")]
 async fn finalized_block_hash_consistent_after_load_state() {
-    use alloy_eips::BlockNumberOrTag;
-
     let tmp = tempfile::tempdir().unwrap();
     let state_file = tmp.path().join("state.json");
 
@@ -467,7 +497,7 @@ async fn can_load_state_without_block_history_at_runtime() {
     state["block"]["coinbase"] = json!(loaded_beneficiary);
 
     let (api, _handle) = spawn(NodeConfig::test()).await;
-    api.backend.set_coinbase(address!("0000000000000000000000000000000000000001"));
+    api.backend.set_coinbase(Address::with_last_byte(1));
     api.mine_one().await.unwrap();
     let parent =
         api.block_by_number(alloy_eips::BlockNumberOrTag::Number(1)).await.unwrap().unwrap();
@@ -515,7 +545,7 @@ async fn state_without_block_history_restores_osaka_blob_excess_gas() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_nonempty_block_history_without_best_block() {
     let (source, _handle) = spawn(NodeConfig::test()).await;
-    source.backend.set_coinbase(address!("0000000000000000000000000000000000000002"));
+    source.backend.set_coinbase(Address::with_last_byte(2));
     source.mine_one().await.unwrap();
     source.mine_one().await.unwrap();
     source.mine_one().await.unwrap();
@@ -526,7 +556,7 @@ async fn rejects_nonempty_block_history_without_best_block() {
         state.blocks.iter().find(|block| block.header.number == 2).unwrap().header.hash_slow();
 
     let (api, _handle) = spawn(NodeConfig::test()).await;
-    let original_coinbase = address!("0000000000000000000000000000000000000001");
+    let original_coinbase = Address::with_last_byte(1);
     api.backend.set_coinbase(original_coinbase);
     api.mine_one().await.unwrap();
     let original =
@@ -625,7 +655,7 @@ async fn test_make_sure_historical_state_is_not_cleared_on_dump() {
     assert_eq!(block_number, Uint::from(3));
 
     // Makes sure historical states of the new instance are not cleared.
-    let code = provider.get_code_at(*address).block_id(BlockId::number(2)).await.unwrap();
+    let code = provider.get_code_at(*address).number(2).await.unwrap();
 
     assert_ne!(code, Bytes::new());
 }
@@ -681,6 +711,158 @@ async fn can_preserve_historical_states_between_dump_and_load() {
     assert_eq!(greeting_after_change, "World!");
 }
 
+// Historical states loaded into a fork must still read uncached accounts from the fork, without
+// resurrecting storage that was cleared locally.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_historical_states_fall_back_to_remote_after_load() {
+    // Shanghai keeps the pre-Cancun selfdestruct that clears storage.
+    let config = || NodeConfig::test().with_hardfork(Some(EthereumHardfork::Shanghai.into()));
+    let (_origin_api, origin) = spawn(config()).await;
+    let origin_provider = origin.http_provider();
+    let sender = origin.dev_accounts().next().unwrap();
+    let remote_account = Address::repeat_byte(0x42);
+    let local_account = Address::repeat_byte(0x11);
+    let send = |to, value| {
+        WithOtherFields::new(
+            TransactionRequest::default()
+                .with_from(sender)
+                .with_to(to)
+                .with_value(U256::from(value)),
+        )
+    };
+
+    let greeter = Greeter::deploy(&origin_provider, "untouched".to_string()).await.unwrap();
+    origin_provider
+        .send_transaction(send(remote_account, 12345))
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    // Stores 42 in slot zero, and its runtime selfdestructs when called.
+    let destructible = origin_provider
+        .send_transaction(WithOtherFields::new(
+            TransactionRequest::default()
+                .with_from(sender)
+                .with_deploy_code(bytes!("602a6000556133ff6000526002601ef3")),
+        ))
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap()
+        .contract_address
+        .unwrap();
+    let fork_block = origin_provider.get_block_number().await.unwrap();
+    let remote_code = origin_provider.get_code_at(*greeter.address()).await.unwrap();
+    let remote_slot = origin_provider.get_storage_at(*greeter.address(), U256::ZERO).await.unwrap();
+    assert_ne!(remote_code, Bytes::new());
+    assert_ne!(remote_slot, U256::ZERO);
+    assert_eq!(
+        origin_provider.get_storage_at(destructible, U256::ZERO).await.unwrap(),
+        U256::from(42)
+    );
+
+    let fork_config = || {
+        config()
+            .with_eth_rpc_url(Some(origin.http_endpoint()))
+            .with_fork_block_number(Some(fork_block))
+    };
+    // Mine three local blocks without reading the remote greeter or account on the fork, and
+    // selfdestruct the remote contract in the second one.
+    let (fork_api, fork) = spawn(fork_config()).await;
+    let fork_provider = fork.http_provider();
+    for (to, value) in [(local_account, 777), (destructible, 0), (local_account, 1000)] {
+        fork_provider.send_transaction(send(to, value)).await.unwrap().get_receipt().await.unwrap();
+    }
+    let selfdestruct_block = BlockId::number(fork_block + 2);
+    assert_eq!(
+        fork_provider
+            .get_storage_at(destructible, U256::ZERO)
+            .block_id(selfdestruct_block)
+            .await
+            .unwrap(),
+        U256::ZERO
+    );
+    // A head-only change that must not leak into the restored history.
+    fork_api.anvil_set_balance(remote_account, U256::from(1)).await.unwrap();
+    let dump = fork_api.anvil_dump_state(Some(true)).await.unwrap();
+
+    let (loaded_api, loaded) = spawn(fork_config()).await;
+    assert!(loaded_api.anvil_load_state(dump).await.unwrap());
+    let provider = loaded.http_provider();
+    assert_eq!(provider.get_block_number().await.unwrap(), fork_block + 3);
+
+    for number in fork_block..=fork_block + 2 {
+        let block = BlockId::number(number);
+        assert_eq!(
+            provider.get_code_at(*greeter.address()).block_id(block).await.unwrap(),
+            remote_code
+        );
+        assert_eq!(
+            provider.get_storage_at(*greeter.address(), U256::ZERO).block_id(block).await.unwrap(),
+            remote_slot
+        );
+        assert_eq!(
+            provider.get_balance(remote_account).block_id(block).await.unwrap(),
+            U256::from(12345)
+        );
+    }
+    assert_eq!(
+        provider.get_balance(local_account).block_id(selfdestruct_block).await.unwrap(),
+        U256::from(777)
+    );
+    assert_eq!(
+        provider
+            .get_storage_at(destructible, U256::ZERO)
+            .block_id(selfdestruct_block)
+            .await
+            .unwrap(),
+        U256::ZERO
+    );
+
+    // Rolling back restores the loaded historical state as the live state.
+    loaded_api.anvil_rollback(Some(1)).await.unwrap();
+    assert_eq!(provider.get_balance(local_account).await.unwrap(), U256::from(777));
+    assert_eq!(provider.get_code_at(*greeter.address()).await.unwrap(), remote_code);
+    assert_eq!(provider.get_storage_at(destructible, U256::ZERO).await.unwrap(), U256::ZERO);
+
+    // Snapshots saved before `account_states` existed must not resurrect cleared storage either.
+    let mut legacy = serde_json::to_value(fork_api.serialized_state(true).await.unwrap()).unwrap();
+    for entry in legacy["historical_states"].as_array_mut().unwrap() {
+        entry[1].as_object_mut().unwrap().remove("account_states").unwrap();
+    }
+    let legacy = serde_json::from_value(legacy).unwrap();
+    let (_legacy_api, legacy_node) = spawn(fork_config().with_init_state(Some(legacy))).await;
+    assert_eq!(
+        legacy_node
+            .http_provider()
+            .get_storage_at(destructible, U256::ZERO)
+            .block_id(selfdestruct_block)
+            .await
+            .unwrap(),
+        U256::ZERO
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revert_removes_historical_states_of_discarded_blocks() {
+    let (api, _handle) = spawn(NodeConfig::test()).await;
+    let genesis_hash = api.backend.best_hash();
+
+    let snapshot = api.evm_snapshot().await.unwrap();
+    api.mine_one().await.unwrap();
+    let discarded_hash = api.backend.best_hash();
+    api.mine_one().await.unwrap();
+    assert!(api.evm_revert(snapshot).await.unwrap());
+
+    let state = api.serialized_state(true).await.unwrap();
+    let hashes: Vec<_> =
+        state.historical_states.unwrap().into_iter().map(|(hash, _)| hash).collect();
+    assert!(hashes.contains(&genesis_hash));
+    assert!(!hashes.contains(&discarded_hash));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn state_dump_is_deterministic() {
     let timestamp = 1_700_000_000u64;
@@ -718,7 +900,7 @@ async fn test_fork_load_state() {
 
     let init_balance_alice = provider.get_balance(alice).await.unwrap();
 
-    let value = Unit::ETHER.wei().saturating_mul(U256::from(1)); // 1 ether
+    let value = Unit::ETHER.wei().saturating_mul(U256::ONE); // 1 ether
     let tx = TransactionRequest::default().with_to(alice).with_value(value).with_from(bob);
     let tx = WithOtherFields::new(tx);
 
@@ -784,6 +966,125 @@ async fn test_fork_load_state() {
     assert_eq!(nonce_bob + 1, latest_nonce_bob);
 
     assert_eq!(balance_alice + value, latest_balance_alice);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fork_load_state_preserves_fork_blocks_below_head() {
+    let (_origin_api, origin) =
+        spawn(NodeConfig::test().with_genesis_timestamp(Some(1_700_000_000u64))).await;
+    let (dump_source_api, dump_source) =
+        spawn(NodeConfig::test().with_genesis_timestamp(Some(1_700_000_001u64))).await;
+    let origin_provider = origin.http_provider();
+    let dump_provider = dump_source.http_provider();
+    let sender = origin.dev_wallets().next().unwrap().address();
+    let recipient = Address::repeat_byte(0x11);
+    let fork_boundary = 3;
+    let mut origin_transactions = Vec::new();
+    let mut dump_transactions = Vec::new();
+
+    for _ in 0..fork_boundary {
+        for (provider, value, transactions) in [
+            (&origin_provider, 1, &mut origin_transactions),
+            (&dump_provider, 2, &mut dump_transactions),
+        ] {
+            let receipt = provider
+                .send_transaction(WithOtherFields::new(
+                    TransactionRequest::default()
+                        .with_from(sender)
+                        .with_to(recipient)
+                        .with_value(U256::from(value)),
+                ))
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+            assert!(receipt.status());
+            transactions.push(receipt.transaction_hash);
+        }
+    }
+
+    let mut origin_blocks = Vec::new();
+    let mut dump_blocks = Vec::new();
+    for number in 0..=fork_boundary {
+        let origin_block =
+            origin_provider.get_block_by_number(number.into()).await.unwrap().unwrap();
+        let dump_block = dump_provider.get_block_by_number(number.into()).await.unwrap().unwrap();
+        assert_ne!(origin_block.header.hash, dump_block.header.hash);
+        origin_blocks.push(origin_block);
+        dump_blocks.push(dump_block);
+    }
+    let state = dump_source_api.serialized_state(false).await.unwrap();
+    let (_forked_api, forked) = spawn(
+        NodeConfig::test()
+            .with_eth_rpc_url(Some(origin.http_endpoint()))
+            .with_fork_block_number(Some(fork_boundary))
+            .with_init_state(Some(state)),
+    )
+    .await;
+    let forked_provider = forked.http_provider();
+    assert_eq!(forked_provider.get_block_number().await.unwrap(), fork_boundary);
+
+    for (number, (origin_block, dump_block)) in origin_blocks.iter().zip(&dump_blocks).enumerate() {
+        let block =
+            forked_provider.get_block_by_number((number as u64).into()).await.unwrap().unwrap();
+        assert_eq!(block.header.hash, origin_block.header.hash);
+        assert_eq!(block.header.parent_hash, origin_block.header.parent_hash);
+        if number > 0 {
+            assert_eq!(block.header.parent_hash, origin_blocks[number - 1].header.hash);
+        }
+        assert!(forked_provider.get_block_by_hash(dump_block.header.hash).await.unwrap().is_none());
+        assert!(
+            forked_provider
+                .get_block_by_hash(dump_block.header.hash)
+                .full()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            forked_provider
+                .get_transaction_by_block_hash_and_index(dump_block.header.hash, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if number > 0 {
+            let origin_tx = origin_provider
+                .get_transaction_by_hash(origin_transactions[number - 1])
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                forked_provider
+                    .get_transaction_by_hash(origin_transactions[number - 1])
+                    .await
+                    .unwrap(),
+                Some(origin_tx.clone())
+            );
+            assert!(
+                forked_provider
+                    .get_transaction_by_hash(dump_transactions[number - 1])
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                forked_provider
+                    .get_transaction_by_block_hash_and_index(origin_block.header.hash, 0)
+                    .await
+                    .unwrap(),
+                Some(origin_tx.clone())
+            );
+            assert_eq!(
+                forked_provider
+                    .get_transaction_by_block_number_and_index((number as u64).into(), 0)
+                    .await
+                    .unwrap(),
+                Some(origin_tx)
+            );
+        }
+    }
 }
 
 // <https://github.com/foundry-rs/foundry/issues/10501>
@@ -878,7 +1179,7 @@ async fn computes_next_base_fee_after_loading_state() {
 
     let base_fee_empty_chain = api.backend.fees().base_fee();
 
-    let value = Unit::ETHER.wei().saturating_mul(U256::from(1)); // 1 ether
+    let value = Unit::ETHER.wei().saturating_mul(U256::ONE); // 1 ether
     let tx = TransactionRequest::default().with_to(alice).with_value(value).with_from(bob);
     let tx = WithOtherFields::new(tx);
 
@@ -984,7 +1285,7 @@ async fn test_backward_compatibility_mixed_formats_deserialization_v1_2() {
     let block_env = state.block.unwrap();
 
     assert_eq!(block_env.number, U256::from(3));
-    assert_eq!(block_env.beneficiary, address!("0x1111111111111111111111111111111111111111"));
+    assert_eq!(block_env.beneficiary, Address::repeat_byte(0x11));
     assert_eq!(block_env.timestamp, U256::from(1751619509));
     assert_eq!(block_env.gas_limit, 0x1c9c380);
     assert_eq!(block_env.basefee, 1_000_000_000);
@@ -1023,8 +1324,8 @@ async fn test_backward_compatibility_optional_fields_deserialization_v1_2() {
     let state: SerializableState = serde_json::from_str(&partial_old_format.to_string()).unwrap();
 
     let block_env = state.block.unwrap();
-    assert_eq!(block_env.number, U256::from(1));
-    assert_eq!(block_env.beneficiary, address!("0x0000000000000000000000000000000000000000"));
+    assert_eq!(block_env.number, U256::ONE);
+    assert_eq!(block_env.beneficiary, Address::ZERO);
     assert_eq!(block_env.timestamp, U256::from(0x688c83b5));
     assert_eq!(block_env.gas_limit, 0x1c9c380);
     assert_eq!(block_env.basefee, 0x3b9aca00);
@@ -1285,8 +1586,8 @@ async fn test_backward_compatibility_state_dump_deserialization_v1_2() {
 
     // Verify the old state was loaded correctly with `coinbase` to `beneficiary` conversion.
     let block_env = deserialized_state.block.unwrap();
-    assert_eq!(block_env.number, U256::from(1));
-    assert_eq!(block_env.beneficiary, address!("0000000000000000000000000000000000000001"));
+    assert_eq!(block_env.number, U256::ONE);
+    assert_eq!(block_env.beneficiary, Address::with_last_byte(1));
     assert_eq!(block_env.gas_limit, 0x1c9c380);
     assert_eq!(block_env.basefee, 0x3b9aca00);
 
@@ -1297,13 +1598,13 @@ async fn test_backward_compatibility_state_dump_deserialization_v1_2() {
     assert_eq!(deserialized_state.accounts.len(), 13);
 
     // Test specific accounts from the old dump.
-    let deployer_addr = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".parse().unwrap();
+    let deployer_addr = address!("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
     let deployer_account = deserialized_state.accounts.get(&deployer_addr).unwrap();
     assert_eq!(deployer_account.nonce, 1);
     assert_eq!(deployer_account.balance, U256::from_str("0x21e19e03b1e9e55d17f").unwrap());
 
     // Test contract account.
-    let contract_addr = "0x5fbdb2315678afecb367f032d93f642f64180aa3".parse().unwrap();
+    let contract_addr = address!("0x5fbdb2315678afecb367f032d93f642f64180aa3");
     let contract_account = deserialized_state.accounts.get(&contract_addr).unwrap();
     assert_eq!(contract_account.nonce, 1);
     assert_eq!(contract_account.balance, U256::ZERO);
@@ -1318,7 +1619,7 @@ async fn test_backward_compatibility_state_dump_deserialization_v1_2() {
 
     // Verify the state was loaded correctly.
     let block_number = api.block_number().unwrap();
-    assert_eq!(block_number, U256::from(1));
+    assert_eq!(block_number, U256::ONE);
 
     // Verify account balances are preserved.
     let provider = _handle.http_provider();
@@ -1359,7 +1660,7 @@ async fn blockhash_opcode_consistent_after_load_state() {
 
     // Runtime code returning BLOCKHASH(1):
     // PUSH1 1, BLOCKHASH, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
-    let code = Bytes::from_str("0x60014060005260206000f3").unwrap();
+    let code = bytes!("0x60014060005260206000f3");
     let target = address!("00000000000000000000000000000000000b10c4");
 
     let mut overrides = StateOverride::default();
@@ -1398,7 +1699,7 @@ async fn blockhash_opcode_consistent_after_loading_older_state() {
 
     // Runtime code returning BLOCKHASH(1):
     // PUSH1 1, BLOCKHASH, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
-    let code = Bytes::from_str("0x60014060005260206000f3").unwrap();
+    let code = bytes!("0x60014060005260206000f3");
     let target = address!("00000000000000000000000000000000000b10c4");
 
     let mut overrides = StateOverride::default();
@@ -1411,4 +1712,43 @@ async fn blockhash_opcode_consistent_after_loading_older_state() {
         .unwrap();
 
     assert_eq!(B256::from_slice(res.as_ref()), block1_hash);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prune_history_respects_limit_with_configured_interval() {
+    for seconds in [1, 2, 3] {
+        assert_pruned_interval_history(seconds, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prune_history_respects_limit_with_rpc_interval() {
+    for seconds in [1, 2, 3] {
+        assert_pruned_interval_history(seconds, false).await;
+    }
+}
+
+async fn assert_pruned_interval_history(seconds: u64, configured: bool) {
+    let config = NodeConfig::test()
+        .set_pruned_history(Some(Some(8)))
+        .with_blocktime(configured.then(|| Duration::from_secs(seconds)));
+    let (api, handle) = spawn(config).await;
+    let provider = handle.http_provider();
+    if !configured {
+        provider.raw_request::<_, ()>("evm_setIntervalMining".into(), [seconds]).await.unwrap();
+    }
+    // Disable the timer so the retention boundary is deterministic.
+    api.anvil_set_interval_mining(0).unwrap();
+    api.anvil_mine(Some(U256::from(40)), None).await.unwrap();
+    let best = provider.get_block_number().await.unwrap();
+    let account = handle.dev_accounts().next().unwrap();
+    let latest = provider.get_balance(account).await.unwrap();
+    assert_eq!(provider.get_balance(account).block_id((best - 8).into()).await.unwrap(), latest);
+    let error = provider.get_balance(account).block_id((best - 9).into()).await.unwrap_err();
+    let error = error.as_error_resp().unwrap();
+    assert_eq!(error.code, -32602);
+    assert_eq!(
+        error.message,
+        format!("BlockOutOfRangeError: block height is {best} but requested was {}", best - 9)
+    );
 }

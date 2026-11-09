@@ -39,6 +39,31 @@ pub struct Params<T> {
     pub params: T,
 }
 
+/// Parameters accepted by `eth_getTransactionCount`.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(untagged)]
+pub enum TransactionCountParams {
+    /// Address only.
+    Address((Address,)),
+    /// Standard address and block query.
+    Standard((Address, Option<BlockId>)),
+    /// EIP-8130 address, block, and nonce-key query.
+    #[cfg(feature = "base")]
+    Eip8130((Address, Option<BlockId>, U256)),
+}
+
+impl TransactionCountParams {
+    /// Splits the request into address, block, and optional EIP-8130 nonce key.
+    pub const fn into_parts(self) -> (Address, Option<BlockId>, Option<U256>) {
+        match self {
+            Self::Address((address,)) => (address, None, None),
+            Self::Standard((address, block)) => (address, block, None),
+            #[cfg(feature = "base")]
+            Self::Eip8130((address, block, nonce_key)) => (address, block, Some(nonce_key)),
+        }
+    }
+}
+
 /// Represents ethereum JSON-RPC API
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(tag = "method", content = "params")]
@@ -90,7 +115,7 @@ pub enum EthRequest {
     EthCoinbase(()),
 
     #[serde(rename = "eth_getBalance")]
-    EthGetBalance(Address, Option<BlockId>),
+    EthGetBalance(Address, #[serde(default)] Option<BlockId>),
 
     #[serde(rename = "eth_getAccount")]
     EthGetAccount(Address, Option<BlockId>),
@@ -99,11 +124,11 @@ pub enum EthRequest {
     EthGetAccountInfo(Address, Option<BlockId>),
 
     #[serde(rename = "eth_getStorageAt")]
-    EthGetStorageAt(Address, U256, Option<BlockId>),
+    EthGetStorageAt(Address, U256, #[serde(default)] Option<BlockId>),
 
     /// Returns storage values for multiple accounts and slots in a single call.
     #[serde(rename = "eth_getStorageValues")]
-    EthGetStorageValues(HashMap<Address, Vec<B256>>, Option<BlockId>),
+    EthGetStorageValues(HashMap<Address, Vec<B256>>, #[serde(default)] Option<BlockId>),
 
     #[serde(rename = "eth_getBlockByHash")]
     EthGetBlockByHash(B256, bool),
@@ -139,7 +164,7 @@ pub enum EthRequest {
     EthGetBlockAccessListRaw(BlockId),
 
     #[serde(rename = "eth_getTransactionCount")]
-    EthGetTransactionCount(Address, Option<BlockId>),
+    EthGetTransactionCount(TransactionCountParams),
 
     #[serde(rename = "eth_getBlockTransactionCountByHash", with = "sequence")]
     EthGetTransactionCountByHash(B256),
@@ -160,12 +185,12 @@ pub enum EthRequest {
     EthGetUnclesCountByNumber(BlockNumber),
 
     #[serde(rename = "eth_getCode")]
-    EthGetCodeAt(Address, Option<BlockId>),
+    EthGetCodeAt(Address, #[serde(default)] Option<BlockId>),
 
     /// Returns the account and storage values of the specified account including the Merkle-proof.
     /// This call can be used to verify that the data you are pulling from is not tampered with.
     #[serde(rename = "eth_getProof")]
-    EthGetProof(Address, Vec<B256>, Option<BlockId>),
+    EthGetProof(Address, Vec<B256>, #[serde(default)] Option<BlockId>),
 
     /// The sign method calculates an Ethereum specific signature with:
     #[serde(rename = "eth_sign")]
@@ -458,7 +483,7 @@ pub enum EthRequest {
 
     /// Trace get endpoint for parity's `trace_get`.
     #[serde(rename = "trace_get")]
-    TraceGet(B256, Vec<Index>),
+    TraceGet(B256, #[serde(deserialize_with = "trace_address::deserialize")] Vec<Index>),
 
     /// Trace transaction endpoint for parity's `trace_replayBlockTransactions`
     #[serde(rename = "trace_replayBlockTransactions")]
@@ -550,6 +575,14 @@ pub enum EthRequest {
     #[serde(rename = "anvil_getIntervalMining", with = "empty_params")]
     GetIntervalMining(()),
 
+    /// Pauses or resumes automatic block production, keeping the block time schedule
+    #[serde(rename = "anvil_setMiningPaused", with = "sequence")]
+    SetMiningPaused(bool),
+
+    /// Returns true if automatic block production is paused
+    #[serde(rename = "anvil_getMiningPaused", with = "empty_params")]
+    GetMiningPaused(()),
+
     /// Removes transactions from the pool
     #[serde(rename = "anvil_dropTransaction", alias = "hardhat_dropTransaction", with = "sequence")]
     DropTransaction(B256),
@@ -632,6 +665,10 @@ pub enum EthRequest {
     /// Sets the `prevrandao` value of the next block
     #[serde(rename = "anvil_setNextBlockPrevRandao", with = "sequence")]
     SetNextBlockPrevRandao(B256),
+
+    /// Sets the parent beacon block root of the next block
+    #[serde(rename = "anvil_setNextBlockParentBeaconBlockRoot", with = "sequence")]
+    SetNextBlockParentBeaconBlockRoot(B256),
 
     /// Sets the chain id
     #[serde(rename = "anvil_setChainId", deserialize_with = "deserialize_u64_seq")]
@@ -905,6 +942,32 @@ pub enum EthRequest {
         #[serde(deserialize_with = "deserialize_number")]
         U256,
     ),
+
+    /// Returns a Tempo finalization certificate and its native block.
+    #[serde(rename = "consensus_getFinalization", with = "sequence")]
+    ConsensusGetFinalization(TempoConsensusQuery),
+
+    /// Returns the latest local Tempo consensus state.
+    #[serde(rename = "consensus_getLatest", with = "empty_params")]
+    ConsensusGetLatest(()),
+
+    /// Returns the public development consensus identity (Tempo-only).
+    #[serde(rename = "anvil_tempoConsensusIdentity", with = "empty_params")]
+    TempoConsensusIdentity(()),
+
+    /// Schedules a new development consensus identity (Tempo-only).
+    #[serde(rename = "anvil_tempoRotateConsensusIdentity", with = "empty_params")]
+    TempoRotateConsensusIdentity(()),
+}
+
+/// Native Tempo consensus selector: `"latest"` or `{"height": N}` with a numeric height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TempoConsensusQuery {
+    /// The latest locally certified block.
+    Latest,
+    /// A specific block height.
+    Height(u64),
 }
 
 /// Represents ethereum JSON-RPC API
@@ -915,9 +978,17 @@ pub enum EthPubSub {
     #[serde(rename = "eth_subscribe")]
     EthSubscribe(SubscriptionKind, #[serde(default)] Box<SubscriptionParams>),
 
-    /// Unsubscribe from an eth subscription
+    /// Cancels a subscription on the current connection.
     #[serde(rename = "eth_unsubscribe", with = "sequence")]
     EthUnSubscribe(SubscriptionId),
+
+    /// Subscribes to locally finalized Tempo blocks.
+    #[serde(rename = "consensus_subscribe", with = "empty_params")]
+    ConsensusSubscribe(()),
+
+    /// Alias for `eth_unsubscribe`.
+    #[serde(rename = "consensus_unsubscribe", with = "sequence")]
+    ConsensusUnsubscribe(SubscriptionId),
 }
 
 /// Container type for either a request or a pub sub
@@ -934,7 +1005,15 @@ impl<'de> serde::Deserialize<'de> for EthRpcCall {
     {
         let value = serde_json::Value::deserialize(deserializer)?;
         match value.get("method").and_then(serde_json::Value::as_str) {
-            Some("eth_subscribe" | "eth_unsubscribe") => serde_json::from_value(value)
+            Some("consensus_subscribe") if value.get("params").is_none() => {
+                Ok(Self::PubSub(EthPubSub::ConsensusSubscribe(())))
+            }
+            Some(
+                "eth_subscribe"
+                | "eth_unsubscribe"
+                | "consensus_subscribe"
+                | "consensus_unsubscribe",
+            ) => serde_json::from_value(value)
                 .map(Self::PubSub)
                 .map_err(<D::Error as serde::de::Error>::custom),
             _ => serde_json::from_value(value)
@@ -1205,6 +1284,22 @@ mod tests {
         let s = r#"{"method": "evm_setIntervalMining", "params": [100]}"#;
         let value: serde_json::Value = serde_json::from_str(s).unwrap();
         let _req = serde_json::from_value::<EthRequest>(value).unwrap();
+    }
+
+    #[test]
+    fn test_set_mining_paused() {
+        let s = r#"{"method": "anvil_setMiningPaused", "params": [true]}"#;
+        let value: serde_json::Value = serde_json::from_str(s).unwrap();
+        let req = serde_json::from_value::<EthRequest>(value).unwrap();
+        assert!(matches!(req, EthRequest::SetMiningPaused(true)));
+    }
+
+    #[test]
+    fn test_get_mining_paused() {
+        let s = r#"{"method": "anvil_getMiningPaused", "params": []}"#;
+        let value: serde_json::Value = serde_json::from_str(s).unwrap();
+        let req = serde_json::from_value::<EthRequest>(value).unwrap();
+        assert!(matches!(req, EthRequest::GetMiningPaused(())));
     }
 
     #[test]
@@ -1510,6 +1605,13 @@ mod tests {
     #[test]
     fn test_serde_custom_set_next_block_prevrandao() {
         let s = r#"{"method": "anvil_setNextBlockPrevRandao", "params": ["0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"]}"#;
+        let value: serde_json::Value = serde_json::from_str(s).unwrap();
+        let _req = serde_json::from_value::<EthRequest>(value).unwrap();
+    }
+
+    #[test]
+    fn test_serde_custom_set_next_block_parent_beacon_block_root() {
+        let s = r#"{"method": "anvil_setNextBlockParentBeaconBlockRoot", "params": ["0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"]}"#;
         let value: serde_json::Value = serde_json::from_str(s).unwrap();
         let _req = serde_json::from_value::<EthRequest>(value).unwrap();
     }
@@ -2057,9 +2159,19 @@ true}]}"#;
 
     #[test]
     fn test_serde_trace_get() {
-        let s = r#"{"method": "trace_get", "params": ["0x4a3b0fce2cb9707b0baa68640cf2fe858c8bb4121b2a8cb904ff369d38a560ff", [0]]}"#;
-        let value: serde_json::Value = serde_json::from_str(s).unwrap();
-        let _req = serde_json::from_value::<EthRequest>(value).unwrap();
+        let s = r#"{"method": "trace_get", "params": ["0x4a3b0fce2cb9707b0baa68640cf2fe858c8bb4121b2a8cb904ff369d38a560ff", ["0x6", "0xa0"]]}"#;
+        let req = serde_json::from_str::<EthRequest>(s).unwrap();
+        let EthRequest::TraceGet(_, indices) = req else { panic!("unexpected request {req:?}") };
+        assert_eq!(indices.into_iter().map(usize::from).collect::<Vec<_>>(), [6, 160]);
+
+        for indices in
+            [r#"[6, 0]"#, r#"["6"]"#, r#"["0x00"]"#, r#"["0x06"]"#, r#"["0xA"]"#, r#"["0x"]"#]
+        {
+            let s = format!(
+                r#"{{"method": "trace_get", "params": ["0x4a3b0fce2cb9707b0baa68640cf2fe858c8bb4121b2a8cb904ff369d38a560ff", {indices}]}}"#
+            );
+            serde_json::from_str::<EthRequest>(&s).unwrap_err();
+        }
     }
 
     #[test]
@@ -2075,6 +2187,55 @@ true}]}"#;
 ["0x295a70b2de5e3953354a6a8344e616ed314d7251", "0x0", "latest"]}"#;
         let value: serde_json::Value = serde_json::from_str(s).unwrap();
         let _req = serde_json::from_value::<EthRequest>(value).unwrap();
+    }
+
+    #[test]
+    fn test_serde_state_requests_without_block() {
+        let requests = [
+            r#"{"method":"eth_getBalance","params":["0x295a70b2de5e3953354a6a8344e616ed314d7251"]}"#,
+            r#"{"method":"eth_getCode","params":["0x295a70b2de5e3953354a6a8344e616ed314d7251"]}"#,
+            r#"{"method":"eth_getStorageAt","params":["0x295a70b2de5e3953354a6a8344e616ed314d7251","0x0"]}"#,
+            r#"{"method":"eth_getStorageValues","params":[{"0x295a70b2de5e3953354a6a8344e616ed314d7251":["0x0000000000000000000000000000000000000000000000000000000000000000"]}]}"#,
+            r#"{"method":"eth_getTransactionCount","params":["0x295a70b2de5e3953354a6a8344e616ed314d7251"]}"#,
+            r#"{"method":"eth_getProof","params":["0x295a70b2de5e3953354a6a8344e616ed314d7251",[]]}"#,
+        ];
+
+        for request in requests {
+            if let EthRequest::EthGetTransactionCount(params) =
+                serde_json::from_str::<EthRequest>(request).unwrap()
+            {
+                let (_, block, nonce_key) = params.into_parts();
+                assert!(block.is_none());
+                assert!(nonce_key.is_none());
+                continue;
+            }
+            assert!(matches!(
+                serde_json::from_str::<EthRequest>(request).unwrap(),
+                EthRequest::EthGetBalance(_, None)
+                    | EthRequest::EthGetCodeAt(_, None)
+                    | EthRequest::EthGetStorageAt(_, _, None)
+                    | EthRequest::EthGetStorageValues(_, None)
+                    | EthRequest::EthGetProof(_, _, None)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_serde_transaction_count_nonce_key_is_base_gated() {
+        let request = r#"{"method":"eth_getTransactionCount","params":["0x295a70b2de5e3953354a6a8344e616ed314d7251","latest","0x7"]}"#;
+        let result = serde_json::from_str::<EthRequest>(request);
+
+        #[cfg(feature = "base")]
+        {
+            let EthRequest::EthGetTransactionCount(params) = result.unwrap() else {
+                panic!("unexpected request variant")
+            };
+            let (_, block, nonce_key) = params.into_parts();
+            assert_eq!(block, Some(BlockId::latest()));
+            assert_eq!(nonce_key, Some(U256::from(7)));
+        }
+        #[cfg(not(feature = "base"))]
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2239,5 +2400,55 @@ true}]}"#;
         "#;
         let value: serde_json::Value = serde_json::from_str(s).unwrap();
         let _req = serde_json::from_value::<EthRequest>(value).unwrap();
+    }
+
+    #[test]
+    fn tempo_consensus_requests() {
+        for request in [
+            r#"{"method":"consensus_getFinalization","params":["latest"]}"#,
+            r#"{"method":"consensus_getFinalization","params":[{"height":0}]}"#,
+            r#"{"method":"consensus_getFinalization","params":[{"height":18446744073709551615}]}"#,
+            r#"{"method":"consensus_getLatest","params":[]}"#,
+            r#"{"method":"anvil_tempoConsensusIdentity","params":[]}"#,
+            r#"{"method":"anvil_tempoRotateConsensusIdentity","params":[]}"#,
+        ] {
+            serde_json::from_str::<EthRequest>(request).unwrap();
+        }
+        for request in [
+            r#"{"method":"consensus_getFinalization","params":["Latest"]}"#,
+            r#"{"method":"consensus_getFinalization","params":["pending"]}"#,
+            r#"{"method":"consensus_getFinalization","params":[{"height":"0x1"}]}"#,
+            r#"{"method":"consensus_getFinalization","params":[{"height":-1}]}"#,
+            r#"{"method":"consensus_getFinalization","params":[{"height":18446744073709551616}]}"#,
+            r#"{"method":"consensus_getFinalization","params":[]}"#,
+            r#"{"method":"consensus_getFinalization","params":["latest",1]}"#,
+            r#"{"method":"consensus_getLatest","params":[1]}"#,
+            r#"{"method":"anvil_tempoRotateConsensusIdentity","params":[1]}"#,
+        ] {
+            assert!(serde_json::from_str::<EthRequest>(request).is_err(), "{request}");
+        }
+    }
+
+    #[test]
+    fn test_tempo_consensus_pubsub_requests() {
+        for request in [
+            serde_json::json!({ "method": "consensus_subscribe", "params": [] }),
+            serde_json::json!({ "method": "consensus_subscribe", "params": null }),
+            serde_json::json!({ "method": "consensus_subscribe" }),
+            serde_json::json!({ "method": "consensus_unsubscribe", "params": ["0x1234"] }),
+        ] {
+            let call = serde_json::from_value::<EthRpcCall>(request).unwrap();
+            assert!(matches!(call, EthRpcCall::PubSub(_)));
+        }
+
+        for request in [
+            serde_json::json!({ "method": "consensus_subscribe", "params": [1] }),
+            serde_json::json!({ "method": "consensus_subscribe", "params": ["finalized"] }),
+            serde_json::json!({ "method": "consensus_subscribe", "params": { "type": "finalized" } }),
+            serde_json::json!({ "method": "consensus_unsubscribe", "params": [] }),
+            serde_json::json!({ "method": "consensus_unsubscribe", "params": ["0x1", "0x2"] }),
+        ] {
+            assert!(serde_json::from_value::<EthRpcCall>(request).is_err());
+        }
     }
 }

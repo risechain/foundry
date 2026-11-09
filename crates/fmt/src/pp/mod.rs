@@ -415,6 +415,7 @@ impl Printer {
                 IndentStyle::Block { offset } => {
                     usize::try_from(self.indent as isize + offset).unwrap()
                 }
+                IndentStyle::Visual if self.out.ends_with('\n') => self.pending_indentation,
                 IndentStyle::Visual => (self.margin - self.space) as usize,
             };
         } else {
@@ -464,9 +465,7 @@ impl Printer {
             self.pending_indentation = usize::try_from(indent).expect("negative indentation");
             self.space = cmp::max(self.margin - indent, MIN_SPACE);
             if let Some(post_break) = token.post_break {
-                self.print_indent();
-                self.out.push_str(post_break);
-                self.space -= post_break.len() as isize;
+                self.print_string(post_break);
             }
         }
     }

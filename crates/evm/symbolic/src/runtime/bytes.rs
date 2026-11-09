@@ -31,7 +31,7 @@ impl SymBytes {
     }
 
     pub(crate) fn empty(cx: &mut SymCx) -> Self {
-        Self::from_kind(cx, SymBytesKind::Concrete(Vec::new()))
+        Self::concrete(cx, Vec::new())
     }
 
     pub(crate) fn concrete(cx: &mut SymCx, bytes: Vec<u8>) -> Self {
@@ -202,7 +202,12 @@ impl SymBytes {
         if len == 0 {
             return Self::empty(cx);
         }
-        if offset == 0 && len == self.len() {
+        let self_len = self.len();
+        // Bytes past the end read as zero; this also keeps `offset + idx` below from overflowing.
+        if offset >= self_len {
+            return Self::concrete(cx, vec![0; len]);
+        }
+        if offset == 0 && len == self_len {
             return self.clone();
         }
         match self.kind() {
@@ -278,6 +283,9 @@ impl SymBytes {
     }
 
     pub(crate) fn word_at(&self, cx: &mut SymCx, offset: usize) -> SymExpr {
+        if offset >= self.len() {
+            return SymExpr::zero(cx);
+        }
         if let Some(word) = self.word_fragment_at(cx, offset, 32, 0) {
             return word;
         }
@@ -322,6 +330,9 @@ impl SymBytes {
     pub(crate) fn right_aligned_word(&self, cx: &mut SymCx, offset: usize, len: usize) -> SymExpr {
         debug_assert!(len <= 32);
         let len = len.min(32);
+        if offset >= self.len() {
+            return SymExpr::zero(cx);
+        }
         if let Some(word) = self.word_fragment_at(cx, offset, len, 32 - len) {
             return word;
         }
@@ -427,6 +438,50 @@ impl SymBytes {
         let expr = SymExpr::binop(cx, SymBinOp::And, expr, mask);
         let dst_trailing_bits = SymExpr::constant(cx, U256::from(dst_trailing_bits));
         Some(SymExpr::binop(cx, SymBinOp::Shl, expr, dst_trailing_bits))
+    }
+
+    /// Returns `true` if the observable bytes depend on an unresolved `GAS` / `gasleft()` value.
+    ///
+    /// Only the represented byte range is inspected: bytes of a backing value that a slice or a
+    /// `max_size` bound excludes are never reachable and do not taint the result. A gas-dependent
+    /// slice offset or dynamic size always taints, because the byte layout itself would then
+    /// depend on gas.
+    pub(crate) fn contains_gasleft(&self, cx: &mut SymCx) -> bool {
+        if self.shape_depends_on_gasleft() {
+            return true;
+        }
+        // Fast structural pre-check: without a gas-dependent backing value nothing can be tainted.
+        if !self.backing_contains_gasleft() {
+            return false;
+        }
+        (0..self.len()).any(|offset| self.byte(cx, offset).contains_gasleft())
+    }
+
+    /// Returns `true` if a slice offset or dynamic size anywhere in the tree mentions `gasleft()`.
+    fn shape_depends_on_gasleft(&self) -> bool {
+        match self.kind() {
+            SymBytesKind::Concrete(_) | SymBytesKind::Exprs(_) | SymBytesKind::Word(_) => false,
+            SymBytesKind::Concat(parts) => parts.iter().any(Self::shape_depends_on_gasleft),
+            SymBytesKind::Slice { bytes, offset, .. } => {
+                offset.contains_gasleft() || bytes.shape_depends_on_gasleft()
+            }
+            SymBytesKind::Sized { bytes, size, .. } => {
+                size.contains_gasleft() || bytes.shape_depends_on_gasleft()
+            }
+        }
+    }
+
+    /// Returns `true` if any backing value, observable or not, mentions `gasleft()`.
+    fn backing_contains_gasleft(&self) -> bool {
+        match self.kind() {
+            SymBytesKind::Concrete(_) => false,
+            SymBytesKind::Exprs(bytes) => bytes.iter().any(SymExpr::contains_gasleft),
+            SymBytesKind::Word(word) => word.contains_gasleft(),
+            SymBytesKind::Concat(parts) => parts.iter().any(Self::backing_contains_gasleft),
+            SymBytesKind::Slice { bytes, .. } | SymBytesKind::Sized { bytes, .. } => {
+                bytes.backing_contains_gasleft()
+            }
+        }
     }
 
     pub(crate) fn materialize(&self, cx: &mut SymCx) -> Vec<SymExpr> {

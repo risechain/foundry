@@ -6,13 +6,12 @@ use crate::{
 };
 use alloy_dyn_abi::FunctionExt;
 use alloy_json_abi::{Function, InternalType, JsonAbi};
-use alloy_network::{AnyNetwork, Network, TransactionBuilder};
+use alloy_network::{AnyNetwork, Network};
 use alloy_primitives::{
     Address, Bytes,
     map::{HashMap, HashSet},
 };
 use alloy_provider::Provider;
-use alloy_rpc_types::TransactionInputKind;
 use eyre::{OptionExt, Result};
 use foundry_cheatcodes::Wallets;
 use foundry_cli::utils::{ensure_clean_constructor, needs_setup};
@@ -21,14 +20,12 @@ use foundry_common::{
     fmt::{format_token, format_token_raw},
     provider::ProviderBuilder,
 };
+use foundry_compilers::multi::MultiCompilerLanguage;
 use foundry_config::{Chain, NamedChain};
-use foundry_debugger::Debugger;
-#[cfg(feature = "monad")]
-use foundry_evm::hardforks::MonadHardfork;
+use foundry_debugger::DebuggerBuilder;
 use foundry_evm::{
     core::evm::FoundryEvmNetwork,
     decode::decode_console_logs,
-    hardforks::{ExecutionSpec, TempoHardfork},
     inspectors::cheatcodes::BroadcastableTransactions,
     traces::{
         CallTraceDecoder, CallTraceDecoderBuilder, DebugTraceIdentifier, TraceKind,
@@ -334,19 +331,9 @@ impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
     async fn prepare_simulation_inner(self, silent: bool) -> Result<PreSimulationState<FEN>> {
         let returns = self.get_returns()?;
 
-        let mut txs: BroadcastableTransactions<FEN::Network> =
-            self.execution_result.transactions.clone().unwrap_or_default();
-
-        // Ensure that unsigned transactions have both `data` and `input` populated to avoid
-        // issues with eth_estimateGas and eth_sendTransaction requests.
-        for tx in &mut txs {
-            if let Some(req) = tx.transaction.as_unsigned_mut()
-                && let Some(input) = req.input().cloned()
-            {
-                *req = req.clone().with_input_kind(input, TransactionInputKind::Both);
-            }
-        }
-        let mut rpc_data = RpcData::from_transactions(&txs);
+        let mut rpc_data = RpcData::from_transactions(
+            self.execution_result.transactions.as_ref().unwrap_or(&Default::default()),
+        );
         if let Some(identity) = &self.script_config.evm_opts.fork_endpoint
             && rpc_data.total_rpcs.contains(&identity.endpoint)
         {
@@ -455,22 +442,17 @@ pub(crate) fn build_trace_decoder_for_context<FEN: FoundryEvmNetwork>(
     let mut tracing = script_config.config.tracing.clone();
     tracing.labels.extend(execution_result.labeled_addresses.clone());
 
-    #[cfg_attr(not(feature = "monad"), allow(unused_mut))]
-    let mut builder = CallTraceDecoderBuilder::new()
+    let builder = CallTraceDecoderBuilder::new()
         .with_tracing_config(&tracing)
         .with_known_contracts(known_contracts)
         .with_signature_identifier(SignaturesIdentifier::from_config(&script_config.config)?)
         .with_networks(script_config.config.networks)
         .with_chain_id(chain_id.map(|chain| chain.id()))
-        .with_tempo_hardfork(resolved_hardfork.and_then(TempoHardfork::from_foundry_hardfork));
-    #[cfg(feature = "monad")]
-    {
-        builder = builder
-            .with_monad_hardfork(resolved_hardfork.and_then(MonadHardfork::from_foundry_hardfork));
-    }
+        .with_hardfork(resolved_hardfork);
     let mut decoder = builder.build();
 
-    if tracing.decode_internal {
+    // The debugger resolves frame identities before decoding internal calls.
+    if tracing.decode_internal && !args.debug {
         decoder.debug_identifier = Some(DebugTraceIdentifier::new(sources.clone()));
     }
 
@@ -617,28 +599,23 @@ impl<FEN: FoundryEvmNetwork> PreSimulationState<FEN> {
     }
 
     pub fn run_debugger(self) -> Result<()> {
-        self.create_debugger().try_run_tui()?;
-        Ok(())
+        self.create_debugger()?.run(None)
     }
 
     pub fn dump_debugger(self, path: &Path) -> Result<()> {
-        self.create_debugger().dump_to_file(path)?;
-        Ok(())
+        self.create_debugger()?.run(Some(path))
     }
 
-    fn create_debugger(self) -> Debugger {
-        Debugger::builder()
-            .traces(
-                self.execution_result
-                    .traces
-                    .into_iter()
-                    .filter(|(t, _)| t.is_execution())
-                    .collect(),
-            )
+    fn create_debugger(self) -> Result<DebuggerBuilder> {
+        let mut sources = self.build_data.sources;
+        sources.insert_compiled_sources(
+            &self.script_config.config.project_paths::<MultiCompilerLanguage>().build_infos,
+        );
+        Ok(DebuggerBuilder::new()
+            .traces(self.execution_result.traces)
             .decoder(&self.execution_artifacts.decoder)
-            .sources(self.build_data.sources)
-            .breakpoints(self.execution_result.breakpoints)
-            .layout(self.args.debug_layout.unwrap_or_default())
-            .build()
+            .known_contracts(&self.build_data.known_contracts)
+            .sources(sources)
+            .breakpoints(self.execution_result.breakpoints))
     }
 }

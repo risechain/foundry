@@ -8,6 +8,8 @@ use foundry_config::{
     cache::StorageCachingConfig, fs_permissions::FsAccessKind,
 };
 use foundry_evm_core::opts::EvmOpts;
+use foundry_evm_traces::identifier::ExternalIdentifierConfig;
+use itertools::Itertools;
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -54,6 +56,15 @@ pub struct CheatsConfig {
     /// If Some, `vm.getDeployedCode` invocations are validated to be in scope of this list.
     /// If None, no validation is performed.
     pub available_artifacts: Option<ContractsByArtifact>,
+    /// Artifacts used to resolve cheatcode artifact references.
+    /// Unlike `available_artifacts`, this is retained when artifact safety checks are disabled.
+    pub artifact_lookup: Option<ContractsByArtifact>,
+    /// Whether to decode the storage layouts of contracts outside the local project in state
+    /// diffs, by fetching their verified source code from a block explorer.
+    pub decode_external_storage: bool,
+    /// Settings for looking contracts up on block explorers, resolved lazily against the chain a
+    /// test is running on: a `vm.createSelectFork` can change it after this config was built.
+    pub external_sources: ExternalIdentifierConfig,
     /// Currently running artifact.
     pub running_artifact: Option<ArtifactId>,
     /// Whether to enable legacy (non-reverting) assertions.
@@ -76,7 +87,8 @@ impl CheatsConfig {
         let rpc_endpoints = config.rpc_endpoints.clone().resolved();
         trace!(?rpc_endpoints, "using resolved rpc endpoints");
 
-        // If user explicitly disabled safety checks, do not set available_artifacts
+        let artifact_lookup = available_artifacts.clone();
+        // If user explicitly disabled safety checks, do not set available_artifacts.
         let available_artifacts =
             if config.unchecked_cheatcode_artifacts { None } else { available_artifacts };
         let mut labels = config.labels.clone();
@@ -100,6 +112,9 @@ impl CheatsConfig {
             evm_opts,
             labels,
             available_artifacts,
+            artifact_lookup,
+            decode_external_storage: config.decode_external_storage,
+            external_sources: ExternalIdentifierConfig::new(config),
             running_artifact,
             assertions_revert: config.assertions_revert,
             seed: config.fuzz.seed,
@@ -112,7 +127,7 @@ impl CheatsConfig {
         let mut cloned = Self::new(
             config,
             evm_opts,
-            self.available_artifacts.clone(),
+            self.artifact_lookup.clone().or_else(|| self.available_artifacts.clone()),
             self.running_artifact.clone(),
             self.batch_rewrite_creates,
         );
@@ -186,6 +201,8 @@ impl CheatsConfig {
     /// corresponding URL of that alias. otherwise this assumes `url_or_alias` is itself a URL
     /// if it starts with a `http` or `ws` scheme.
     ///
+    /// A URL that configured entries resolve to keeps their settings when the entries agree.
+    ///
     /// If the url is a path to an existing file, it is also considered a valid RPC URL, IPC path.
     ///
     /// # Errors
@@ -193,9 +210,25 @@ impl CheatsConfig {
     ///  - Returns an error if `url_or_alias` is a known alias but references an unresolved env var.
     ///  - Returns an error if `url_or_alias` is not an alias but does not start with a `http` or
     ///    `ws` `scheme` and is not a path to an existing file
+    ///  - Returns an error if network access is disabled.
     pub fn rpc_endpoint(&self, url_or_alias: &str) -> Result<ResolvedRpcEndpoint> {
+        // Every cheatcode that opens a connection to a URL or alias resolves it here.
+        if self.evm_opts.no_network {
+            return Err(fmt_err!("network access is disabled"));
+        }
         if let Some(endpoint) = self.rpc_endpoints.get(url_or_alias) {
             Ok(endpoint.clone().try_resolve())
+        } else if let Ok(endpoint) = self
+            .rpc_endpoints
+            .values()
+            .map(|endpoint| endpoint.clone().try_resolve())
+            .filter(|endpoint| endpoint.endpoint.as_ref().is_ok_and(|url| url == url_or_alias))
+            .all_equal_value()
+        {
+            // A URL that entries resolve to, such as one `vm.rpcUrl` returns, keeps their settings
+            // when they agree. Entries are resolved again, as `vm.rpcUrl` does, so an env var set
+            // during the run matches too.
+            Ok(endpoint)
         } else if let Some(builtin_url) = foundry_config::builtin_rpc_url(url_or_alias) {
             let url = RpcEndpointUrl::Url(builtin_url.to_string());
             Ok(RpcEndpoint::new(url).resolve())
@@ -244,6 +277,9 @@ impl Default for CheatsConfig {
             evm_opts: Default::default(),
             labels: Default::default(),
             available_artifacts: Default::default(),
+            artifact_lookup: Default::default(),
+            decode_external_storage: false,
+            external_sources: Default::default(),
             running_artifact: Default::default(),
             assertions_revert: true,
             seed: None,
@@ -272,9 +308,10 @@ fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use alloy_primitives::address;
-    use foundry_config::fs_permissions::PathPermission;
+    use alloy_primitives::Address;
+    use foundry_config::{RpcEndpoints, fs_permissions::PathPermission};
     use tempfile::TempDir;
 
     fn config(root: &Path, fs_permissions: FsPermissions) -> CheatsConfig {
@@ -314,8 +351,39 @@ mod tests {
     }
 
     #[test]
+    fn unchecked_artifacts_retain_lookup_without_validation() {
+        let config = Config { unchecked_cheatcode_artifacts: true, ..Default::default() };
+        let cheats = CheatsConfig::new(
+            &config,
+            Default::default(),
+            Some(ContractsByArtifact::default()),
+            None,
+            false,
+        );
+
+        assert!(cheats.available_artifacts.is_none());
+        assert!(cheats.artifact_lookup.is_some());
+
+        let cloned = cheats.clone_with(&config, Default::default());
+        assert!(cloned.available_artifacts.is_none());
+        assert!(cloned.artifact_lookup.is_some());
+    }
+
+    #[test]
+    fn clone_with_preserves_available_artifacts_without_lookup() {
+        let cheats = CheatsConfig {
+            available_artifacts: Some(ContractsByArtifact::default()),
+            ..Default::default()
+        };
+
+        let cloned = cheats.clone_with(&Config::default(), Default::default());
+        assert!(cloned.available_artifacts.is_some());
+        assert!(cloned.artifact_lookup.is_some());
+    }
+
+    #[test]
     fn tracing_labels_override_legacy_labels() {
-        let address = address!("0x0000000000000000000000000000000000000001");
+        let address = Address::with_last_byte(1);
         let mut config = Config::default();
         config.labels.insert(address, "legacy".to_string());
         config.tracing.labels.insert(address, "canonical".to_string());
@@ -338,5 +406,41 @@ mod tests {
 
         let f = root.join("lib/other/foundry.toml");
         assert!(!config.is_foundry_toml(f));
+    }
+
+    #[test]
+    fn test_rpc_endpoint_url_keeps_entry_config() {
+        let mut endpoint = RpcEndpoint::new(RpcEndpointUrl::Url("http://127.0.0.1:18429".into()));
+        endpoint.config.retries = Some(2);
+        endpoint.config.retry_backoff = Some(100);
+        let shared = || RpcEndpoint::new(RpcEndpointUrl::Url("http://127.0.0.1:18430".into()));
+        let mut retrying = shared();
+        retrying.config.retries = Some(5);
+        let mut same = RpcEndpoint::new(RpcEndpointUrl::Url("http://127.0.0.1:18431".into()));
+        same.config.retries = Some(3);
+        let config = Config {
+            rpc_endpoints: RpcEndpoints::new([
+                ("stub", endpoint),
+                ("plain", shared()),
+                ("retrying", retrying),
+                ("same_a", same.clone()),
+                ("same_b", same),
+            ]),
+            ..Default::default()
+        };
+        let config = CheatsConfig::new(&config, Default::default(), None, None, false);
+        let settings = |url_or_alias| {
+            let config = config.rpc_endpoint(url_or_alias).unwrap().config;
+            (config.retries, config.retry_backoff)
+        };
+
+        assert_eq!(settings("stub"), (Some(2), Some(100)));
+        assert_eq!(settings("http://127.0.0.1:18429"), (Some(2), Some(100)));
+        // Two entries with different settings resolve to this URL, so neither applies.
+        assert_eq!(settings("http://127.0.0.1:18430"), (None, None));
+        assert_eq!(settings("retrying"), (Some(5), None));
+        // Two entries with the same settings resolve to this URL, so they apply.
+        assert_eq!(settings("http://127.0.0.1:18431"), (Some(3), None));
+        assert_eq!(settings("http://127.0.0.1:18432"), (None, None));
     }
 }

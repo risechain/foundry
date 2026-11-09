@@ -1,8 +1,8 @@
 use super::{
     FailureKey, InvariantFailureMetrics, InvariantFailures, InvariantFuzzError,
-    InvariantFuzzTestResult, InvariantMetrics,
+    InvariantFuzzTestResult, InvariantMetrics, LiveInvariantSolver,
 };
-use crate::executors::{EarlyExit, EvmExecutionCancellation, corpus::CampaignCorpusEntry};
+use crate::executors::{EarlyExit, EvmExecutionCancellation};
 use alloy_primitives::{Address, I256, Selector};
 use eyre::{Result, ensure};
 use foundry_evm_coverage::HitMaps;
@@ -81,6 +81,7 @@ pub struct InvariantCampaignState {
     cancellation: EvmExecutionCancellation,
     last_metrics_report: Mutex<Instant>,
     failure_metrics: Mutex<CampaignFailureMetrics>,
+    pub(super) live_solver: Option<Mutex<LiveInvariantSolver>>,
 }
 
 #[derive(Default)]
@@ -108,6 +109,7 @@ impl InvariantCampaignState {
             ),
             last_metrics_report: Mutex::new(started_at),
             failure_metrics: Mutex::new(CampaignFailureMetrics::default()),
+            live_solver: None,
         }
     }
 
@@ -143,6 +145,20 @@ impl InvariantCampaignState {
 
     pub fn request_terminal_stop(&self) {
         self.cancellation.request_stop();
+    }
+
+    /// Returns whether fail-fast or Ctrl-C stopped the campaign before its timeout or
+    /// `planned_runs`.
+    ///
+    /// The deadline and terminal failures latch the campaign stop flag, while early exit does not,
+    /// so a timed campaign without a latched stop was interrupted.
+    pub fn interrupted(&self, runs: usize, planned_runs: u32) -> bool {
+        self.early_exit().should_stop()
+            && if self.timed {
+                !self.cancellation.stop_requested()
+            } else {
+                runs < planned_runs as usize
+            }
     }
 
     pub fn should_emit_metrics_report(&self, interval: Duration) -> bool {
@@ -206,13 +222,12 @@ impl InvariantCampaignState {
 pub struct InvariantWorkerOutput {
     pub plan: InvariantWorkerPlan,
     pub result: InvariantFuzzTestResult,
-    pub corpus_entries: Vec<CampaignCorpusEntry>,
 }
 
 impl InvariantWorkerOutput {
     #[cfg(test)]
     pub const fn new(plan: InvariantWorkerPlan, result: InvariantFuzzTestResult) -> Self {
-        Self { plan, result, corpus_entries: Vec::new() }
+        Self { plan, result }
     }
 }
 
@@ -246,14 +261,10 @@ impl InvariantCampaignAggregator {
     /// Validates the collected worker ranges and folds them into one logical campaign result.
     #[cfg(test)]
     pub fn finish(self) -> Result<InvariantFuzzTestResult> {
-        Ok(self.finish_with_corpus_entries()?.0)
+        self.finish_campaign()
     }
 
-    /// Validates the collected worker ranges and folds them into one logical campaign result with
-    /// corpus artifacts selected in logical worker order.
-    pub fn finish_with_corpus_entries(
-        mut self,
-    ) -> Result<(InvariantFuzzTestResult, Vec<CampaignCorpusEntry>)> {
+    pub fn finish_campaign(mut self) -> Result<InvariantFuzzTestResult> {
         ensure!(!self.outputs.is_empty(), "missing invariant worker output");
 
         self.outputs.sort_by_key(|output| output.plan.first_global_run);
@@ -267,9 +278,7 @@ impl InvariantCampaignAggregator {
     /// worker may have completed fewer than its assigned runs, so the original static ranges can
     /// contain gaps. The merge still validates worker identity and preserves deterministic worker
     /// order, but final run count is derived from the completed worker counters.
-    pub fn finish_partial_with_corpus_entries(
-        mut self,
-    ) -> Result<(InvariantFuzzTestResult, Vec<CampaignCorpusEntry>)> {
+    pub fn finish_partial(mut self) -> Result<InvariantFuzzTestResult> {
         ensure!(!self.outputs.is_empty(), "missing invariant worker output");
 
         self.outputs.sort_by_key(|output| output.plan.first_global_run);
@@ -278,9 +287,7 @@ impl InvariantCampaignAggregator {
     }
 }
 
-fn fold_outputs(
-    outputs: Vec<InvariantWorkerOutput>,
-) -> Result<(InvariantFuzzTestResult, Vec<CampaignCorpusEntry>)> {
+fn fold_outputs(outputs: Vec<InvariantWorkerOutput>) -> Result<InvariantFuzzTestResult> {
     let workers = outputs.len();
     let mut errors = HashMap::default();
     let mut handler_errors = HashMap::default();
@@ -292,11 +299,10 @@ fn fold_outputs(
     let mut line_coverage = None;
     let mut metrics = HashMap::default();
     let mut cpu_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();
-    let mut corpus_entries = Vec::new();
     let mut failed_corpus_replays = 0;
     let mut optimization_best = None;
 
-    for InvariantWorkerOutput { plan, result, corpus_entries: worker_entries } in outputs {
+    for InvariantWorkerOutput { plan, result } in outputs {
         if plan.worker_id == 0 {
             failed_corpus_replays = result.failed_corpus_replays;
         }
@@ -304,7 +310,6 @@ fn fold_outputs(
             errors.entry(invariant).or_insert(error);
         }
         merge_handler_errors(&mut handler_errors, result.handler_errors);
-        corpus_entries.extend(worker_entries);
         runs += result.runs;
         calls += result.calls;
         reverts += result.reverts;
@@ -323,24 +328,21 @@ fn fold_outputs(
     }
     let (optimization_best_value, optimization_best_sequence) =
         optimization_best.map(|(value, sequence)| (Some(value), sequence)).unwrap_or_default();
-    Ok((
-        InvariantFuzzTestResult::new(
-            errors,
-            handler_errors,
-            runs,
-            calls,
-            reverts,
-            last_run_inputs,
-            gas_report_traces,
-            line_coverage,
-            metrics,
-            cpu_snapshots,
-            failed_corpus_replays,
-            workers,
-            optimization_best_value,
-            optimization_best_sequence,
-        ),
-        corpus_entries,
+    Ok(InvariantFuzzTestResult::new(
+        errors,
+        handler_errors,
+        runs,
+        calls,
+        reverts,
+        last_run_inputs,
+        gas_report_traces,
+        line_coverage,
+        metrics,
+        cpu_snapshots,
+        failed_corpus_replays,
+        workers,
+        optimization_best_value,
+        optimization_best_sequence,
     ))
 }
 
@@ -452,8 +454,8 @@ mod tests {
     use alloy_primitives::{B256, Bytes};
     use foundry_evm_coverage::HitMap;
     use foundry_evm_fuzz::CallDetails;
+    use foundry_evm_traces::CallTraceArena;
     use proptest::test_runner::TestError;
-    use revm_inspectors::tracing::CallTraceArena;
 
     fn empty_result(reverts: usize, failed_corpus_replays: usize) -> InvariantFuzzTestResult {
         InvariantFuzzTestResult::new(
@@ -649,6 +651,24 @@ mod tests {
         assert_eq!(state.throughput_totals(), (2, 50));
         assert_eq!(state.increment_runs(), 1);
         assert_eq!(state.total_runs(), 1);
+    }
+
+    #[test]
+    fn campaign_state_reports_early_exit_before_completion_as_interrupted() {
+        let early_exit = EarlyExit::new(true);
+        let untimed = InvariantCampaignState::new(early_exit.clone(), None);
+        let timed = InvariantCampaignState::new(early_exit.clone(), Some(3600));
+        let expired = InvariantCampaignState::new(early_exit.clone(), Some(0));
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(expired.should_stop());
+        assert!(!untimed.interrupted(4, 100));
+        assert!(!timed.interrupted(4, 100));
+
+        early_exit.record_failure();
+        assert!(untimed.interrupted(4, 100));
+        assert!(!untimed.interrupted(100, 100));
+        assert!(timed.interrupted(100, 100));
+        assert!(!expired.interrupted(4, 100));
     }
 
     #[test]
@@ -877,12 +897,11 @@ mod tests {
             result_with_counts(1, 10, true, 0),
         ));
 
-        let (result, corpus_entries) = partial.finish_partial_with_corpus_entries().unwrap();
+        let result = partial.finish_partial().unwrap();
 
         assert_eq!(result.runs, 3);
         assert_eq!(result.calls, 30);
         assert_eq!(result.failed_corpus_replays, 5);
-        assert!(corpus_entries.is_empty());
     }
 
     #[test]

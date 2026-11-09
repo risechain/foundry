@@ -12,7 +12,14 @@ use alloy_primitives::{
 use alloy_rlp::Encodable;
 use anvil_core::eth::transaction::PendingTransaction;
 use parking_lot::RwLock;
-use std::{cmp::Ordering, collections::BTreeSet, fmt, str::FromStr, sync::Arc, time::Instant};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+    sync::Arc,
+    time::Instant,
+};
 
 /// A unique identifying marker for a transaction
 pub type TxMarker = Vec<u8>;
@@ -20,14 +27,6 @@ pub type TxMarker = Vec<u8>;
 /// Result type for replaced transactions: the replaced pool transactions and the hashes they
 /// unlock.
 type ReplacedTransactions<T> = (Vec<Arc<PoolTransaction<T>>>, Vec<TxHash>);
-
-/// creates an unique identifier for aan (`nonce` + `Address`) combo
-pub fn to_marker(nonce: u64, from: Address) -> TxMarker {
-    let mut data = [0u8; 28];
-    data[..8].copy_from_slice(&nonce.to_le_bytes()[..]);
-    data[8..].copy_from_slice(&from.0[..]);
-    data.to_vec()
-}
 
 /// Modes that determine the transaction ordering of the mempool
 ///
@@ -40,6 +39,9 @@ pub enum TransactionOrder {
     /// determined by their internal id
     Fifo,
     /// This means that it prioritizes transactions based on the fees paid to the miner.
+    ///
+    /// Transactions are ranked by their effective miner tip at the base fee of the block being
+    /// built.
     #[default]
     Fees,
 }
@@ -49,7 +51,10 @@ impl TransactionOrder {
     pub fn priority<T: Transaction>(&self, tx: &T) -> TransactionPriority {
         match self {
             Self::Fifo => TransactionPriority::default(),
-            Self::Fees => TransactionPriority(tx.max_fee_per_gas()),
+            Self::Fees => TransactionPriority {
+                max_fee_per_gas: tx.max_fee_per_gas(),
+                max_priority_fee_per_gas: tx.max_priority_fee_per_gas(),
+            },
         }
     }
 }
@@ -73,7 +78,19 @@ impl FromStr for TransactionOrder {
 /// The `TransactionPriority` determines the ordering of two transactions that have all their
 /// markers satisfied.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TransactionPriority(pub u128);
+pub struct TransactionPriority {
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: Option<u128>,
+}
+
+impl TransactionPriority {
+    /// Returns the effective miner tip at the given base fee, see
+    /// [`Transaction::effective_tip_per_gas`].
+    fn effective_tip(&self, base_fee: u64) -> u128 {
+        let fee = self.max_fee_per_gas.saturating_sub(base_fee as u128);
+        self.max_priority_fee_per_gas.map_or(fee, |tip| fee.min(tip))
+    }
+}
 
 /// Internal Transaction type
 #[derive(Clone, PartialEq, Eq)]
@@ -98,7 +115,7 @@ impl<T> PoolTransaction<T> {
             pending_transaction: transaction,
             requires: vec![],
             provides: vec![],
-            priority: TransactionPriority(0),
+            priority: TransactionPriority { max_fee_per_gas: 0, max_priority_fee_per_gas: None },
             is_replay: false,
         }
     }
@@ -155,7 +172,7 @@ where
             pending_transaction,
             requires: vec![],
             provides: vec![],
-            priority: TransactionPriority(0),
+            priority: TransactionPriority::default(),
             is_replay: false,
         })
     }
@@ -185,6 +202,15 @@ impl<T> Default for PendingTransactions<T> {
 }
 
 impl<T> PendingTransactions<T> {
+    /// Returns an independent snapshot of the pending transactions.
+    pub(super) fn snapshot(&self) -> Self {
+        Self {
+            required_markers: self.required_markers.clone(),
+            waiting_markers: self.waiting_markers.clone(),
+            waiting_queue: self.waiting_queue.clone(),
+        }
+    }
+
     /// Returns the number of transactions that are currently waiting
     pub fn len(&self) -> usize {
         self.waiting_queue.len()
@@ -254,12 +280,10 @@ impl<T> PendingTransactions<T> {
             if let Some(waiting_tx) = self.waiting_queue.remove(&hash) {
                 self.waiting_markers.remove(&waiting_tx.transaction.provides);
                 for marker in waiting_tx.missing_markers {
-                    let remove = if let Some(required) = self.required_markers.get_mut(&marker) {
+                    let remove = self.required_markers.get_mut(&marker).is_some_and(|required| {
                         required.remove(&hash);
                         required.is_empty()
-                    } else {
-                        false
-                    };
+                    });
                     if remove {
                         self.required_markers.remove(&marker);
                     }
@@ -268,6 +292,44 @@ impl<T> PendingTransactions<T> {
             }
         }
         removed
+    }
+
+    /// Removes transactions and their transitive dependents from the waiting pool.
+    pub fn remove_with_dependents(
+        &mut self,
+        hashes: Vec<TxHash>,
+        invalidated: impl IntoIterator<Item = TxMarker>,
+    ) -> Vec<Arc<PoolTransaction<T>>> {
+        let mut required_by = HashMap::<TxMarker, Vec<TxHash>>::default();
+        for (hash, tx) in &self.waiting_queue {
+            for marker in &tx.transaction.requires {
+                required_by.entry(marker.clone()).or_default().push(*hash);
+            }
+        }
+
+        let mut to_remove = HashSet::<TxHash>::default();
+        let mut markers = invalidated.into_iter().collect::<Vec<_>>();
+        for hash in hashes {
+            if to_remove.insert(hash)
+                && let Some(tx) = self.waiting_queue.get(&hash)
+            {
+                markers.extend(tx.transaction.provides.iter().cloned());
+            }
+        }
+
+        while let Some(marker) = markers.pop() {
+            if let Some(dependents) = required_by.remove(&marker) {
+                for hash in dependents {
+                    if to_remove.insert(hash)
+                        && let Some(tx) = self.waiting_queue.get(&hash)
+                    {
+                        markers.extend(tx.transaction.provides.iter().cloned());
+                    }
+                }
+            }
+        }
+
+        self.remove(to_remove.into_iter().collect())
     }
 }
 
@@ -280,7 +342,7 @@ impl<T: Transaction> PendingTransactions<T> {
             "transaction is already added"
         );
 
-        if let Some(replace) = self
+        let replaced_hash = if let Some(replace) = self
             .waiting_markers
             .get(&tx.transaction.provides)
             .and_then(|hash| self.waiting_queue.get(hash))
@@ -290,6 +352,13 @@ impl<T: Transaction> PendingTransactions<T> {
                 warn!(target: "txpool", "pending replacement transaction underpriced [{:?}]", tx.transaction.hash());
                 return Err(PoolError::ReplacementUnderpriced(tx.transaction.hash()));
             }
+            Some(replace.transaction.hash())
+        } else {
+            None
+        };
+        // Remove old markers before inserting the replacement, which shares their keys.
+        if let Some(replaced_hash) = replaced_hash {
+            self.remove(vec![replaced_hash]);
         }
 
         // add all missing markers
@@ -307,13 +376,22 @@ impl<T: Transaction> PendingTransactions<T> {
 }
 
 /// A transaction in the pool
-#[derive(Clone)]
 pub struct PendingPoolTransaction<T> {
     pub transaction: Arc<PoolTransaction<T>>,
     /// markers required and have not been satisfied yet by other transactions in the pool
     pub missing_markers: HashSet<TxMarker>,
     /// timestamp when the tx was added
     pub added_at: Instant,
+}
+
+impl<T> Clone for PendingPoolTransaction<T> {
+    fn clone(&self) -> Self {
+        Self {
+            transaction: Arc::clone(&self.transaction),
+            missing_markers: self.missing_markers.clone(),
+            added_at: self.added_at,
+        }
+    }
 }
 
 impl<T> PendingPoolTransaction<T> {
@@ -359,17 +437,25 @@ impl<T: fmt::Debug> fmt::Debug for PendingPoolTransaction<T> {
 pub struct TransactionsIterator<T> {
     all: HashMap<TxHash, ReadyTransaction<T>>,
     awaiting: HashMap<TxHash, (usize, PoolTransactionRef<T>)>,
-    independent: BTreeSet<PoolTransactionRef<T>>,
+    /// Independent transactions keyed by their effective tip at `base_fee`, then arrival order.
+    independent: BTreeMap<(u128, Reverse<u64>), PoolTransactionRef<T>>,
+    base_fee: u64,
     _invalid: HashSet<TxHash>,
 }
 
 impl<T> TransactionsIterator<T> {
+    /// Adds an independent transaction ranked at the iterator's base fee.
+    fn insert_independent(&mut self, tx_ref: PoolTransactionRef<T>) {
+        let tip = tx_ref.transaction.priority.effective_tip(self.base_fee);
+        self.independent.insert((tip, Reverse(tx_ref.id)), tx_ref);
+    }
+
     /// Depending on number of satisfied requirements insert given ref
     /// either to awaiting set or to best set.
     fn independent_or_awaiting(&mut self, satisfied: usize, tx_ref: PoolTransactionRef<T>) {
         if satisfied >= tx_ref.transaction.requires.len() {
             // If we have satisfied all deps insert to best
-            self.independent.insert(tx_ref);
+            self.insert_independent(tx_ref);
         } else {
             // otherwise we're still awaiting for some deps
             self.awaiting.insert(tx_ref.transaction.hash(), (satisfied, tx_ref));
@@ -382,8 +468,7 @@ impl<T> Iterator for TransactionsIterator<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let best = self.independent.iter().next_back()?.clone();
-            let best = self.independent.take(&best)?;
+            let (_, best) = self.independent.pop_last()?;
             let hash = best.transaction.hash();
 
             let ready =
@@ -439,14 +524,29 @@ impl<T> Default for ReadyTransactions<T> {
 }
 
 impl<T> ReadyTransactions<T> {
-    /// Returns an iterator over all transactions
-    pub fn get_transactions(&self) -> TransactionsIterator<T> {
-        TransactionsIterator {
+    /// Returns an independent snapshot of the ready transactions.
+    pub(super) fn snapshot(&self) -> Self {
+        Self {
+            id: self.id,
+            provided_markers: self.provided_markers.clone(),
+            ready_tx: Arc::new(RwLock::new(self.ready_tx.read().clone())),
+            independent_transactions: self.independent_transactions.clone(),
+        }
+    }
+
+    /// Returns an iterator over all transactions, ranked at the given base fee.
+    pub fn get_transactions(&self, base_fee: u64) -> TransactionsIterator<T> {
+        let mut iter = TransactionsIterator {
             all: self.ready_tx.read().clone(),
-            independent: self.independent_transactions.clone(),
+            independent: Default::default(),
+            base_fee,
             awaiting: Default::default(),
             _invalid: Default::default(),
+        };
+        for tx_ref in &self.independent_transactions {
+            iter.insert_independent(tx_ref.clone());
         }
+        iter
     }
 
     /// Clears the internal state
@@ -576,7 +676,7 @@ impl<T> ReadyTransactions<T> {
         while let Some(hash) = tx_hashes.pop() {
             if let Some(mut tx) = ready.remove(&hash) {
                 let invalidated = tx.transaction.transaction.provides.iter().filter(|mark| {
-                    marker_filter.as_ref().map(|filter| !filter.contains(&**mark)).unwrap_or(true)
+                    marker_filter.as_ref().is_none_or(|filter| !filter.contains(&**mark))
                 });
 
                 let mut removed_some_marks = false;
@@ -784,6 +884,14 @@ impl<T: Transaction> ReadyTransaction<T> {
     pub fn max_fee_per_gas(&self) -> u128 {
         self.transaction.transaction.max_fee_per_gas()
     }
+}
+
+/// creates an unique identifier for aan (`nonce` + `Address`) combo
+pub fn to_marker(nonce: u64, from: Address) -> TxMarker {
+    let mut data = [0u8; 28];
+    data[..8].copy_from_slice(&nonce.to_le_bytes()[..]);
+    data[8..].copy_from_slice(&from.0[..]);
+    data.to_vec()
 }
 
 #[cfg(test)]

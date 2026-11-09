@@ -15,6 +15,7 @@ use std::{
 };
 
 const FRONTIER_SCHEMA: &str = "foundry:fuzz.branch-frontiers@v1";
+const STATEFUL_FRONTIER_SCHEMA: &str = "foundry:fuzz.branch-frontiers@v2";
 pub(super) const FRONTIER_FILE: &str = "branch-frontiers.json";
 
 #[derive(Debug, Serialize)]
@@ -58,7 +59,85 @@ impl FuzzBranchFrontierArtifact {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct FuzzBranchFrontier {
+pub(in crate::executors) struct StatefulFuzzBranchFrontierArtifact {
+    /// Stable artifact schema identifier for downstream symbolic consumers.
+    schema: &'static str,
+    /// Schema version for consumers that prefer numeric dispatch.
+    version: u32,
+    /// Unix timestamp, in seconds, when the artifact was written.
+    generated_at: u64,
+    /// Invariant campaign anchor that produced the frontier records.
+    test: String,
+    /// Configured maximum number of records retained for this campaign.
+    limit: usize,
+    /// Deduplicated concrete transaction sequences referenced by frontier records.
+    #[serde(serialize_with = "serialize_sequences")]
+    sequences: Vec<StatefulFuzzSequence>,
+    /// Captured comparison frontiers.
+    frontiers: Vec<StatefulFuzzBranchFrontier>,
+}
+
+impl StatefulFuzzBranchFrontierArtifact {
+    pub(in crate::executors) fn new(
+        func: &Function,
+        limit: usize,
+        frontiers: Vec<FuzzBranchFrontier>,
+    ) -> Self {
+        let mut sequence_indexes = HashMap::<*const BasicTxDetails, usize>::default();
+        let mut sequences = Vec::<StatefulFuzzSequence>::new();
+        let mut records = Vec::with_capacity(frontiers.len());
+        for (id, frontier) in frontiers.into_iter().enumerate() {
+            let sequence_key = frontier.sequence.as_ptr();
+            let required_len = frontier.call_index + 1;
+            let sequence_index = match sequence_indexes.entry(sequence_key) {
+                Entry::Occupied(entry) => {
+                    let index = *entry.get();
+                    sequences[index].len = sequences[index].len.max(required_len);
+                    index
+                }
+                Entry::Vacant(entry) => {
+                    let index = sequences.len();
+                    entry.insert(index);
+                    sequences.push(StatefulFuzzSequence {
+                        calls: Arc::clone(&frontier.sequence),
+                        len: required_len,
+                    });
+                    index
+                }
+            };
+            records.push(StatefulFuzzBranchFrontier {
+                id: id as u64,
+                call_index: frontier.call_index,
+                sequence_index,
+                site: frontier.site,
+                operands: frontier.operands,
+            });
+        }
+
+        Self {
+            schema: STATEFUL_FRONTIER_SCHEMA,
+            version: 2,
+            generated_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_secs(),
+            test: func.signature(),
+            limit,
+            sequences,
+            frontiers: records,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StatefulFuzzSequence {
+    calls: Arc<[BasicTxDetails]>,
+    len: usize,
+}
+
+/// A concrete sequence and the comparison reached by one of its calls.
+#[derive(Clone, Debug, Serialize)]
+pub struct FuzzBranchFrontier {
     /// Unique record identifier.
     id: u64,
     /// Reproducible fuzz seed, if configured.
@@ -82,6 +161,15 @@ pub(super) struct FuzzBranchFrontier {
     /// EVM comparison site to target symbolically.
     site: FuzzBranchFrontierSite,
     /// Concrete operands observed at the site.
+    operands: FuzzBranchFrontierOperands,
+}
+
+#[derive(Debug, Serialize)]
+struct StatefulFuzzBranchFrontier {
+    id: u64,
+    call_index: usize,
+    sequence_index: usize,
+    site: FuzzBranchFrontierSite,
     operands: FuzzBranchFrontierOperands,
 }
 
@@ -118,32 +206,86 @@ impl FuzzBranchFrontierKey {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct FuzzFrontierRecorder {
+pub(in crate::executors) struct FuzzFrontierRecorder {
     limit: usize,
     frontiers: Vec<FuzzBranchFrontier>,
     indexes: HashMap<FuzzBranchFrontierKey, usize>,
+    prefer_shortest: bool,
 }
 
 impl FuzzFrontierRecorder {
-    pub(super) fn new(limit: usize) -> Self {
-        Self { limit, frontiers: Vec::with_capacity(limit.min(32)), indexes: HashMap::default() }
+    pub(in crate::executors) fn new(limit: usize) -> Self {
+        Self { limit, frontiers: Vec::with_capacity(limit.min(32)), ..Default::default() }
     }
 
-    pub(super) fn capture_stateless_call(
+    /// Prefers short live prefixes so a returned seed leaves room for a continuation.
+    pub(in crate::executors) const fn prefer_shortest_prefix(&mut self) {
+        self.prefer_shortest = true;
+    }
+
+    pub(super) fn capture_call(
         &mut self,
         run: Option<&FuzzRunMetadata>,
-        tx: &BasicTxDetails,
+        sequence: &[BasicTxDetails],
+        call_index: usize,
         cmp_values: &[CmpOperands],
         new_coverage: Option<bool>,
     ) {
         if self.limit == 0 || cmp_values.is_empty() {
             return;
         }
+        debug_assert!(call_index < sequence.len());
 
-        let mut sequence = None;
+        let mut recorded_sequence = None;
+        self.capture_comparisons(
+            run,
+            sequence,
+            call_index,
+            cmp_values,
+            new_coverage,
+            &mut recorded_sequence,
+        );
+    }
+
+    pub(in crate::executors) fn capture_sequence(
+        &mut self,
+        sequence: &[BasicTxDetails],
+        cmp_sequence: &[Vec<CmpOperands>],
+    ) {
+        if self.limit == 0 || cmp_sequence.is_empty() {
+            return;
+        }
+        debug_assert!(sequence.len() >= cmp_sequence.len());
+        let sequence = &sequence[..cmp_sequence.len()];
+
+        let mut recorded_sequence = None;
+        for (call_index, cmp_values) in cmp_sequence.iter().enumerate() {
+            self.capture_comparisons(
+                None,
+                sequence,
+                call_index,
+                cmp_values,
+                None,
+                &mut recorded_sequence,
+            );
+        }
+    }
+
+    fn capture_comparisons(
+        &mut self,
+        run: Option<&FuzzRunMetadata>,
+        sequence: &[BasicTxDetails],
+        call_index: usize,
+        cmp_values: &[CmpOperands],
+        new_coverage: Option<bool>,
+        recorded_sequence: &mut Option<Arc<[BasicTxDetails]>>,
+    ) {
+        if cmp_values.is_empty() {
+            return;
+        }
+
         let mut new_frontier = |cmp: &CmpOperands, result, operand_delta| {
-            let sequence = sequence
-                .get_or_insert_with(|| Arc::from(Vec::from([tx.clone()]).into_boxed_slice()));
+            let sequence = recorded_sequence.get_or_insert_with(|| Arc::from(sequence));
             FuzzBranchFrontier::new(
                 run,
                 Arc::clone(sequence),
@@ -151,19 +293,27 @@ impl FuzzFrontierRecorder {
                 result,
                 operand_delta,
                 new_coverage,
-                0,
+                call_index,
             )
         };
 
         for cmp in cmp_values {
-            let result = comparison_result(cmp);
+            let Some(result) = comparison_result(cmp) else { continue };
             let key = FuzzBranchFrontierKey::new(cmp, result);
             let operand_delta = operand_delta(cmp);
 
             match self.indexes.entry(key) {
                 Entry::Occupied(entry) => {
                     let index = *entry.get();
-                    if operand_delta < self.frontiers[index].operands.operand_delta {
+                    let previous = &self.frontiers[index];
+                    let replace = if self.prefer_shortest {
+                        (call_index, operand_delta)
+                            < (previous.call_index, previous.operands.operand_delta)
+                    } else {
+                        (operand_delta, call_index)
+                            < (previous.operands.operand_delta, previous.call_index)
+                    };
+                    if replace {
                         self.frontiers[index] = new_frontier(cmp, result, operand_delta);
                     }
                 }
@@ -178,12 +328,31 @@ impl FuzzFrontierRecorder {
         }
     }
 
-    pub(super) fn into_frontiers(self) -> Vec<FuzzBranchFrontier> {
+    pub(in crate::executors) fn into_frontiers(self) -> Vec<FuzzBranchFrontier> {
         self.frontiers
     }
 }
 
 impl FuzzBranchFrontier {
+    /// Returns the sequence ending at the comparison's call.
+    pub fn sequence(&self) -> &[BasicTxDetails] {
+        &self.sequence[..=self.call_index]
+    }
+
+    /// Returns the comparison operands and their observed result.
+    pub const fn comparison(&self) -> (CmpOperands, bool) {
+        (
+            CmpOperands {
+                address: self.site.address,
+                pc: self.site.pc,
+                opcode: self.site.opcode,
+                op1: self.operands.lhs,
+                op2: self.operands.rhs,
+            },
+            self.operands.result,
+        )
+    }
+
     const fn key(&self) -> FuzzBranchFrontierKey {
         FuzzBranchFrontierKey {
             address: self.site.address,
@@ -234,7 +403,7 @@ impl FuzzBranchFrontier {
 /// policy across all workers so the artifact keeps one globally closest record per site and does
 /// not spend `limit` on duplicates. Iteration continues after `limit` is reached because a later
 /// record may be a smaller-delta duplicate of an already retained key.
-pub(super) fn merge_frontiers(
+pub(in crate::executors) fn merge_frontiers(
     limit: usize,
     frontiers: impl IntoIterator<Item = FuzzBranchFrontier>,
 ) -> Vec<FuzzBranchFrontier> {
@@ -248,7 +417,11 @@ pub(super) fn merge_frontiers(
         match indexes.entry(frontier.key()) {
             Entry::Occupied(entry) => {
                 let index = *entry.get();
-                if frontier.operands.operand_delta < merged[index].operands.operand_delta {
+                let previous = &merged[index];
+                if frontier.operands.operand_delta < previous.operands.operand_delta
+                    || (frontier.operands.operand_delta == previous.operands.operand_delta
+                        && frontier.call_index < previous.call_index)
+                {
                     merged[index] = frontier;
                 }
             }
@@ -264,9 +437,9 @@ pub(super) fn merge_frontiers(
     merged
 }
 
-pub(super) fn write_frontier_artifact(
+pub(in crate::executors) fn write_frontier_artifact(
     dir: &Path,
-    artifact: &FuzzBranchFrontierArtifact,
+    artifact: &impl Serialize,
 ) -> fs::Result<()> {
     fs::create_dir_all(dir)?;
     fs::write_json_file(&dir.join(FRONTIER_FILE), artifact)
@@ -279,16 +452,28 @@ where
     Serialize::serialize(sequence.as_ref(), serializer)
 }
 
-fn comparison_result(cmp: &CmpOperands) -> bool {
-    match cmp.opcode {
+fn serialize_sequences<S>(
+    sequences: &[StatefulFuzzSequence],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.collect_seq(sequences.iter().map(|sequence| &sequence.calls[..sequence.len]))
+}
+
+/// Returns the result of a comparison opcode, or `None` for operands logged from other opcodes,
+/// such as `SUB`, which symbolic branch targets cannot match.
+pub(in crate::executors) fn comparison_result(cmp: &CmpOperands) -> Option<bool> {
+    Some(match cmp.opcode {
         opcode::EQ => cmp.op1 == cmp.op2,
         opcode::LT => cmp.op1 < cmp.op2,
         opcode::GT => cmp.op1 > cmp.op2,
         opcode::SLT => I256::from_raw(cmp.op1) < I256::from_raw(cmp.op2),
         opcode::SGT => I256::from_raw(cmp.op1) > I256::from_raw(cmp.op2),
         opcode::ISZERO => cmp.op1.is_zero(),
-        _ => false,
-    }
+        _ => return None,
+    })
 }
 
 fn operand_delta(cmp: &CmpOperands) -> U256 {
@@ -351,17 +536,18 @@ mod tests {
         };
         let cmp = CmpOperands {
             op1: U256::ZERO,
-            op2: U256::from(1),
+            op2: U256::ONE,
             pc: 1,
             address: tx.call_details.target,
             opcode: opcode::LT,
         };
         let mut recorder = FuzzFrontierRecorder::new(1);
 
-        recorder.capture_stateless_call(None, &tx, &[cmp], Some(true));
+        recorder.capture_call(None, std::slice::from_ref(&tx), 0, &[cmp], Some(true));
 
         let frontier = recorder.into_frontiers().pop().unwrap();
         assert_eq!(frontier.sequence.len(), 1);
+        assert_eq!(frontier.call_index, 0);
         let recorded = &frontier.sequence[0];
         assert_eq!(recorded.sender, tx.sender);
         assert_eq!(recorded.call_details.target, tx.call_details.target);
@@ -373,12 +559,12 @@ mod tests {
     fn operand_delta_uses_signed_distance_for_signed_comparisons() {
         let unsigned = CmpOperands {
             op1: U256::MAX,
-            op2: U256::from(1),
+            op2: U256::ONE,
             pc: 0,
             address: Address::ZERO,
             opcode: opcode::LT,
         };
-        assert_eq!(operand_delta(&unsigned), U256::MAX - U256::from(1));
+        assert_eq!(operand_delta(&unsigned), U256::MAX - U256::ONE);
 
         let signed = CmpOperands { opcode: opcode::SLT, ..unsigned };
         assert_eq!(operand_delta(&signed), U256::from(2));
@@ -423,6 +609,73 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].operands.operand_delta, U256::from(10));
+    }
+
+    #[test]
+    fn frontier_keeps_shortest_stateful_sequence_for_equal_delta() {
+        let tx = BasicTxDetails {
+            warp: None,
+            roll: None,
+            sender: Address::with_last_byte(1),
+            call_details: CallDetails {
+                target: Address::with_last_byte(2),
+                calldata: Bytes::from_static(&[1, 2, 3, 4]),
+                value: None,
+            },
+        };
+        let cmp = CmpOperands {
+            op1: U256::ONE,
+            op2: U256::from(2),
+            pc: 1,
+            address: tx.call_details.target,
+            opcode: opcode::LT,
+        };
+        let mut recorder = FuzzFrontierRecorder::new(1);
+
+        recorder.capture_call(None, &[tx.clone(), tx.clone()], 1, &[cmp], None);
+        recorder.capture_call(None, std::slice::from_ref(&tx), 0, &[cmp], None);
+
+        let frontier = recorder.into_frontiers().pop().unwrap();
+        assert_eq!(frontier.sequence.len(), 1);
+        assert_eq!(frontier.call_index, 0);
+    }
+
+    #[test]
+    fn stateful_artifact_stores_shared_sequence_once() {
+        let tx = BasicTxDetails {
+            warp: None,
+            roll: None,
+            sender: Address::with_last_byte(1),
+            call_details: CallDetails {
+                target: Address::with_last_byte(2),
+                calldata: Bytes::from_static(&[1, 2, 3, 4]),
+                value: None,
+            },
+        };
+        let first = CmpOperands {
+            op1: U256::ZERO,
+            op2: U256::ONE,
+            pc: 1,
+            address: tx.call_details.target,
+            opcode: opcode::LT,
+        };
+        let second = CmpOperands { pc: 2, ..first };
+        let mut recorder = FuzzFrontierRecorder::new(2);
+        recorder.capture_sequence(&[tx.clone(), tx], &[vec![first], vec![second]]);
+        let func: Function = serde_json::from_str(
+            r#"{"type":"function","name":"invariant_ok","inputs":[],"outputs":[],"stateMutability":"pure"}"#,
+        )
+        .unwrap();
+
+        let artifact = StatefulFuzzBranchFrontierArtifact::new(&func, 2, recorder.into_frontiers());
+
+        assert_eq!(artifact.sequences.len(), 1);
+        assert_eq!(artifact.sequences[0].len, 2);
+        assert_eq!(artifact.frontiers.len(), 2);
+        assert_eq!(artifact.frontiers[0].sequence_index, 0);
+        assert_eq!(artifact.frontiers[1].sequence_index, 0);
+        assert_eq!(artifact.frontiers[0].call_index, 0);
+        assert_eq!(artifact.frontiers[1].call_index, 1);
     }
 
     #[test]
@@ -485,5 +738,31 @@ mod tests {
     #[test]
     fn merge_frontiers_with_zero_limit_is_empty() {
         assert!(merge_frontiers(0, [frontier(1, false, 1)]).is_empty());
+    }
+
+    #[test]
+    fn sub_comparisons_are_not_frontiers() {
+        let tx = BasicTxDetails {
+            warp: None,
+            roll: None,
+            sender: Address::ZERO,
+            call_details: CallDetails {
+                target: Address::ZERO,
+                calldata: Bytes::from_static(&[1, 2, 3, 4]),
+                value: None,
+            },
+        };
+        let cmp = CmpOperands {
+            op1: U256::ZERO,
+            op2: U256::ONE,
+            pc: 1,
+            address: Address::ZERO,
+            opcode: opcode::SUB,
+        };
+        let mut recorder = FuzzFrontierRecorder::new(1);
+
+        recorder.capture_call(None, std::slice::from_ref(&tx), 0, &[cmp], Some(true));
+
+        assert!(recorder.into_frontiers().is_empty());
     }
 }

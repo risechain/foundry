@@ -2,6 +2,8 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// Cheatcode docs are Solidity descriptions exported verbatim, such as `<path>:<contract>`.
+#![allow(rustdoc::bare_urls, rustdoc::invalid_html_tags)]
 
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, fmt};
@@ -81,6 +83,8 @@ impl Cheatcodes<'static> {
                 Vm::Log::STRUCT.clone(),
                 Vm::Rpc::STRUCT.clone(),
                 Vm::EthGetLogs::STRUCT.clone(),
+                Vm::EthStorageProof::STRUCT.clone(),
+                Vm::EthGetProof::STRUCT.clone(),
                 Vm::DirEntry::STRUCT.clone(),
                 Vm::FsMetadata::STRUCT.clone(),
                 Vm::Wallet::STRUCT.clone(),

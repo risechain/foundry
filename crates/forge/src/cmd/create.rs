@@ -1,13 +1,14 @@
-use crate::cmd::install;
 use alloy_chains::Chain;
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
 use alloy_json_abi::JsonAbi;
 use alloy_network::{Ethereum, EthereumWallet, Network, ReceiptResponse, TransactionBuilder};
 use alloy_primitives::{Address, Bytes, U256, hex};
-use alloy_provider::{PendingTransactionError, Provider, ProviderBuilder as AlloyProviderBuilder};
+use alloy_provider::{
+    PendingTransactionBuilder, PendingTransactionError, Provider,
+    ProviderBuilder as AlloyProviderBuilder,
+};
 use alloy_signer::{Signature, Signer};
-use alloy_transport::TransportError;
 use clap::{Parser, ValueHint};
 use eyre::{Context, ContextCompat, Result};
 use forge_verify::{RetryArgs, VerifierArgs, VerifyArgs, parse_etherscan_license_type};
@@ -20,12 +21,12 @@ use foundry_cli::{
     },
 };
 use foundry_common::{
-    FoundryTransactionBuilder,
-    compile::{self},
+    FoundryTransactionBuilder, compile,
     provider::{
         ProviderBuilder,
         fee::{estimate_eip1559_fees, resolve_broadcast_eip1559_fees},
     },
+    retry::Retry,
     shell,
     tempo::{maybe_print_fee_token, resolve_and_set_fee_token},
 };
@@ -40,12 +41,10 @@ use foundry_config::{
     },
     merge_impl_figment_convert,
 };
-use foundry_wallets::{
-    BrowserWalletOpts, TempoAccountsWallet, WalletSigner, wallet_browser::signer::BrowserSigner,
-};
+use foundry_wallets::{BrowserWalletOpts, WalletSigner, wallet_browser::signer::BrowserSigner};
 use serde_json::json;
 use std::{borrow::Borrow, marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
-use tempo_alloy::TempoNetwork;
+use tempo_alloy::{TempoNetwork, accounts::TempoAccountsWallet};
 
 merge_impl_figment_convert!(CreateArgs, build, eth);
 
@@ -162,7 +161,26 @@ impl CreateArgs {
             // deployment into a Tempo transaction.
             wallet.from = None;
         }
-        let (signer, tempo_access_key) = wallet.maybe_signer_for_chain(chain.id()).await?;
+        let (signer, tempo_access_key) =
+            foundry_common::tempo::maybe_signer(&wallet, Some(chain.id())).await?;
+
+        // Never deploy from an account other than the one explicitly selected by the user. Unlocked
+        // and browser deployments do not use the resolved signer.
+        let deployer = signer
+            .as_ref()
+            .map(|signer| signer.address())
+            .or_else(|| tempo_access_key.as_ref().map(|ak| ak.account()));
+        if !self.unlocked
+            && !self.browser.browser
+            && let Some(from) = self.eth.wallet.from
+            && let Some(deployer) = deployer
+            && from != deployer
+        {
+            eyre::bail!(
+                "the sender specified via `--from`/`ETH_FROM` ({from}) does not match the \
+                 signer address ({deployer})"
+            );
+        }
 
         if tempo_access_key.is_some() || self.tx.tempo.is_tempo() || chain.is_tempo() {
             self.run_generic::<TempoNetwork>(signer, tempo_access_key).await
@@ -186,11 +204,7 @@ impl CreateArgs {
         let resolve_unknown_fee_token_symbol = !config.eth_rpc_curl;
 
         // Install missing dependencies.
-        if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
-        {
-            // need to re-configure here to also catch additional remappings
-            config = self.load_config()?;
-        }
+        self.install_missing_dependencies(&mut config)?;
 
         // Find Project & Compile
         let project = config.project()?;
@@ -201,7 +215,12 @@ impl CreateArgs {
             project.find_contract_path(&self.contract.name)?
         };
 
-        let output = compile::compile_target(&target_path, &project, shell::is_json())?;
+        let compiler = compile::ProjectCompiler::new()
+            .allow_linked_libraries(config.allow_linked_libraries)
+            .external_compilers(&config)
+            .quiet(shell::is_json())
+            .target_files([target_path.clone()]);
+        let output = compiler.compile(&project)?;
 
         let (abi, bin, id) = find_contract_artifacts(output, &target_path, &self.contract.name)?;
 
@@ -455,7 +474,7 @@ impl CreateArgs {
 
         let provider = Arc::new(provider);
         let factory =
-            ContractFactory::<N, _>::new(abi.clone(), bin.clone(), provider.clone(), timeout);
+            DeploymentTxFactory::<N, _>::new(abi.clone(), bin.clone(), provider.clone(), timeout);
 
         let is_args_empty = args.is_empty();
         let mut deployer =
@@ -550,7 +569,7 @@ impl CreateArgs {
         }
 
         if self.tx.gas_limit.is_none() {
-            let request = if browser_signer.is_some() && chain.is_tempo() {
+            let request = if browser_signer.is_some() {
                 deployer.tx.browser_wallet_gas_estimation_request()
             } else {
                 deployer.tx.clone()
@@ -611,7 +630,6 @@ impl CreateArgs {
             sponsor
                 .resolve_and_set_fee_token(
                     resolve_unknown_fee_token_symbol.then_some(&provider),
-                    Some(chain),
                     &mut deployer.tx,
                 )
                 .await?;
@@ -619,7 +637,6 @@ impl CreateArgs {
         } else {
             let fee_token = resolve_and_set_fee_token(
                 resolve_unknown_fee_token_symbol.then_some(&provider),
-                Some(chain),
                 &mut deployer.tx,
                 Some(deployer_address),
             )
@@ -632,43 +649,16 @@ impl CreateArgs {
         let (deployed_contract, receipt) = if let Some(browser) = browser_signer {
             // Browser wallet signs and sends the transaction
             let tx_hash = browser.send_transaction_via_browser(deployer.tx).await?;
-
-            // Wait for the transaction to be confirmed, then fetch the receipt.
-            provider
-                .watch_pending_transaction(alloy_provider::PendingTransactionConfig::new(tx_hash))
+            wait_for_deployment(PendingTransactionBuilder::new(provider.root().clone(), tx_hash))
                 .await?
-                .await?;
-
-            let receipt = provider
-                .get_transaction_receipt(tx_hash)
-                .await?
-                .ok_or_else(|| eyre::eyre!("could not get transaction receipt for {tx_hash}"))?;
-
-            if !receipt.status() {
-                eyre::bail!("deployment transaction failed (receipt status 0): {tx_hash}");
-            }
-
-            let address = receipt
-                .contract_address()
-                .ok_or_else(|| eyre::eyre!("contract was not deployed"))?;
-
-            (address, receipt)
         } else if let Some(wallet) = tempo_keychain {
             let raw_tx = deployer.tx.sign_with_tempo_wallet(&wallet).await?;
-
-            let receipt = provider
+            let pending = provider
                 .send_raw_transaction(&raw_tx)
                 .await?
                 .with_required_confirmations(1)
-                .with_timeout(Some(Duration::from_secs(timeout)))
-                .get_receipt()
-                .await?;
-
-            let address = receipt
-                .contract_address()
-                .ok_or_else(|| eyre::eyre!("contract was not deployed"))?;
-
-            (address, receipt)
+                .with_timeout(Some(Duration::from_secs(timeout)));
+            wait_for_deployment(pending).await?
         } else {
             deployer.send_with_receipt().await?
         };
@@ -757,13 +747,6 @@ impl figment::Provider for CreateArgs {
     }
 }
 
-/// `ContractFactory` is a [`DeploymentTxFactory`] object with an
-/// [`Arc`] middleware. This type alias exists to preserve backwards
-/// compatibility with less-abstract Contracts.
-///
-/// For full usage docs, see [`DeploymentTxFactory`].
-pub type ContractFactory<N, P> = DeploymentTxFactory<N, P>;
-
 /// Helper which manages the deployment transaction of a smart contract. It
 /// wraps a deployment transaction, and retrieves the contract address output
 /// by it.
@@ -805,31 +788,51 @@ impl<N: Network, P: Provider<N>> Deployer<N, P> {
     /// Broadcasts the contract deployment transaction and after waiting for it to
     /// be sufficiently confirmed (default: 1), it returns a tuple with the [`Address`] at the
     /// deployed contract's address and the corresponding receipt.
-    pub async fn send_with_receipt(
-        self,
-    ) -> Result<(Address, N::ReceiptResponse), ContractDeploymentError> {
-        let receipt = self
+    pub async fn send_with_receipt(self) -> Result<(Address, N::ReceiptResponse)> {
+        let pending = self
             .client
             .borrow()
             .send_transaction(self.tx)
             .await?
             .with_required_confirmations(self.confs as u64)
-            .with_timeout(Some(Duration::from_secs(self.timeout)))
-            .get_receipt()
-            .await?;
-
-        if !receipt.status() {
-            return Err(ContractDeploymentError::DeploymentFailed(receipt.transaction_hash()));
-        }
-
-        let address =
-            receipt.contract_address().ok_or(ContractDeploymentError::ContractNotDeployed)?;
-
-        Ok((address, receipt))
+            .with_timeout(Some(Duration::from_secs(self.timeout)));
+        wait_for_deployment(pending).await
     }
 }
 
-/// To deploy a contract to the Ethereum network, a [`ContractFactory`] can be
+/// Waits for a deployment transaction's receipt and returns the deployed address with it.
+///
+/// A load-balanced RPC can report the transaction as mined before the node that serves
+/// `eth_getTransactionReceipt` has its receipt, which alloy reports as a null response. The
+/// deployment went through, so keep polling for the receipt instead of failing it.
+async fn wait_for_deployment<N: Network>(
+    pending: PendingTransactionBuilder<N>,
+) -> Result<(Address, N::ReceiptResponse)> {
+    let tx_hash = *pending.tx_hash();
+    let provider = pending.provider().clone();
+    let receipt = match pending.get_receipt().await {
+        Err(PendingTransactionError::TransportError(err)) if err.is_null_resp() => {
+            Retry::new(15, Duration::from_secs(1))
+                .run_async(|| async {
+                    provider
+                        .get_transaction_receipt(tx_hash)
+                        .await?
+                        .wrap_err("the RPC has no receipt for the mined transaction yet")
+                })
+                .await
+        }
+        res => res.map_err(Into::into),
+    }
+    .wrap_err_with(|| {
+        format!("transaction {tx_hash} was sent, but waiting for its receipt failed")
+    })?;
+
+    eyre::ensure!(receipt.status(), "deployment transaction failed (receipt status 0): {tx_hash}");
+    let address = receipt.contract_address().wrap_err("contract was not deployed")?;
+    Ok((address, receipt))
+}
+
+/// To deploy a contract to the Ethereum network, a [`DeploymentTxFactory`] can be
 /// created which manages the Contract bytecode and Application Binary Interface
 /// (ABI), usually generated from the Solidity compiler.
 #[derive(Clone, Debug)]
@@ -886,18 +889,6 @@ pub enum ContractDeploymentError {
     ConstructorError,
     #[error(transparent)]
     DetokenizationError(#[from] alloy_dyn_abi::Error),
-    #[error("contract was not deployed")]
-    ContractNotDeployed,
-    #[error("deployment transaction failed (receipt status 0): {0}")]
-    DeploymentFailed(alloy_primitives::TxHash),
-    #[error(transparent)]
-    RpcError(#[from] TransportError),
-}
-
-impl From<PendingTransactionError> for ContractDeploymentError {
-    fn from(_err: PendingTransactionError) -> Self {
-        Self::ContractNotDeployed
-    }
 }
 
 #[cfg(test)]
@@ -905,6 +896,7 @@ mod tests {
     use super::*;
     use alloy_json_abi::Constructor;
     use alloy_primitives::I256;
+    use foundry_cli::utils::parse_json;
 
     #[test]
     fn can_parse_create() {
@@ -982,7 +974,7 @@ mod tests {
             "--constructor-args",
             "Hello",
         ]);
-        let constructor: Constructor = serde_json::from_str(r#"{"type":"constructor","inputs":[{"name":"_name","type":"string","internalType":"string"}],"stateMutability":"nonpayable"}"#).unwrap();
+        let constructor: Constructor = parse_json(r#"{"type":"constructor","inputs":[{"name":"_name","type":"string","internalType":"string"}],"stateMutability":"nonpayable"}"#).unwrap();
         let params = parse_constructor_args(&constructor, &args.constructor_args).unwrap();
         assert_eq!(params, vec![DynSolValue::String("Hello".to_string())]);
     }
@@ -995,7 +987,7 @@ mod tests {
             "--constructor-args",
             "[(1,2), (2,3), (3,4)]",
         ]);
-        let constructor: Constructor = serde_json::from_str(r#"{"type":"constructor","inputs":[{"name":"_points","type":"tuple[]","internalType":"struct Point[]","components":[{"name":"x","type":"uint256","internalType":"uint256"},{"name":"y","type":"uint256","internalType":"uint256"}]}],"stateMutability":"nonpayable"}"#).unwrap();
+        let constructor: Constructor = parse_json(r#"{"type":"constructor","inputs":[{"name":"_points","type":"tuple[]","internalType":"struct Point[]","components":[{"name":"x","type":"uint256","internalType":"uint256"},{"name":"y","type":"uint256","internalType":"uint256"}]}],"stateMutability":"nonpayable"}"#).unwrap();
         let _params = parse_constructor_args(&constructor, &args.constructor_args).unwrap();
     }
 
@@ -1007,7 +999,7 @@ mod tests {
             "--constructor-args",
             "-5",
         ]);
-        let constructor: Constructor = serde_json::from_str(r#"{"type":"constructor","inputs":[{"name":"_name","type":"int256","internalType":"int256"}],"stateMutability":"nonpayable"}"#).unwrap();
+        let constructor: Constructor = parse_json(r#"{"type":"constructor","inputs":[{"name":"_name","type":"int256","internalType":"int256"}],"stateMutability":"nonpayable"}"#).unwrap();
         let params = parse_constructor_args(&constructor, &args.constructor_args).unwrap();
         assert_eq!(params, vec![DynSolValue::Int(I256::unchecked_from(-5), 256)]);
     }

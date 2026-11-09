@@ -75,6 +75,7 @@ impl EthApi<FoundryNetwork> {
             .backend
             .trace_transaction(hash)
             .await?
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|trace| TraceEntry::from_transaction_trace(&trace.trace))
             .collect();
@@ -156,7 +157,7 @@ impl EthApi<FoundryNetwork> {
         let best = self.backend.best_number();
         // we go from given block (defaulting to best) down to first block
         // considering only post-fork (or post-genesis in non-fork mode)
-        let from = if block_number == 0 { best } else { block_number - 1 };
+        let from = if block_number == 0 { best } else { (block_number - 1).min(best) };
         let to = self
             .get_fork()
             .map(|f| f.block_number() + 1)
@@ -206,7 +207,7 @@ impl EthApi<FoundryNetwork> {
             .get_fork()
             .map(|f| f.block_number() + 1)
             .unwrap_or_else(|| self.backend.genesis_number() + 1);
-        let from = if block_number == 0 { first_block } else { block_number + 1 };
+        let from = if block_number == 0 { first_block } else { block_number.saturating_add(1) };
         let to = best;
 
         let mut first_page = from >= best;
@@ -222,7 +223,6 @@ impl EthApi<FoundryNetwork> {
             if let Some(traces) = self.backend.mined_parity_trace_block(n) {
                 let hashes = traces
                     .into_iter()
-                    .rev()
                     .filter(|trace| trace.contains_address(address))
                     .filter_map(|trace| trace.transaction_hash)
                     .unique();
@@ -278,7 +278,10 @@ impl EthApi<FoundryNetwork> {
     pub async fn ots_get_contract_creator(&self, addr: Address) -> Result<Option<ContractCreator>> {
         node_info!("ots_getContractCreator");
 
-        let from = self.get_fork().map(|f| f.block_number()).unwrap_or_default();
+        let from = self
+            .get_fork()
+            .map(|f| f.block_number())
+            .unwrap_or_else(|| self.backend.genesis_number());
         let to = self.backend.best_number();
 
         // loop in reverse, since we want the latest deploy to the address
@@ -373,6 +376,9 @@ impl EthApi<FoundryNetwork> {
             return Err(BlockchainError::DataUnavailable);
         }
 
+        // Preserve the total transaction count before pagination.
+        let transaction_count = block.transactions().len();
+
         block.transactions = match block.transactions() {
             BlockTransactions::Full(txs) => BlockTransactions::Full(
                 txs.iter().skip(page * page_size).take(page_size).cloned().collect(),
@@ -400,7 +406,6 @@ impl EthApi<FoundryNetwork> {
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
-        let transaction_count = block.transactions().len();
         let fullblock = OtsBlock { block: block.inner.clone(), transaction_count };
 
         let ots_block_txs = OtsBlockTransactions { fullblock, receipts };

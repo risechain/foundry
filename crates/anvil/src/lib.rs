@@ -2,9 +2,7 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-
-#[cfg(feature = "optimism")]
-use op_alloy_rpc_types as _;
+#![recursion_limit = "256"]
 
 use crate::{
     error::{NodeError, NodeResult},
@@ -27,7 +25,6 @@ use alloy_signer_local::PrivateKeySigner;
 use eth::backend::fork::ClientFork;
 use eyre::{Result, WrapErr};
 use foundry_common::provider::{ProviderBuilder, RetryProvider};
-pub use foundry_evm::hardfork::EthereumHardfork;
 use foundry_primitives::FoundryNetwork;
 use futures::{FutureExt, TryFutureExt};
 use parking_lot::Mutex;
@@ -42,7 +39,12 @@ use tokio::{
     runtime::Handle,
     task::{JoinError, JoinHandle},
 };
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, prelude::*};
+
+#[cfg(feature = "optimism")]
+use op_alloy_rpc_types as _;
+
+pub use foundry_evm::hardfork::EthereumHardfork;
 
 /// contains the background service that drives the node
 mod service;
@@ -155,6 +157,13 @@ pub async fn try_spawn(mut config: NodeConfig) -> Result<(EthApi<FoundryNetwork>
             .wrap_err("failed to replay fork transaction prefix")?;
     }
 
+    let tempo_consensus_identity = if !config.silent && backend.is_tempo() {
+        Some(backend.tempo_consensus_identity().await?)
+    } else {
+        None
+    };
+    let tempo_epoch_length_fallback_warning = backend.tempo_epoch_length_fallback_warning().await;
+
     backend.commit_startup_fork_cache();
     let backend = Arc::new(backend);
 
@@ -177,7 +186,7 @@ pub async fn try_spawn(mut config: NodeConfig) -> Result<(EthApi<FoundryNetwork>
         ..
     } = config.clone();
 
-    let pool = Arc::new(Pool::default());
+    let pool = Arc::new(Pool::new(backend.fees().clone()));
 
     let mode = if let Some(block_time) = block_time {
         if mixed_mining {
@@ -194,7 +203,7 @@ pub async fn try_spawn(mut config: NodeConfig) -> Result<(EthApi<FoundryNetwork>
         MiningMode::instant(max_transactions, listener)
     };
 
-    let miner = Miner::new(mode);
+    let miner = Miner::new(mode.with_coalescing_window(config.transaction_coalescing_window));
 
     let dev_signer: Box<dyn EthSigner<foundry_primitives::FoundryNetwork>> =
         Box::new(DevSigner::new(signer_accounts));
@@ -275,6 +284,18 @@ pub async fn try_spawn(mut config: NodeConfig) -> Result<(EthApi<FoundryNetwork>
     };
 
     handle.print(fork.as_ref())?;
+    if let Some(identity) = tempo_consensus_identity {
+        sh_eprintln!(
+            "\nTempo Consensus\n==================\nIdentity:       {}\nProposer:       {}\nEpoch length:   {}",
+            identity.identity,
+            identity.proposer,
+            identity.epoch_length,
+        )?;
+    }
+
+    if let Some(warning) = tempo_epoch_length_fallback_warning {
+        let _ = sh_warn!("{warning}");
+    }
 
     Ok((api, handle))
 }
@@ -468,8 +489,6 @@ impl Future for NodeHandle {
 
 #[doc(hidden)]
 pub fn init_tracing() -> LoggingManager {
-    use tracing_subscriber::prelude::*;
-
     let manager = LoggingManager::default();
 
     let _ = if let Ok(rust_log_val) = std::env::var("RUST_LOG")

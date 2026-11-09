@@ -92,7 +92,7 @@ impl<'a> InvariantRunCtx<'a> {
             return_reason: "".into(),
             revert_reason,
             addr: self.contract.address,
-            calldata: broken_fn.selector().to_vec().into(),
+            calldata: broken_fn.selector().into(),
             inner_sequence: inner_sequence.to_vec(),
             shrink_run_limit: self.config.shrink_run_limit,
             fail_on_revert,
@@ -185,8 +185,8 @@ pub(crate) fn record_handler_assertion_bug<FEN: FoundryEvmNetwork>(
         });
     }
 
-    // Standard reverted-input pop. Delay-enabled campaigns keep reverted calls so
-    // shrinking can preserve their warp/roll contribution.
+    // Standard reverted-input pop. Delay-enabled campaigns keep reverted calls so their warp/roll
+    // contribution can be replayed.
     if call_reverted && !is_optimization && !config.has_delay() {
         inputs.pop();
     }
@@ -426,7 +426,7 @@ impl InvariantFuzzError {
             return_reason: "".into(),
             revert_reason,
             addr: invariant_address,
-            calldata: invariant.selector().to_vec().into(),
+            calldata: invariant.selector().into(),
             inner_sequence: Vec::new(),
             shrink_run_limit: config.shrink_run_limit,
             fail_on_revert,

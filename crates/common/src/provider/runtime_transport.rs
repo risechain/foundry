@@ -4,7 +4,10 @@
 
 use crate::{
     DEFAULT_USER_AGENT, REQUEST_TIMEOUT,
-    provider::mpp::transport::{LazyMppHttpTransport, lazy_mpp_ws_connect},
+    provider::{
+        mpp::transport::{LazyMppHttpTransport, lazy_mpp_ws_connect},
+        redact_url,
+    },
 };
 use alloy_json_rpc::{RequestPacket, ResponsePacket};
 use alloy_pubsub::{PubSubConnect, PubSubFrontend};
@@ -15,10 +18,20 @@ use alloy_transport::{
 };
 use alloy_transport_ipc::IpcConnect;
 use alloy_transport_ws::WsConnect;
+use regex::{Captures, Regex};
 use reqwest::header::{HeaderName, HeaderValue};
-use std::{fmt, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    error::Error as StdError,
+    fmt,
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::{
+    runtime::{Handle, Id},
+    sync::RwLock,
+};
 use tower::Service;
 use url::Url;
 
@@ -28,10 +41,8 @@ use url::Url;
 /// regardless of whether local MPP keys have been discovered.
 const KNOWN_MPP_HOSTS: &[&str] = &[".mpp.tempo.xyz", ".mpp.moderato.tempo.xyz"];
 
-/// Returns `true` if `url` points to a known MPP-enabled RPC service.
-fn is_known_mpp_endpoint(url: &Url) -> bool {
-    url.host_str().is_some_and(|host| KNOWN_MPP_HOSTS.iter().any(|suffix| host.ends_with(suffix)))
-}
+static HTTP_URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)https?://[^\s<>"']+"#).expect("valid URL regex"));
 
 /// An enum representing the different transports that can be used to connect to a runtime.
 /// Only meant to be used internally by [RuntimeTransport].
@@ -39,8 +50,8 @@ fn is_known_mpp_endpoint(url: &Url) -> bool {
 pub enum InnerTransport {
     /// HTTP transport with lazy MPP 402 handling.
     ///
-    /// For known Tempo endpoints, the MPP layer additionally runs the
-    /// `wallet.tempo.xyz` device-code flow on a 402 when no local access key
+    /// Unless MPP is disabled, for known Tempo endpoints the MPP layer additionally
+    /// runs the `wallet.tempo.xyz` device-code flow on a 402 when no local access key
     /// is configured (see [`crate::tempo::ensure_access_key`]).
     Http(LazyMppHttpTransport),
     /// WebSocket transport
@@ -86,8 +97,8 @@ pub enum RuntimeTransportError {
 /// client layer (e.g., `RetryBackoffLayer`) when configured.
 #[derive(Clone, Debug)]
 pub struct RuntimeTransport {
-    /// The inner actual transport used.
-    inner: Arc<RwLock<Option<InnerTransport>>>,
+    /// The connection to the URL, established by the first request on each runtime.
+    connection: Arc<RwLock<Connection>>,
     /// The URL to connect to.
     url: Url,
     /// The headers to use for requests.
@@ -100,6 +111,32 @@ pub struct RuntimeTransport {
     accept_invalid_certs: bool,
     /// Whether to disable automatic proxy detection.
     no_proxy: bool,
+    /// Whether to disable MPP: no `MPP_API_KEY` `x-api-key` header and no 402 payments.
+    no_mpp: bool,
+}
+
+/// The connection state of a [RuntimeTransport].
+#[derive(Debug)]
+enum Connection {
+    /// No request has connected yet.
+    Disconnected,
+    /// Connected from the Tokio runtime with ID `runtime`.
+    ///
+    /// Connections may own tasks and I/O resources on their originating runtime, so a request
+    /// from another runtime reconnects.
+    Connected { runtime: Id, transport: InnerTransport },
+}
+
+impl Connection {
+    /// Returns the transport if it was connected from `runtime`.
+    fn transport_for(&self, runtime: Id) -> Option<InnerTransport> {
+        match self {
+            Self::Connected { runtime: connected, transport } if *connected == runtime => {
+                Some(transport.clone())
+            }
+            Self::Connected { .. } | Self::Disconnected => None,
+        }
+    }
 }
 
 /// A builder for [RuntimeTransport].
@@ -111,6 +148,7 @@ pub struct RuntimeTransportBuilder {
     timeout: std::time::Duration,
     accept_invalid_certs: bool,
     no_proxy: bool,
+    no_mpp: bool,
 }
 
 impl RuntimeTransportBuilder {
@@ -123,6 +161,7 @@ impl RuntimeTransportBuilder {
             timeout: REQUEST_TIMEOUT,
             accept_invalid_certs: false,
             no_proxy: false,
+            no_mpp: false,
         }
     }
 
@@ -159,24 +198,31 @@ impl RuntimeTransportBuilder {
         self
     }
 
+    /// Set whether to disable MPP: no `MPP_API_KEY` `x-api-key` header and no 402 payments.
+    pub const fn no_mpp(mut self, no_mpp: bool) -> Self {
+        self.no_mpp = no_mpp;
+        self
+    }
+
     /// Builds the [RuntimeTransport] and returns it in a disconnected state.
     /// The runtime transport will then connect when the first request happens.
     pub fn build(self) -> RuntimeTransport {
         RuntimeTransport {
-            inner: Arc::new(RwLock::new(None)),
+            connection: Arc::new(RwLock::new(Connection::Disconnected)),
             url: self.url,
             headers: self.headers,
             jwt: self.jwt,
             timeout: self.timeout,
             accept_invalid_certs: self.accept_invalid_certs,
             no_proxy: self.no_proxy,
+            no_mpp: self.no_mpp,
         }
     }
 }
 
 impl fmt::Display for RuntimeTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RuntimeTransport {}", self.url)
+        write!(f, "RuntimeTransport {}", redact_url(self.url.as_str()))
     }
 }
 
@@ -228,7 +274,8 @@ impl RuntimeTransport {
 
         // If MPP_API_KEY is set, attach it as x-api-key for gated MPP proxies.
         // Does not override an explicit x-api-key header from the user.
-        if !headers.contains_key(HeaderName::from_static("x-api-key"))
+        if !self.no_mpp
+            && !headers.contains_key(HeaderName::from_static("x-api-key"))
             && let Ok(api_key) = std::env::var("MPP_API_KEY")
         {
             let api_key = api_key.trim();
@@ -251,6 +298,23 @@ impl RuntimeTransport {
             .timeout(self.timeout)
             .danger_accept_invalid_certs(self.accept_invalid_certs);
 
+        // Custom headers and `x-api-key` may contain credentials that reqwest does not strip on
+        // redirects, so only same-origin redirects are followed when they are sent.
+        if !self.headers.is_empty() || headers.contains_key(HeaderName::from_static("x-api-key")) {
+            client_builder =
+                client_builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt
+                        .previous()
+                        .last()
+                        .is_some_and(|previous| previous.origin() != attempt.url().origin())
+                    {
+                        attempt.error("cross-origin RPC redirects are not allowed")
+                    } else {
+                        reqwest::redirect::Policy::default().redirect(attempt)
+                    }
+                }));
+        }
+
         // Disable automatic proxy detection if requested. This helps in sandboxed environments
         // (e.g., Cursor IDE sandbox, macOS App Sandbox) where system proxy detection via
         // SCDynamicStore causes crashes. See: https://github.com/foundry-rs/foundry/issues/12733
@@ -272,33 +336,43 @@ impl RuntimeTransport {
     fn connect_http(&self) -> Result<InnerTransport, RuntimeTransportError> {
         let headers = self.reqwest_headers()?;
         let client = self.reqwest_client_with_headers(headers.clone())?;
-        Ok(InnerTransport::Http(LazyMppHttpTransport::lazy(client, self.url.clone(), headers)))
+        Ok(InnerTransport::Http(LazyMppHttpTransport::lazy(
+            client,
+            self.url.clone(),
+            headers,
+            !self.no_mpp,
+        )))
     }
 
     /// Connects to a WS transport.
     ///
     /// Uses the canonical Alloy MPP WebSocket transport when the endpoint is a
-    /// known MPP service.
+    /// known MPP service; it only pays challenges when MPP is not disabled.
     /// Otherwise falls back to alloy's plain [`WsConnect`] with zero overhead.
     async fn connect_ws(&self) -> Result<InnerTransport, RuntimeTransportError> {
-        let auth = self.jwt.as_ref().and_then(|jwt| build_auth(jwt.clone()).ok());
+        let auth = self
+            .jwt
+            .as_ref()
+            .map(|jwt| build_auth(jwt.clone()))
+            .transpose()
+            .map_err(|e| RuntimeTransportError::InvalidJwt(e.to_string()))?;
 
         let service = if is_known_mpp_endpoint(&self.url) {
-            let mut ws = lazy_mpp_ws_connect(&self.url);
+            let mut ws = lazy_mpp_ws_connect(&self.url, !self.no_mpp);
             if let Some(auth) = auth {
                 ws = ws.with_auth(auth);
             }
-            ws.into_service()
-                .await
-                .map_err(|e| RuntimeTransportError::TransportError(e, self.url.to_string()))?
+            ws.into_service().await.map_err(|e| {
+                RuntimeTransportError::TransportError(e, redact_url(self.url.as_str()))
+            })?
         } else {
             let mut ws = WsConnect::new(self.url.to_string());
             if let Some(auth) = auth {
                 ws = ws.with_auth(auth);
             }
-            ws.into_service()
-                .await
-                .map_err(|e| RuntimeTransportError::TransportError(e, self.url.to_string()))?
+            ws.into_service().await.map_err(|e| {
+                RuntimeTransportError::TransportError(e, redact_url(self.url.as_str()))
+            })?
         };
 
         Ok(InnerTransport::Ws(service))
@@ -325,36 +399,75 @@ impl RuntimeTransport {
     pub fn request(&self, req: RequestPacket) -> TransportFut<'static> {
         let this = self.clone();
         Box::pin(async move {
-            let mut inner = this.inner.read().await;
-            if inner.is_none() {
-                drop(inner);
-                {
-                    let mut inner_mut = this.inner.write().await;
-                    if inner_mut.is_none() {
-                        *inner_mut =
-                            Some(this.connect().await.map_err(TransportErrorKind::custom)?);
+            let runtime = Handle::current().id();
+            let connected = this.connection.read().await.transport_for(runtime);
+            let transport = match connected {
+                Some(transport) => transport,
+                None => {
+                    let mut connection = this.connection.write().await;
+                    // Another request may have connected while waiting for the write lock.
+                    match connection.transport_for(runtime) {
+                        Some(transport) => transport,
+                        None => {
+                            let transport =
+                                this.connect().await.map_err(TransportErrorKind::custom)?;
+                            *connection =
+                                Connection::Connected { runtime, transport: transport.clone() };
+                            transport
+                        }
                     }
                 }
-                inner = this.inner.read().await;
-            }
+            };
 
-            // SAFETY: We just checked that the inner transport exists.
-            match inner.clone().expect("must've been initialized") {
-                InnerTransport::Http(mut http) => http.call(req),
-                InnerTransport::Ws(mut ws) => ws.call(req),
-                InnerTransport::Ipc(mut ipc) => ipc.call(req),
+            match transport {
+                InnerTransport::Http(mut http) => http
+                    .call(req)
+                    .await
+                    .map_err(|error| redact_http_transport_error(error, &this.url)),
+                InnerTransport::Ws(mut ws) => ws.call(req).await,
+                InnerTransport::Ipc(mut ipc) => ipc.call(req).await,
             }
-            .await
         })
     }
 
     /// Convert this transport into a boxed trait object.
-    pub fn boxed(self) -> BoxTransport
-    where
-        Self: Sized + Clone + Send + Sync + 'static,
-    {
+    pub fn boxed(self) -> BoxTransport {
         BoxTransport::new(self)
     }
+}
+
+/// Returns `true` if `url` points to a known MPP-enabled RPC service.
+fn is_known_mpp_endpoint(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| KNOWN_MPP_HOSTS.iter().any(|suffix| host.ends_with(suffix)))
+}
+
+fn redact_http_transport_error(error: TransportError, endpoint: &Url) -> TransportError {
+    let alloy_json_rpc::RpcError::Transport(TransportErrorKind::Custom(source)) = &error else {
+        return error;
+    };
+    let safe_endpoint = redact_url(endpoint.as_str());
+
+    let mut message = String::new();
+    let mut error: Option<&(dyn StdError + 'static)> = Some(source.as_ref());
+    while let Some(source) = error {
+        if !message.is_empty() {
+            message.push_str(": ");
+        }
+        message.push_str(&source.to_string());
+        error = source.source();
+    }
+    let message = HTTP_URL_RE.replace_all(&message, |captures: &Captures<'_>| {
+        let candidate = &captures[0];
+        let Ok(url) = Url::parse(candidate) else { return candidate.to_owned() };
+        if url.host() == endpoint.host()
+            && url.port_or_known_default() == endpoint.port_or_known_default()
+        {
+            safe_endpoint.clone()
+        } else {
+            candidate.to_owned()
+        }
+    });
+    TransportErrorKind::custom_str(&message)
 }
 
 impl tower::Service<RequestPacket> for RuntimeTransport {
@@ -428,7 +541,94 @@ fn url_to_file_path(url: &Url) -> Result<PathBuf, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_json_rpc::{Id as RpcId, Request};
+    use axum::{Json, Router, routing::post};
     use reqwest::header::HeaderMap;
+    use serde_json::{Value, json};
+    use std::{io, time::Duration};
+    use tokio::{runtime::Builder, sync::Notify, time::timeout};
+
+    #[derive(Debug, Error)]
+    #[error("request to https://example.com/private-api-key failed")]
+    struct ProviderError {
+        #[source]
+        source: io::Error,
+    }
+
+    #[test]
+    fn http_transport_errors_preserve_provider_guidance() {
+        let endpoint =
+            Url::parse("https://user:password@example.com/private-api-key?token=secret").unwrap();
+        let error = TransportErrorKind::custom(ProviderError {
+            source: io::Error::other(
+                "Authorize an access key with:\n  cast tempo login --no-browser",
+            ),
+        });
+
+        let report = redact_http_transport_error(error, &endpoint).to_string();
+
+        assert!(report.contains("https://example.com/"));
+        assert!(report.contains("cast tempo login --no-browser"));
+        assert!(!report.contains("password"));
+        assert!(!report.contains("private-api-key"));
+        assert!(!report.contains("secret"));
+    }
+
+    #[test]
+    fn http_transport_errors_redact_endpoint_paths() {
+        let endpoint =
+            Url::parse("https://user:password@example.com/private-api-key?token=secret").unwrap();
+        let error = TransportErrorKind::custom_str(concat!(
+            "request to https://example.com/private-api-key failed: connection refused\n\n",
+            "Authorize an access key with:\n  cast tempo login"
+        ));
+
+        let error = redact_http_transport_error(error, &endpoint);
+        let report = error.to_string();
+
+        assert!(report.contains("https://example.com/"));
+        assert!(!report.contains("password"));
+        assert!(!report.contains("private-api-key"));
+        assert!(!report.contains("secret"));
+        assert!(report.to_lowercase().contains("connection refused"));
+        assert!(report.contains("cast tempo login"));
+    }
+
+    #[test]
+    fn http_transport_errors_redact_normalized_endpoint_variants() {
+        let endpoint =
+            Url::parse("https://user:password@example.com/private-api-key?token=secret").unwrap();
+        let error = TransportErrorKind::custom_str(
+            "request to https://USER:normalized@example.com:443/different%2Fpath?key=other failed",
+        );
+
+        let report = redact_http_transport_error(error, &endpoint).to_string();
+
+        assert!(report.contains("https://example.com/"));
+        assert!(!report.contains("normalized"));
+        assert!(!report.contains("different"));
+        assert!(!report.contains("other"));
+    }
+
+    #[tokio::test]
+    async fn websocket_error_redacts_url_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = Url::parse(&format!(
+            "ws://user:password@{address}/private-api-key?token=secret#fragment"
+        ))
+        .unwrap();
+        let transport = RuntimeTransportBuilder::new(url).build();
+
+        let error = transport.connect_ws().await.unwrap_err().to_string();
+
+        assert!(error.contains(&format!("ws://{address}/")));
+        assert!(!error.contains("user"));
+        assert!(!error.contains("password"));
+        assert!(!error.contains("private-api-key"));
+        assert!(!error.contains("secret"));
+    }
 
     #[tokio::test]
     async fn test_user_agent_header() {
@@ -461,5 +661,70 @@ mod tests {
         }
 
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_invalid_jwt() {
+        for scheme in ["http", "https", "ws", "wss"] {
+            for jwt in ["not-hex", "00"] {
+                let url = Url::parse(&format!("{scheme}://127.0.0.1:0")).unwrap();
+                let transport =
+                    RuntimeTransportBuilder::new(url).with_jwt(Some(jwt.to_string())).build();
+
+                let error = transport.connect().await.unwrap_err();
+
+                assert!(
+                    matches!(error, RuntimeTransportError::InvalidJwt(_)),
+                    "expected InvalidJwt for {scheme} with {jwt:?}, got {error:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_request_does_not_block_another_runtime() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let router = Router::new().route(
+            "/",
+            post({
+                let started = started.clone();
+                let release = release.clone();
+                move |Json(request): Json<Value>| {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        if request["method"] == "hold" {
+                            started.notify_one();
+                            release.notified().await;
+                        }
+                        Json(json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x1"}))
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let transport = RuntimeTransportBuilder::new(url).build();
+        let ready =
+            RequestPacket::from(Request::new("ready", RpcId::Number(1), ()).serialize().unwrap());
+        transport.request(ready.clone()).await.unwrap();
+        let hold = Request::new("hold", RpcId::Number(2), ()).serialize().unwrap().into();
+        let pending = tokio::spawn(transport.request(hold));
+        started.notified().await;
+
+        let result =
+            tokio::task::spawn_blocking(move || {
+                Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    timeout(Duration::from_secs(2), transport.request(ready)).await
+                })
+            })
+            .await
+            .unwrap();
+        release.notify_one();
+        pending.await.unwrap().unwrap();
+        server.abort();
+        result.expect("another runtime waited for an in-flight request").unwrap();
     }
 }

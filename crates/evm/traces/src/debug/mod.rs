@@ -1,4 +1,6 @@
+mod recording;
 mod sources;
+
 use crate::CallTraceNode;
 use alloy_dyn_abi::{
     DynSolType, DynSolValue, Specifier,
@@ -7,9 +9,12 @@ use alloy_dyn_abi::{
 use alloy_primitives::U256;
 use foundry_common::fmt::format_token;
 use foundry_compilers::artifacts::sourcemap::{Jump, SourceElement};
+pub use recording::{
+    DebugRecording, DebugStepSink, RecordedFrame, StepConverter, StepStorage, quantity,
+};
 use revm::bytecode::opcode::OpCode;
 use revm_inspectors::tracing::types::{CallTraceStep, DecodedInternalCall, DecodedTraceStep};
-pub use sources::{ArtifactData, ContractSources, DebugSourceScope, DebugVariable, SourceData};
+pub use sources::{ArtifactData, ContractSources, SourceData};
 
 #[derive(Clone, Debug)]
 pub struct DebugTraceIdentifier {
@@ -466,6 +471,9 @@ mod tests {
             gas_refund_counter: 0,
             gas_used: 0,
             gas_cost: 0,
+            state_gas_cost: None,
+            state_gas_reservoir: None,
+            state_gas_spent: 0,
             storage_change: None,
             status: Some(InstructionResult::Stop),
             immediate_bytes: None,

@@ -1,25 +1,36 @@
 use super::{
-    install,
     test::{ProjectPathsAwareFilter, TestArgs, TestExecutionOptions},
     watch::WatchArgs,
 };
 use crate::coverage::{
     BytecodeReporter, ContractId, CoverageAttributionReporter, CoverageReport, CoverageReporter,
-    CoverageSummaryReporter, DebugReporter, ItemAnchor, LcovReporter, ResolvedHitMap,
-    ResolvedHitMaps,
+    CoverageSummaryReporter, DebugReporter, GapsReporter, ItemAnchors, LcovReporter,
+    ResolvedHitMap, ResolvedHitMaps,
     analysis::{SourceAnalysis, SourceFiles},
     anchors::{find_anchors, find_execution_anchors},
 };
 use alloy_json_abi::StateMutability;
-use alloy_primitives::{Address, Bytes, U256, map::HashMap};
+use alloy_primitives::{
+    Address, B256, Bytes, U256, keccak256,
+    map::{HashMap, HashSet},
+};
 use clap::{Parser, ValueHint};
 use eyre::Result;
 use foundry_cli::utils::{FoundryPathExt, LoadConfig, STATIC_FUZZ_SEED};
-use foundry_common::{TestFilter, compile::ProjectCompiler, errors::convert_solar_errors};
+use foundry_common::{
+    ContractsByArtifactBuilder, TestFilter, compile::ProjectCompiler, errors::convert_solar_errors,
+    version::SHORT_VERSION,
+};
 use foundry_compilers::{
-    Artifact, ArtifactId, Project, ProjectCompileOutput, ProjectPathsConfig, VYPER_EXTENSIONS,
-    artifacts::{CompactBytecode, CompactDeployedBytecode, sourcemap::SourceMap},
-    compilers::{Language, multi::MultiCompilerLanguage},
+    Artifact, ArtifactId, Graph, Project, ProjectCompileOutput, ProjectPathsConfig,
+    VYPER_EXTENSIONS,
+    artifacts::{CompactBytecode, CompactDeployedBytecode, Source, sourcemap::SourceMap},
+    cache::SOLIDITY_FILES_CACHE_FILENAME,
+    compilers::{
+        Language,
+        multi::{MultiCompilerLanguage, MultiCompilerParser},
+    },
+    error::SolcError,
     utils::source_files_iter,
 };
 use foundry_config::{
@@ -30,7 +41,8 @@ use globset::{Glob, GlobSetBuilder};
 use rayon::prelude::*;
 use semver::Version;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -42,7 +54,7 @@ foundry_config::impl_figment_convert!(CoverageArgs, test);
 ///
 /// Most flags here have a corresponding `[profile.<name>.coverage]` config
 /// option in `foundry.toml`. CLI flags take precedence over config; the helper
-/// `resolve_with` merges them after the config is loaded.
+/// `resolve` merges them after the config is loaded.
 #[derive(Parser)]
 #[command(after_long_help = r#"Source attribution:
   Coverage follows compiler source maps. Inherited modifier code is reported under the
@@ -53,8 +65,9 @@ Compatibility:
   `forge coverage` supports test filters and `--watch`, but not test-only output or
   execution modes such as `--json`, `--junit`, `--list`, `--debug`, flame profiles,
   symbolic artifact replay, showmap replay, brutalization, or mutation testing. Use
-  `--report lcov` for interoperable coverage data or `--report attribution` for
-  Foundry's per-test JSON attribution report."#)]
+  `--report lcov` for interoperable coverage data, `--report attribution` for
+  Foundry's per-test JSON attribution report, or `--report gaps` for a JSON list of
+  uncovered source items."#)]
 pub struct CoverageArgs {
     /// The report type to use for coverage.
     ///
@@ -77,10 +90,6 @@ pub struct CoverageArgs {
     /// when not provided.
     #[arg(long = "lcov-version", value_parser = parse_lcov_version)]
     lcov_version_cli: Option<Version>,
-
-    /// The resolved LCOV version to use after merging CLI and config values.
-    #[arg(skip = Version::new(1, 0, 0))]
-    lcov_version: Version,
 
     /// Enable viaIR with minimum optimization
     ///
@@ -108,21 +117,31 @@ pub struct CoverageArgs {
     #[arg(long)]
     exclude_tests: bool,
 
-    /// The coverage reporters to use. Constructed from the other fields.
-    #[arg(skip)]
-    reporters: Vec<Box<dyn CoverageReporter>>,
-
-    /// Glob patterns of source files to exclude from the coverage report.
-    /// Populated from `[profile.<name>.coverage] skip_files` after config is
-    /// loaded; not exposed directly on the CLI.
-    #[arg(skip)]
-    skip_files: Vec<String>,
-
     #[command(flatten)]
     test: TestArgs,
 }
 
-impl CoverageArgs {
+/// The coverage settings of a run: the CLI flags merged with the
+/// `[profile.<name>.coverage]` config values by [`CoverageArgs::resolve`].
+#[derive(Debug)]
+struct CoverageSettings {
+    /// The report types to generate. Never empty.
+    report: Vec<CoverageReportKind>,
+    /// The version of the LCOV "tracefile" format to use.
+    lcov_version: Version,
+    /// Whether to enable viaIR with minimum optimization.
+    ir_minimum: bool,
+    /// The path to output a single file report to.
+    report_file: Option<PathBuf>,
+    /// Whether to include dependency sources in the coverage report.
+    include_libs: bool,
+    /// Whether to exclude tests from the coverage report.
+    exclude_tests: bool,
+    /// Glob patterns of source files to exclude from the coverage report.
+    skip_files: Vec<String>,
+}
+
+impl CoverageSettings {
     fn report_path(&self, root: &Path, default_file_name: &str) -> PathBuf {
         let report_file =
             (self.file_report_count() == 1).then_some(self.report_file.as_deref()).flatten();
@@ -133,91 +152,14 @@ impl CoverageArgs {
         let has_lcov = self.report.iter().any(|kind| matches!(kind, CoverageReportKind::Lcov));
         let has_attribution =
             self.report.iter().any(|kind| matches!(kind, CoverageReportKind::Attribution));
-        usize::from(has_lcov) + usize::from(has_attribution)
+        let has_gaps = self.report.iter().any(|kind| matches!(kind, CoverageReportKind::Gaps));
+        usize::from(has_lcov) + usize::from(has_attribution) + usize::from(has_gaps)
     }
 
-    pub(crate) fn ensure_mode_compatible(&self) -> Result<()> {
-        self.test.ensure_coverage_mode_compatible()
-    }
-
-    pub async fn run(mut self) -> Result<()> {
-        self.ensure_mode_compatible()?;
-
-        let (mut config, evm_opts) = self.load_config_and_evm_opts()?;
-
-        // install missing dependencies
-        if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
-        {
-            // need to re-configure here to also catch additional remappings
-            config = self.load_config()?;
-        }
-
-        // Default to a static fuzz seed so coverage reports are deterministic,
-        // but allow the user to override it via `--fuzz-seed` or `[fuzz] seed` in config.
-        if config.fuzz.seed.is_none() {
-            config.fuzz.seed = Some(U256::from_be_bytes(STATIC_FUZZ_SEED));
-        }
-
-        // Merge CLI args with `[profile.<name>.coverage]` config values. CLI
-        // flags take precedence; unset CLI flags fall back to the config.
-        self.resolve_with(&config.coverage);
-        let filter = self.test.filter(&config)?;
-
-        let (paths, mut output) = {
-            let (project, output) = self.build(&config, &filter)?;
-            (project.paths, output)
-        };
-
-        if self.report_file.is_some() && self.file_report_count() > 1 {
-            sh_warn!(
-                "`--report-file` is ignored when multiple file reports are requested; \
-                 each report will use its default output path"
-            )?;
-        }
-
-        self.populate_reporters(&paths.root);
-
-        sh_println!("Analysing contracts...")?;
-        let report = self.prepare(&paths, &mut output)?;
-
-        sh_println!("Running tests...")?;
-        self.collect(&paths.root, &output, report, config, evm_opts, filter).await
-    }
-
-    /// Merge `[profile.<name>.coverage]` config values into this struct. CLI
-    /// flags already set on `self` win; unset/false flags inherit from
-    /// `config`.
-    ///
-    /// After this returns:
-    /// - `self.report` is non-empty.
-    /// - boolean flags reflect `cli || config` (CLI cannot disable a flag set to `true` in config;
-    ///   this matches the pre-existing flag-only semantics where booleans defaulted to `false`).
-    fn resolve_with(&mut self, config: &CoverageConfig) {
-        if self.report.is_empty() {
-            self.report.clone_from(&config.report);
-        }
-        self.lcov_version =
-            self.lcov_version_cli.clone().unwrap_or_else(|| config.lcov_version.clone());
-        if !self.ir_minimum {
-            self.ir_minimum = config.ir_minimum;
-        }
-        if self.report_file.is_none() {
-            self.report_file.clone_from(&config.report_file);
-        }
-        if !self.include_libs {
-            self.include_libs = config.include_libs;
-        }
-        if !self.exclude_tests {
-            self.exclude_tests = config.exclude_tests;
-        }
-        // Glob filters are additive — there's no CLI flag for these, so always
-        // take from config.
-        self.skip_files.clone_from(&config.skip_files);
-    }
-
-    fn populate_reporters(&mut self, root: &Path) {
-        self.reporters = self
-            .report
+    /// The reporters that write the requested reports, except the attribution report, which
+    /// needs the test outcome.
+    fn reporters(&self, root: &Path) -> Vec<Box<dyn CoverageReporter>> {
+        self.report
             .iter()
             .filter_map(|report_kind| match report_kind {
                 CoverageReportKind::Summary => {
@@ -233,19 +175,140 @@ impl CoverageArgs {
                 ))),
                 CoverageReportKind::Debug => Some(Box::new(DebugReporter)),
                 CoverageReportKind::Attribution => None,
+                CoverageReportKind::Gaps => {
+                    let path = self.report_path(root, "coverage-gaps.json");
+                    Some(Box::new(GapsReporter::new(root.to_path_buf(), path)))
+                }
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+}
+
+impl CoverageArgs {
+    pub(crate) fn ensure_mode_compatible(&self) -> Result<()> {
+        self.test.ensure_coverage_mode_compatible()
+    }
+
+    pub async fn run(self) -> Result<()> {
+        self.ensure_mode_compatible()?;
+
+        let (mut config, evm_opts) = self.load_config_and_evm_opts()?;
+
+        // install missing dependencies
+        self.install_missing_dependencies(&mut config)?;
+
+        // Default to a static fuzz seed so coverage reports are deterministic,
+        // but allow the user to override it via `--fuzz-seed` or `[fuzz] seed` in config.
+        if config.fuzz.seed.is_none() {
+            config.fuzz.seed = Some(U256::from_be_bytes(STATIC_FUZZ_SEED));
+        }
+
+        // Merge CLI args with `[profile.<name>.coverage]` config values. CLI
+        // flags take precedence; unset CLI flags fall back to the config.
+        let settings = self.resolve(&config.coverage);
+        let filter = self.test.filter(&config)?;
+
+        let (paths, mut output) = {
+            let (project, output) = Self::build(&config, &filter, settings.ir_minimum)?;
+            (project.paths, output)
+        };
+
+        if settings.report_file.is_some() && settings.file_report_count() > 1 {
+            sh_warn!(
+                "`--report-file` is ignored when multiple file reports are requested; \
+                 each report will use its default output path"
+            )?;
+        }
+
+        let mut reporters = settings.reporters(&paths.root);
+
+        sh_println!("Analysing contracts...")?;
+        let report = Self::prepare(&settings, &reporters, &paths, &mut output)?;
+
+        sh_println!("Running tests...")?;
+        self.collect(
+            &settings,
+            &mut reporters,
+            &paths.root,
+            &output,
+            report,
+            config,
+            evm_opts,
+            filter,
+        )
+        .await
+    }
+
+    /// Merges `[profile.<name>.coverage]` config values with the CLI flags. CLI
+    /// flags that are set win; unset/false flags inherit from `config`.
+    ///
+    /// In the result:
+    /// - `report` is non-empty.
+    /// - boolean flags reflect `cli || config` (CLI cannot disable a flag set to `true` in config;
+    ///   this matches the pre-existing flag-only semantics where booleans defaulted to `false`).
+    fn resolve(&self, config: &CoverageConfig) -> CoverageSettings {
+        CoverageSettings {
+            report: if self.report.is_empty() {
+                config.report.clone()
+            } else {
+                self.report.clone()
+            },
+            lcov_version: self
+                .lcov_version_cli
+                .clone()
+                .unwrap_or_else(|| config.lcov_version.clone()),
+            ir_minimum: self.ir_minimum || config.ir_minimum,
+            report_file: self.report_file.clone().or_else(|| config.report_file.clone()),
+            include_libs: self.include_libs || config.include_libs,
+            exclude_tests: self.exclude_tests || config.exclude_tests,
+            // Glob filters are additive — there's no CLI flag for these, so always
+            // take from config.
+            skip_files: config.skip_files.clone(),
+        }
     }
 
     /// Builds the project.
     fn build(
-        &self,
         config: &Config,
         filter: &ProjectPathsAwareFilter,
+        ir_minimum: bool,
     ) -> Result<(Project, ProjectCompileOutput)> {
         let mut project = config.ephemeral_project()?;
+        // A contended or unavailable cache retains ephemeral compilation. Keep the lock until
+        // artifacts and build contexts have been loaded or published together.
+        let cache = (config.cache && !config.deny.warnings())
+            .then(|| config.coverage_cache_path())
+            .flatten()
+            .and_then(|path| {
+                fs::create_dir_all(path.parent()?).ok()?;
+                let lock = Config::lock_coverage_cache(&path).ok()?;
+                match fs::create_dir(&path) {
+                    Ok(()) => {
+                        if fs::File::create_new(path.join(Config::COVERAGE_CACHE_MARKER)).is_err() {
+                            let _ = fs::remove_dir(&path);
+                            return None;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if !path.join(Config::COVERAGE_CACHE_MARKER).is_file() {
+                            return None;
+                        }
+                    }
+                    Err(_) => return None,
+                }
+                Some((path, lock))
+            });
+        let original_paths = project.paths.clone();
+        if let Some((path, _)) = &cache {
+            project.cached = true;
+            project.no_artifacts = false;
+            project.paths.cache = path.join(SOLIDITY_FILES_CACHE_FILENAME);
+            project.paths.artifacts = path.join("artifacts");
+            project.paths.build_infos = path.join("build-info");
+            project.paths.slash_paths();
+        }
 
-        if self.ir_minimum {
+        if ir_minimum {
             sh_warn!(
                 "`--ir-minimum` enables `viaIR` with minimum optimization, \
                  which can result in inaccurate source mappings.\n\
@@ -262,11 +325,12 @@ impl CoverageArgs {
             )?;
         }
 
-        config.disable_optimizations(&mut project, self.ir_minimum);
+        config.disable_optimizations(&mut project, ir_minimum);
 
-        let mut compiler = ProjectCompiler::new().dynamic_test_linking(config.dynamic_test_linking);
-        if filter.args().path_pattern.is_some() || filter.args().path_pattern_inverse.is_some() {
-            let sources = source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS)
+        let files = (filter.args().path_pattern.is_some()
+            || filter.args().path_pattern_inverse.is_some())
+        .then(|| {
+            source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS)
                 .chain(
                     source_files_iter(&config.test, MultiCompilerLanguage::FILE_EXTENSIONS)
                         // Preserve path-filter behavior for conventional test files while still
@@ -275,10 +339,121 @@ impl CoverageArgs {
                 )
                 // Coverage reports include scripts even though they are not test targets.
                 .chain(source_files_iter(&config.script, MultiCompilerLanguage::FILE_EXTENSIONS))
-                .collect::<BTreeSet<_>>();
-            compiler = compiler.files(sources);
-        }
-        let output = compiler.compile(&project)?.with_stripped_file_prefixes(project.root());
+                .collect::<BTreeSet<_>>()
+        });
+        let compile = |project: &Project| {
+            let mut compiler = ProjectCompiler::new()
+                .allow_linked_libraries(config.allow_linked_libraries)
+                .external_compilers(config)
+                .external_artifacts(false)
+                .dynamic_test_linking(config.dynamic_test_linking);
+            if let Some(files) = &files {
+                compiler = compiler.files(files.iter().cloned());
+            }
+            compiler.compile(project)
+        };
+        // Coverage needs complete build contexts, including sources without contract artifacts.
+        // Invalidate the owned cache as a whole on edits so source IDs, artifact names, and
+        // build-info files all belong to the same compilation.
+        let cached_output = (|| -> Result<Option<ProjectCompileOutput>> {
+            let Some((path, _)) = &cache else { return Ok(None) };
+            let mut sources = if let Some(files) = &files
+                && !files.is_empty()
+            {
+                Source::read_all(files)?
+            } else {
+                project.paths.read_input_files()?
+            };
+            if let Some(filter) = &project.sparse_output {
+                sources.retain(|path, _| filter.is_match(path));
+            }
+            let graph = Graph::<MultiCompilerParser>::resolve_sources(&project.paths, sources)?;
+            let resolved = graph.into_sources_by_version(&project)?;
+            let mut jobs = resolved
+                .sources
+                .iter()
+                .flat_map(|(language, jobs)| {
+                    jobs.iter().map(move |(version, sources, (profile, settings))| {
+                        let sources = sources
+                            .iter()
+                            .map(|(path, source)| {
+                                (path, source.content_hash(), source.kind.is_dirty())
+                            })
+                            .collect::<Vec<_>>();
+                        serde_json::to_value((language, version, profile, settings, sources))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            jobs.sort_unstable_by_key(serde_json::Value::to_string);
+            let primary_profiles = resolved.primary_profiles.iter().collect::<BTreeMap<_, _>>();
+            let mut identity = serde_json::to_value((
+                SHORT_VERSION,
+                &project.paths,
+                (&config.solc, &config.vyper, &config.extra_args),
+                (&config.extra_output, &config.extra_output_files),
+                config.dynamic_test_linking,
+                jobs,
+                primary_profiles,
+            ))?;
+            identity.sort_all_objects();
+            let fingerprint = keccak256(serde_json::to_vec(&identity)?).to_string();
+            let marker = path.join(Config::COVERAGE_CACHE_MARKER);
+            if fs::read_to_string(&marker).ok().as_deref() != Some(&fingerprint) {
+                // Retain ownership even if compilation fails before the new fingerprint is saved.
+                fs::write(&marker, "")?;
+                for entry in fs::read_dir(path)? {
+                    let entry = entry?;
+                    if entry.file_name() == Config::COVERAGE_CACHE_MARKER {
+                        continue;
+                    }
+                    if entry.file_type()?.is_dir() {
+                        fs::remove_dir_all(entry.path())?;
+                    } else {
+                        fs::remove_file(entry.path())?;
+                    }
+                }
+            }
+            let output = compile(&project)?;
+            // Compiler builds with no artifacts can be pruned from the cache. Coverage still
+            // reports their free functions, so recover their source IDs with a fresh compilation.
+            let mapped_sources = output
+                .builds()
+                .flat_map(|(_, build)| build.source_id_to_path.values().map(PathBuf::as_path))
+                .collect::<HashSet<_>>();
+            if output
+                .graph()
+                .files()
+                .any(|idx| !mapped_sources.contains(output.graph().node_path(idx)))
+            {
+                return Ok(None);
+            }
+            // Publication is optional once the compiler has returned a complete output.
+            if let Err(err) = fs::write(marker, fingerprint) {
+                debug!(%err, "failed to publish coverage cache fingerprint");
+            }
+            Ok(Some(output))
+        })();
+        let output = match cached_output {
+            Ok(Some(output)) => output,
+            Err(err)
+                if !err.chain().any(|cause| {
+                    cause.is::<std::io::Error>()
+                        || matches!(cause.downcast_ref(), Some(SolcError::Io(_)))
+                }) =>
+            {
+                return Err(err);
+            }
+            result => {
+                if let Err(err) = result {
+                    debug!(%err, "coverage cache unavailable; compiling without persistence");
+                }
+                project.cached = false;
+                project.no_artifacts = true;
+                project.paths = original_paths;
+                compile(&project)?
+            }
+        };
+        let output = output.with_stripped_file_prefixes(project.root());
 
         Ok((project, output))
     }
@@ -286,7 +461,8 @@ impl CoverageArgs {
     /// Builds the coverage report.
     #[instrument(name = "Coverage::prepare", skip_all)]
     fn prepare(
-        &self,
+        settings: &CoverageSettings,
+        reporters: &[Box<dyn CoverageReporter>],
         project_paths: &ProjectPathsConfig,
         output: &mut ProjectCompileOutput,
     ) -> Result<CoverageReport> {
@@ -302,32 +478,30 @@ impl CoverageArgs {
 
         // Collect source files.
         let mut sources_by_build = HashMap::<String, SourceFiles>::default();
-        for (path, sources) in &output.output().sources.0 {
-            // Filter out vyper sources.
-            if path
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|ext| VYPER_EXTENSIONS.contains(&ext))
-            {
-                continue;
-            }
+        for (build_id, build) in output.builds() {
+            for (source_id, path) in &build.source_id_to_path {
+                if output.graph().get_parsed_source(path).is_none()
+                    || path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|ext| VYPER_EXTENSIONS.contains(&ext))
+                {
+                    continue;
+                }
+                let path = path.strip_prefix(&project_paths.root).unwrap_or(path);
+                report.add_source(build_id.clone(), *source_id as usize, path.to_path_buf());
 
-            for source in sources {
-                let source_file = &source.source_file;
-                report.add_source(source.build_id.clone(), source_file.id as usize, path.clone());
-
-                // Filter out libs dependencies and tests.
-                if (!self.include_libs && project_paths.has_library_ancestor(path))
-                    || (self.exclude_tests && project_paths.is_test(path))
+                if (!settings.include_libs && project_paths.has_library_ancestor(path))
+                    || (settings.exclude_tests && project_paths.is_test(path))
                 {
                     continue;
                 }
 
                 sources_by_build
-                    .entry(source.build_id.clone())
+                    .entry(build_id.clone())
                     .or_default()
                     .sources
-                    .insert(source_file.id, project_paths.root.join(path));
+                    .insert(*source_id, project_paths.root.join(path));
             }
         }
 
@@ -373,7 +547,7 @@ impl CoverageArgs {
             report.add_analysis(build_id.clone(), source_analysis);
         }
 
-        if self.reporters.iter().any(|reporter| reporter.needs_source_maps()) {
+        if reporters.iter().any(|reporter| reporter.needs_source_maps()) {
             report.add_source_maps(artifacts.into_iter().map(|artifact| {
                 (artifact.contract_id, (artifact.creation.source_map, artifact.deployed.source_map))
             }));
@@ -384,8 +558,11 @@ impl CoverageArgs {
 
     /// Runs tests, collects coverage data and generates the final report.
     #[instrument(name = "Coverage::collect", skip_all)]
+    #[allow(clippy::too_many_arguments)]
     async fn collect(
         mut self,
+        settings: &CoverageSettings,
+        reporters: &mut [Box<dyn CoverageReporter>],
         project_root: &Path,
         output: &ProjectCompileOutput,
         mut report: CoverageReport,
@@ -407,7 +584,14 @@ impl CoverageArgs {
             .await?;
 
         let known_contracts = outcome.known_contracts.as_ref().unwrap();
+        // Linking removes library references. Match runtime against the compiler artifacts to
+        // retain those offsets, while keeping linked bytecode for creation matching.
+        let runtime_contracts = ContractsByArtifactBuilder::new(
+            output.artifact_ids().map(|(id, artifact)| (id, artifact.into())),
+        )
+        .build();
         let mut resolved_hit_maps = ResolvedHitMaps::default();
+        let mut unresolved_hit_maps = HashSet::<B256>::default();
 
         // Add hit data to the coverage report
         for suite in outcome.results.values() {
@@ -423,16 +607,42 @@ impl CoverageArgs {
                         )?;
                         continue;
                     }
+                    if unresolved_hit_maps.contains(code_hash) {
+                        continue;
+                    }
 
-                    let Some((artifact_id, is_deployed_code)) = known_contracts
-                        .find_by_deployed_code(map.bytecode())
+                    // Only exact matches are credited: source maps of a merely similar artifact
+                    // would attribute hits to code that never ran. Creation code may be followed
+                    // by any constructor data, which leaves the artifact's instructions unchanged.
+                    let Some((artifact_id, is_deployed_code)) = runtime_contracts
+                        .find_by_deployed_code_exact(map.bytecode())
                         .map(|(id, _)| (id, true))
                         .or_else(|| {
                             known_contracts
-                                .find_by_creation_code(map.bytecode())
+                                .iter()
+                                .find(|(_, contract)| {
+                                    contract
+                                        .bytecode()
+                                        .is_some_and(|code| map.bytecode().starts_with(code))
+                                })
                                 .map(|(id, _)| (id, false))
                         })
                     else {
+                        if let Some((similar, kind)) = known_contracts
+                            .find_by_deployed_code(map.bytecode())
+                            .map(|(id, _)| (id, "runtime"))
+                            .or_else(|| {
+                                known_contracts
+                                    .find_by_creation_code(map.bytecode())
+                                    .map(|(id, _)| (id, "creation"))
+                            })
+                        {
+                            sh_warn!(
+                                "excluding executed {kind} code from coverage: it resembles `{}` but does not match it exactly",
+                                similar.identifier()
+                            )?;
+                        }
+                        unresolved_hit_maps.insert(*code_hash);
                         continue;
                     };
 
@@ -465,9 +675,9 @@ impl CoverageArgs {
                 !not_re.is_match(&path.to_string_lossy())
             });
         }
-        if !self.skip_files.is_empty() {
+        if !settings.skip_files.is_empty() {
             let mut builder = GlobSetBuilder::new();
-            for pattern in &self.skip_files {
+            for pattern in &settings.skip_files {
                 let glob = Glob::new(pattern).map_err(|e| {
                     eyre::eyre!("invalid glob in coverage.skip_files: '{pattern}': {e}")
                 })?;
@@ -483,11 +693,11 @@ impl CoverageArgs {
         }
 
         // Output final reports.
-        self.report(&report)?;
+        Self::report(reporters, &report)?;
 
-        if self.report.iter().any(|kind| matches!(kind, CoverageReportKind::Attribution)) {
+        if settings.report.iter().any(|kind| matches!(kind, CoverageReportKind::Attribution)) {
             let reporter = CoverageAttributionReporter::new(
-                self.report_path(project_root, "coverage-attribution.json"),
+                settings.report_path(project_root, "coverage-attribution.json"),
             );
             reporter.report(&report, &outcome, &resolved_hit_maps)?;
         }
@@ -500,8 +710,8 @@ impl CoverageArgs {
     }
 
     #[instrument(name = "Coverage::report", skip_all)]
-    fn report(&mut self, report: &CoverageReport) -> Result<()> {
-        for reporter in &mut self.reporters {
+    fn report(reporters: &mut [Box<dyn CoverageReporter>], report: &CoverageReport) -> Result<()> {
+        for reporter in reporters {
             let _guard = debug_span!("reporter.report", kind=%reporter.name()).entered();
             reporter.report(report)?;
         }
@@ -605,7 +815,7 @@ impl BytecodeData {
         Self { source_map, bytecode, ic_pc_map }
     }
 
-    pub fn find_anchors(&self, source_analysis: &SourceAnalysis) -> Vec<ItemAnchor> {
+    pub fn find_anchors(&self, source_analysis: &SourceAnalysis) -> ItemAnchors {
         find_anchors(&self.bytecode, &self.source_map, &self.ic_pc_map, source_analysis)
     }
 }
@@ -625,31 +835,31 @@ mod tests {
 
     #[test]
     fn resolve_lcov_version_uses_config_when_cli_absent() {
-        let mut args = CoverageArgs::parse_from(["coverage"]);
+        let args = CoverageArgs::parse_from(["coverage"]);
         let config = CoverageConfig { lcov_version: Version::new(2, 2, 0), ..Default::default() };
 
-        args.resolve_with(&config);
+        let settings = args.resolve(&config);
 
-        assert_eq!(args.lcov_version, Version::new(2, 2, 0));
+        assert_eq!(settings.lcov_version, Version::new(2, 2, 0));
     }
 
     #[test]
     fn resolve_lcov_version_keeps_explicit_cli_default() {
-        let mut args = CoverageArgs::parse_from(["coverage", "--lcov-version", "1"]);
+        let args = CoverageArgs::parse_from(["coverage", "--lcov-version", "1"]);
         let config = CoverageConfig { lcov_version: Version::new(2, 2, 0), ..Default::default() };
 
-        args.resolve_with(&config);
+        let settings = args.resolve(&config);
 
-        assert_eq!(args.lcov_version, Version::new(1, 0, 0));
+        assert_eq!(settings.lcov_version, Version::new(1, 0, 0));
     }
 
     #[test]
     fn resolve_lcov_version_keeps_explicit_cli_value() {
-        let mut args = CoverageArgs::parse_from(["coverage", "--lcov-version", "2"]);
+        let args = CoverageArgs::parse_from(["coverage", "--lcov-version", "2"]);
         let config = CoverageConfig { lcov_version: Version::new(2, 2, 0), ..Default::default() };
 
-        args.resolve_with(&config);
+        let settings = args.resolve(&config);
 
-        assert_eq!(args.lcov_version, Version::new(2, 0, 0));
+        assert_eq!(settings.lcov_version, Version::new(2, 0, 0));
     }
 }

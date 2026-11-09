@@ -1,10 +1,10 @@
 use alloy_primitives::{
     Address, U256,
-    map::{DefaultHashBuilder, Entry, HashMap},
+    map::{Entry, HashMap},
 };
 use core::{
     fmt,
-    hash::{BuildHasher, Hash, Hasher},
+    hash::{Hash, Hasher},
 };
 use revm::{
     Inspector,
@@ -89,12 +89,33 @@ pub struct CmpOperands {
     pub opcode: u8,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// Identity of a control-flow edge: the jump at `pc` in the code running at `address` to
+/// `jump_dest`, optionally split by call depth.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct EdgeKey {
     pub address: Address,
     pub depth: Option<usize>,
     pub pc: usize,
     pub jump_dest: U256,
+}
+
+impl Hash for EdgeKey {
+    /// Hashes a 24-byte digest of the key instead of all 80 bytes.
+    ///
+    /// The map that counts hits is probed once per executed `JUMP` and `JUMPI`, so the hash is
+    /// on the hot path of every coverage-guided run. Equal keys still hash equal because the
+    /// digest is a function of the key; the fields it leaves out only take part in equality.
+    /// The low eight bytes of the address separate distinct contracts, the jump source and
+    /// destination separate edges within a contract, and the rotated depth keeps same-edge keys at
+    /// different depths apart when depth is part of the identity.
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let address = u64::from_be_bytes(self.address.0[12..].try_into().unwrap());
+        let depth = self.depth.map_or(0, |depth| (depth as u64).rotate_left(48));
+        state.write_u64(address);
+        state.write_u64(self.pc as u64 ^ depth);
+        state.write_u64(self.jump_dest.as_limbs()[0]);
+    }
 }
 
 impl EdgeKey {
@@ -171,10 +192,11 @@ pub struct EdgeCovInspector {
     collect_edges: bool,
     /// Per-execution dense edge hitcounts. Stable IDs are assigned by the corpus history owner.
     dense_hitcount: HashMap<EdgeKey, u8>,
-    hash_builder: DefaultHashBuilder,
     /// Comparison operand log for CmpLog-style guided fuzzing.
     cmp_log: Option<Vec<CmpOperands>>,
     cmp_site_counts: HashMap<CmpSiteKey, u8>,
+    /// Operands of the last `SUB`, logged when the next `JUMPI` branches on its result.
+    last_sub: Option<CmpOperands>,
 }
 
 impl fmt::Debug for EdgeCovInspector {
@@ -223,9 +245,9 @@ impl EdgeCovInspector {
             config,
             collect_edges: true,
             dense_hitcount: HashMap::default(),
-            hash_builder: DefaultHashBuilder::default(),
             cmp_log: None,
             cmp_site_counts: HashMap::default(),
+            last_sub: None,
         }
     }
 
@@ -236,6 +258,7 @@ impl EdgeCovInspector {
         } else {
             self.cmp_log = None;
             self.cmp_site_counts.clear();
+            self.last_sub = None;
         }
     }
 
@@ -249,6 +272,7 @@ impl EdgeCovInspector {
             cmp_log.clear();
         }
         self.cmp_site_counts.clear();
+        self.last_sub = None;
     }
 
     /// Get an immutable reference to the comparison operand log.
@@ -299,16 +323,16 @@ impl EdgeCovInspector {
         pc: usize,
         jump_dest: U256,
     ) -> usize {
-        let mut hasher = self.hash_builder.build_hasher();
-        address.hash(&mut hasher);
+        let mut hash = FNV_OFFSET_BASIS;
+        hash_bytes(&mut hash, address.as_slice());
         if self.config.include_call_depth {
-            depth.hash(&mut hasher);
+            hash_bytes(&mut hash, &depth.to_le_bytes());
         }
-        pc.hash(&mut hasher);
-        jump_dest.hash(&mut hasher);
+        hash_bytes(&mut hash, &pc.to_le_bytes());
+        hash_bytes(&mut hash, &jump_dest.to_be_bytes::<32>());
         // The hash is used to index into the hitcount array,
         // so it must be modulo the map size.
-        (hasher.finish() % self.hitcount.len() as u64) as usize
+        (hash % self.hitcount.len() as u64) as usize
     }
 
     #[cfg(test)]
@@ -338,6 +362,18 @@ impl EdgeCovInspector {
         } else if self.cmp_site_counts.len() < MAX_CMP_LOG_SITES {
             self.cmp_site_counts.insert(site, 1);
             cmp_log.push(cmp);
+        }
+    }
+
+    /// Logs the last `SUB` as an equality comparison when a `JUMPI` at `address` branches on its
+    /// nonzero result: solc compiles `if (a == b)` to `SUB` + `JUMPI`.
+    fn store_sub_branch(&mut self, condition: U256, address: Address) {
+        if let Some(sub) = self.last_sub.take()
+            && sub.address == address
+            && !condition.is_zero()
+            && condition == sub.op1.wrapping_sub(sub.op2)
+        {
+            self.store_cmp(sub);
         }
     }
 
@@ -404,6 +440,17 @@ impl EdgeCovInspector {
                     });
                 }
             }
+            op @ opcode::SUB => {
+                if let (Ok(op1), Ok(op2)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+                    self.last_sub =
+                        Some(CmpOperands { op1, op2, pc: current_pc, address, opcode: op });
+                }
+            }
+            opcode::JUMPI => {
+                if let Ok(condition) = interp.stack.peek(1) {
+                    self.store_sub_branch(condition, address);
+                }
+            }
             _ => {}
         }
     }
@@ -447,7 +494,14 @@ where
         if self.cmp_log.is_some()
             && matches!(
                 op,
-                opcode::EQ | opcode::LT | opcode::GT | opcode::SLT | opcode::SGT | opcode::ISZERO
+                opcode::EQ
+                    | opcode::LT
+                    | opcode::GT
+                    | opcode::SLT
+                    | opcode::SGT
+                    | opcode::ISZERO
+                    | opcode::SUB
+                    | opcode::JUMPI
             )
         {
             self.do_cmp_step(interp);
@@ -455,16 +509,36 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CmpSiteKey {
     address: Address,
     pc: usize,
     opcode: u8,
 }
 
+impl Hash for CmpSiteKey {
+    /// Hashes a 16-byte digest of the site, for the same reason as [`EdgeKey`].
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let address = u64::from_be_bytes(self.address.0[12..].try_into().unwrap());
+        state.write_u64(address);
+        state.write_u64(self.pc as u64 ^ u64::from(self.opcode).rotate_left(56));
+    }
+}
+
 impl CmpSiteKey {
     const fn new(cmp: &CmpOperands) -> Self {
         Self { address: cmp.address, pc: cmp.pc, opcode: cmp.opcode }
+    }
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
     }
 }
 
@@ -511,7 +585,7 @@ mod tests {
         let mut inspector = EdgeCovInspector::with_cmp_log_only();
         let addr = Address::ZERO;
 
-        inspector.store_hit(addr, 0, 0, U256::from(1));
+        inspector.store_hit(addr, 0, 0, U256::ONE);
         inspector.store_cmp(CmpOperands {
             op1: U256::from(123),
             op2: U256::from(456),
@@ -570,7 +644,7 @@ mod tests {
         let addr = Address::ZERO;
 
         for _ in 0..256 {
-            inspector.store_hit(addr, 0, 0, U256::from(1));
+            inspector.store_hit(addr, 0, 0, U256::ONE);
         }
 
         assert_eq!(inspector.edge_count(), 1);
@@ -582,7 +656,7 @@ mod tests {
         let mut inspector = EdgeCovInspector::new();
         let addr = Address::ZERO;
 
-        inspector.store_hit(addr, 0, 0, U256::from(1));
+        inspector.store_hit(addr, 0, 0, U256::ONE);
         inspector.store_hit(addr, 0, 0, U256::from(2));
         assert_eq!(inspector.edge_count(), 2);
         assert_eq!(dense_counts(&inspector), [1, 1]);
@@ -591,27 +665,21 @@ mod tests {
         assert_eq!(inspector.edge_count(), 0);
         assert!(inspector.dense_hits().is_empty());
 
-        inspector.store_hit(addr, 0, 0, U256::from(1));
+        inspector.store_hit(addr, 0, 0, U256::ONE);
         assert_eq!(inspector.edge_count(), 1);
         assert_eq!(dense_counts(&inspector), [1]);
     }
 
     #[test]
-    fn legacy_hash_ids_match_old_calculation() {
+    fn hash_ids_use_stable_encoding() {
         let mut inspector = EdgeCovInspector::with_config(EdgeCovConfig::legacy_hash_ids());
         let addr = Address::ZERO;
         let pc = 42;
         let jump_dest = U256::from(100);
 
-        let mut hasher = inspector.hash_builder.build_hasher();
-        addr.hash(&mut hasher);
-        pc.hash(&mut hasher);
-        jump_dest.hash(&mut hasher);
-        let expected_id = (hasher.finish() % MAX_EDGE_COUNT as u64) as usize;
-
         inspector.store_hit(addr, 0, pc, jump_dest);
 
-        assert_eq!(inspector.hitcount[expected_id], 1);
+        assert_eq!(inspector.hitcount[65235], 1);
         assert_eq!(inspector.hitcount.iter().filter(|&&count| count != 0).count(), 1);
     }
 
@@ -620,15 +688,15 @@ mod tests {
         let addr = Address::ZERO;
 
         let mut without_depth = EdgeCovInspector::new();
-        without_depth.store_hit(addr, 0, 0, U256::from(1));
-        without_depth.store_hit(addr, 1, 0, U256::from(1));
+        without_depth.store_hit(addr, 0, 0, U256::ONE);
+        without_depth.store_hit(addr, 1, 0, U256::ONE);
         assert_eq!(without_depth.edge_count(), 1);
         assert_eq!(dense_counts(&without_depth), [2]);
 
         let mut with_depth =
             EdgeCovInspector::with_config(EdgeCovConfig::new(EdgeCovKind::CollisionFree, true));
-        with_depth.store_hit(addr, 0, 0, U256::from(1));
-        with_depth.store_hit(addr, 1, 0, U256::from(1));
+        with_depth.store_hit(addr, 0, 0, U256::ONE);
+        with_depth.store_hit(addr, 1, 0, U256::ONE);
         assert_eq!(with_depth.edge_count(), 2);
         assert_eq!(dense_counts(&with_depth), [1, 1]);
     }
@@ -637,7 +705,7 @@ mod tests {
     fn reset_clears_hitcount_and_cmp_log() {
         let mut inspector = EdgeCovInspector::with_cmp_log();
 
-        inspector.store_hit(Address::ZERO, 0, 0, U256::from(1));
+        inspector.store_hit(Address::ZERO, 0, 0, U256::ONE);
         inspector.store_cmp(CmpOperands {
             op1: U256::from(123),
             op2: U256::from(456),
@@ -692,5 +760,30 @@ mod tests {
 
         assert_eq!(inspector.get_cmp_log().len(), usize::from(MAX_CMP_OBSERVATIONS_PER_SITE) + 1);
         assert_eq!(inspector.get_cmp_log().last().unwrap().pc, 2);
+    }
+
+    #[test]
+    fn sub_is_logged_only_when_next_jumpi_branches_on_its_nonzero_result() {
+        let mut inspector = EdgeCovInspector::with_cmp_log();
+        let address = Address::repeat_byte(0xaa);
+        let sub = CmpOperands {
+            op1: U256::from(7),
+            op2: U256::from(42),
+            pc: 3,
+            address,
+            opcode: opcode::SUB,
+        };
+        let result = sub.op1.wrapping_sub(sub.op2);
+
+        inspector.last_sub = Some(sub);
+        inspector.store_sub_branch(result, Address::ZERO);
+        inspector.last_sub = Some(CmpOperands { op2: sub.op1, ..sub });
+        inspector.store_sub_branch(U256::ZERO, address);
+        assert!(inspector.get_cmp_log().is_empty());
+
+        inspector.last_sub = Some(sub);
+        inspector.store_sub_branch(result, address);
+        inspector.store_sub_branch(result, address);
+        assert_eq!(inspector.get_cmp_log(), [sub]);
     }
 }

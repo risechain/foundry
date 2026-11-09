@@ -2,13 +2,14 @@
 
 use alloy_primitives::U256;
 use foundry_compilers::utils::canonicalized;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error};
 use std::path::PathBuf;
 
 /// Contains for fuzz testing
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FuzzConfig {
     /// The number of test cases that must execute for each property test
+    #[serde(deserialize_with = "deserialize_fuzz_runs")]
     pub runs: u32,
     /// Optional 1-based fuzz run to execute.
     pub run: Option<u32>,
@@ -73,6 +74,11 @@ pub struct FuzzDictionaryConfig {
     pub include_storage: bool,
     /// The flag indicating whether to include push bytes values
     pub include_push_bytes: bool,
+    /// The flag indicating whether invariant runs call targeted contracts' view functions (with
+    /// no inputs or only address inputs, bound to the sender) after each successful call that
+    /// accessed them, and add the results, whole structs included, to the dictionary. At most 32
+    /// views are called per call; when more are eligible, the selection rotates across calls.
+    pub include_view_values: bool,
     /// How many addresses to record at most.
     /// Once the fuzzer exceeds this limit, it will start evicting random entries
     ///
@@ -108,6 +114,7 @@ impl Default for FuzzDictionaryConfig {
             dictionary_weight: 40,
             include_storage: true,
             include_push_bytes: true,
+            include_view_values: false,
             max_fuzz_dictionary_addresses: 300 * MB / 20,
             max_fuzz_dictionary_values: 300 * MB / 32,
             max_fuzz_dictionary_literals: 200 * MB / 32,
@@ -302,4 +309,15 @@ impl Default for FuzzCorpusMutationWeights {
             mutation_weight_cmp: 1,
         }
     }
+}
+
+fn deserialize_fuzz_runs<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let runs = u32::deserialize(deserializer)?;
+    if runs == 0 {
+        return Err(D::Error::custom("`fuzz.runs` must be greater than 0"));
+    }
+    Ok(runs)
 }

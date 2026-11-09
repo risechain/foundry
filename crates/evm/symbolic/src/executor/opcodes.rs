@@ -1,4 +1,5 @@
 use super::*;
+use foundry_evm::revm::interpreter::STACK_LIMIT;
 
 enum MappingStorageProvenance {
     None,
@@ -179,9 +180,9 @@ impl SymbolicExecutor {
         SymCalldata::from_bytes(&mut self.cx, bytes)
     }
 
-    fn invoke_storage_hook<FEN: FoundryEvmNetwork>(
+    fn invoke_storage_hook(
         &mut self,
-        executor: &Executor<FEN>,
+        executor: &ExecutorView<'_>,
         state: &mut PathState,
         worklist: &mut VecDeque<PathState>,
         completed_paths: &mut usize,
@@ -220,6 +221,7 @@ impl SymbolicExecutor {
                 std::mem::take(&mut outcome.state.mapping_storage_store_hooks);
             parent.mapping_hook_keccak_preimages =
                 std::mem::take(&mut outcome.state.mapping_hook_keccak_preimages);
+            parent.persistent_writes = std::mem::take(&mut outcome.state.persistent_writes);
             parent.storage_hook_active = false;
 
             match outcome.status {
@@ -227,7 +229,10 @@ impl SymbolicExecutor {
                     parent.world = outcome.state.world;
                     parent.block = outcome.state.block;
                 }
-                CallStatus::Revert | CallStatus::Failure => {
+                CallStatus::Revert | CallStatus::ExceptionalHalt | CallStatus::Failure => {
+                    parent.world.merge_replay_metadata_from(&outcome.state.world);
+                    let start = state.persistent_writes.len();
+                    parent.replay_persistent_writes(&mut self.cx, executor, start)?;
                     parent.return_data = outcome.state.frame.return_data;
                     parent.pending_storage_hook_revert = true;
                 }
@@ -291,10 +296,163 @@ impl SymbolicExecutor {
         Ok(true)
     }
 
-    #[expect(clippy::too_many_arguments)]
-    pub(super) fn step<FEN: FoundryEvmNetwork>(
+    fn guard_fixed_memory_access(
         &mut self,
-        executor: &Executor<FEN>,
+        executor: &ExecutorView<'_>,
+        state: &mut PathState,
+        worklist: &mut VecDeque<PathState>,
+        offset: &SymExpr,
+        size: usize,
+    ) -> Result<Option<StepOutcome>, SymbolicError> {
+        let memory_limit = executor.memory_limit;
+        let host_max_offset = (usize::MAX & !31usize).checked_sub(size);
+        let constrained_offset = state.constrained_usize_checked(&mut self.cx, offset);
+        if constrained_offset.as_ref().is_some_and(|offset| match offset {
+            Ok(offset) => host_max_offset.is_none_or(|max| *offset > max),
+            Err(_) => true,
+        }) {
+            state.return_data = SymReturnData::empty(&mut self.cx);
+            return Ok(Some(StepOutcome::ExceptionalHalt));
+        }
+
+        let expanded_size_bound = state
+            .upper_bound_usize(&mut self.cx, offset)
+            .and_then(|offset| offset.checked_add(size))
+            .and_then(|end| end.checked_add(31))
+            .and_then(|end| u64::try_from(end & !31usize).ok());
+        if expanded_size_bound.is_some_and(|size| size <= memory_limit) {
+            return Ok(None);
+        }
+
+        let representable = if let Some(host_max_offset) = host_max_offset {
+            let host_max_offset = SymExpr::constant(&mut self.cx, U256::from(host_max_offset));
+            SymBoolExpr::cmp_word_expr(&mut self.cx, SymCmpOp::Ule, offset, host_max_offset)
+        } else {
+            SymBoolExpr::constant(&mut self.cx, false)
+        };
+        let size = SymExpr::constant(&mut self.cx, U256::from(size));
+        let local_size =
+            state.memory.size_after_range_expansion_word(&mut self.cx, offset.clone(), size);
+        if let Some(local_size) = local_size.as_const() {
+            if local_size <= U256::from(memory_limit) {
+                return Ok(None);
+            }
+            state.return_data = SymReturnData::empty(&mut self.cx);
+            return Ok(Some(StepOutcome::ExceptionalHalt));
+        }
+        let memory_limit = SymExpr::constant(&mut self.cx, U256::from(memory_limit));
+        let within_limit = SymBoolExpr::cmp(&mut self.cx, SymCmpOp::Ule, local_size, memory_limit);
+        let valid_access = SymBoolExpr::and(&mut self.cx, vec![representable, within_limit]);
+        self.apply_memory_access_guard(state, worklist, valid_access)
+    }
+
+    fn apply_memory_access_guard(
+        &mut self,
+        state: &mut PathState,
+        worklist: &mut VecDeque<PathState>,
+        valid_access: SymBoolExpr,
+    ) -> Result<Option<StepOutcome>, SymbolicError> {
+        let (valid_constraints, valid_sat) =
+            self.constraints_with_condition(state, valid_access.clone())?;
+        let invalid = valid_access.clone().not(&mut self.cx);
+        let (invalid_constraints, invalid_sat) = self.constraints_with_condition(state, invalid)?;
+        match (valid_sat, invalid_sat) {
+            (true, true) => {
+                let (valid_seed_models, invalid_seed_models) =
+                    state.split_corpus_seed_models(&valid_access);
+                let mut valid = state.clone();
+                valid.pc = valid.pc.saturating_sub(1);
+                valid.depth = valid.depth.saturating_sub(1);
+                valid.constraints = valid_constraints;
+                valid.set_corpus_seed_models(valid_seed_models);
+                worklist.push_back(valid);
+                state.constraints = invalid_constraints;
+                state.set_corpus_seed_models(invalid_seed_models);
+                state.return_data = SymReturnData::empty(&mut self.cx);
+                Ok(Some(StepOutcome::ExceptionalHalt))
+            }
+            (true, false) => {
+                state.constraints = valid_constraints;
+                Ok(None)
+            }
+            (false, true) => {
+                state.constraints = invalid_constraints;
+                state.return_data = SymReturnData::empty(&mut self.cx);
+                Ok(Some(StepOutcome::ExceptionalHalt))
+            }
+            (false, false) => Ok(Some(StepOutcome::AssumeRejected)),
+        }
+    }
+
+    pub(super) fn guard_memory_range(
+        &mut self,
+        executor: &ExecutorView<'_>,
+        state: &mut PathState,
+        worklist: &mut VecDeque<PathState>,
+        offset: &SymExpr,
+        size: &SymExpr,
+    ) -> Result<Option<StepOutcome>, SymbolicError> {
+        let memory_limit = executor.memory_limit;
+        if let (Some(offset_value), Some(size_value)) = (offset.as_const(), size.as_const()) {
+            let valid = size_value.is_zero()
+                || usize::try_from(offset_value)
+                    .ok()
+                    .zip(usize::try_from(size_value).ok())
+                    .and_then(|(offset, size)| offset.checked_add(size))
+                    .and_then(|end| end.checked_add(31))
+                    .and_then(|end| u64::try_from(end & !31usize).ok())
+                    .is_some_and(|end| end <= memory_limit);
+            if !valid {
+                state.return_data = SymReturnData::empty(&mut self.cx);
+                return Ok(Some(StepOutcome::ExceptionalHalt));
+            }
+            state.memory.expand_range(&mut self.cx, offset.clone(), size.clone());
+            return Ok(None);
+        }
+
+        let offset_bound = state.upper_bound_usize(&mut self.cx, offset);
+        let size_bound = state.upper_bound_usize(&mut self.cx, size);
+        if offset_bound
+            .zip(size_bound)
+            .and_then(|(offset, size)| offset.checked_add(size))
+            .and_then(|end| end.checked_add(31))
+            .and_then(|end| u64::try_from(end & !31usize).ok())
+            .is_some_and(|end| end <= memory_limit)
+        {
+            state.memory.expand_range(&mut self.cx, offset.clone(), size.clone());
+            return Ok(None);
+        }
+
+        let zero_size = SymBoolExpr::eq_word_const(&mut self.cx, size, U256::ZERO);
+        let host_max = SymExpr::constant(&mut self.cx, U256::from(usize::MAX & !31usize));
+        let size_fits =
+            SymBoolExpr::cmp_word_expr(&mut self.cx, SymCmpOp::Ule, size, host_max.clone());
+        let max_offset = SymExpr::binop(&mut self.cx, SymBinOp::Sub, host_max, size.clone());
+        let offset_fits =
+            SymBoolExpr::cmp_word_expr(&mut self.cx, SymCmpOp::Ule, offset, max_offset);
+
+        let local_size = state.memory.size_after_range_expansion_word(
+            &mut self.cx,
+            offset.clone(),
+            size.clone(),
+        );
+        let memory_limit = SymExpr::constant(&mut self.cx, U256::from(memory_limit));
+        let local_fits = SymBoolExpr::cmp(&mut self.cx, SymCmpOp::Ule, local_size, memory_limit);
+        let nonzero_valid =
+            SymBoolExpr::and(&mut self.cx, vec![size_fits, offset_fits, local_fits]);
+        let valid_access = SymBoolExpr::or(&mut self.cx, vec![zero_size, nonzero_valid]);
+
+        let outcome = self.apply_memory_access_guard(state, worklist, valid_access)?;
+        if outcome.is_none() {
+            state.memory.expand_range(&mut self.cx, offset.clone(), size.clone());
+        }
+        Ok(outcome)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(super) fn step(
+        &mut self,
+        executor: &ExecutorView<'_>,
         code: &SymCode,
         jumpdests: &JumpTable,
         state: &mut PathState,
@@ -303,6 +461,23 @@ impl SymbolicExecutor {
         op: u8,
     ) -> Result<StepOutcome, SymbolicError> {
         state.pc += 1;
+
+        if executor.spec_id < opcode_activation(op) {
+            state.return_data = SymReturnData::empty(&mut self.cx);
+            return Ok(StepOutcome::ExceptionalHalt);
+        }
+
+        // The EVM halts a frame exceptionally before it runs an undefined opcode or one whose
+        // stack inputs or outputs do not fit, so the handlers below never see such a stack.
+        let fits = opcode::OpCode::new(op).is_some_and(|opcode| {
+            let height = state.stack.len();
+            let inputs = opcode.inputs() as usize;
+            height >= inputs && height - inputs + opcode.outputs() as usize <= STACK_LIMIT
+        });
+        if !fits {
+            state.return_data = SymReturnData::empty(&mut self.cx);
+            return Ok(StepOutcome::ExceptionalHalt);
+        }
 
         match op {
             opcode::PUSH0 => {
@@ -325,63 +500,70 @@ impl SymbolicExecutor {
             }
             opcode::SWAP1..=opcode::SWAP16 => {
                 let n = (op - opcode::SWAP1 + 1) as usize;
-                state.stack.swap(n)?;
+                state.stack.exchange(0, n)?;
             }
-            opcode::STOP => return Ok(StepOutcome::Halt),
-            opcode::ADD => {
-                state.bin_word(&mut self.cx, SymBinOp::Add)?;
+            opcode::DUPN | opcode::SWAPN | opcode::EXCHANGE => {
+                // EIP-8024: a missing trailing immediate reads as zero, like revm's padded code.
+                let immediate = code.opcode(&mut self.cx, state.pc)?.unwrap_or_default();
+                state.pc += 1;
+                let decoded = if op == opcode::EXCHANGE {
+                    decode_exchange_immediate(immediate)
+                } else {
+                    decode_stack_immediate(immediate).map(|n| (0, n))
+                };
+                let Some((n, m)) = decoded else {
+                    return Ok(StepOutcome::ExceptionalHalt);
+                };
+                if op == opcode::DUPN {
+                    let value = state.stack.peek(m - 1)?.clone();
+                    state.stack.push(value)?;
+                } else {
+                    state.stack.exchange(n, m)?;
+                }
             }
-            opcode::SUB => {
-                state.bin_word(&mut self.cx, SymBinOp::Sub)?;
+            opcode::STOP => {
+                // STOP returns no output; drop the return data of the frame's last call.
+                state.return_data = SymReturnData::empty(&mut self.cx);
+                return Ok(StepOutcome::Halt);
             }
-            opcode::MUL => {
-                state.bin_word(&mut self.cx, SymBinOp::Mul)?;
+            opcode::ADD | opcode::SUB | opcode::MUL | opcode::AND | opcode::OR | opcode::XOR => {
+                let bin_op = match op {
+                    opcode::ADD => SymBinOp::Add,
+                    opcode::SUB => SymBinOp::Sub,
+                    opcode::MUL => SymBinOp::Mul,
+                    opcode::AND => SymBinOp::And,
+                    opcode::OR => SymBinOp::Or,
+                    _ => SymBinOp::Xor,
+                };
+                state.bin_word(&mut self.cx, bin_op)?
             }
-            opcode::EXP => {
-                state.exp_word(&mut self.cx)?;
+            opcode::EXP => state.exp_word(&mut self.cx)?,
+            opcode::DIV | opcode::SDIV | opcode::MOD | opcode::SMOD => {
+                let bin_op = match op {
+                    opcode::DIV => SymBinOp::UDiv,
+                    opcode::SDIV => SymBinOp::SDiv,
+                    opcode::MOD => SymBinOp::URem,
+                    _ => SymBinOp::SRem,
+                };
+                state.bin_word_div_zero_guard(&mut self.cx, bin_op)?
             }
-            opcode::DIV => {
-                state.bin_word_div_zero_guard(&mut self.cx, SymBinOp::UDiv)?;
-            }
-            opcode::SDIV => {
-                state.bin_word_div_zero_guard(&mut self.cx, SymBinOp::SDiv)?;
-            }
-            opcode::MOD => {
-                state.bin_word_div_zero_guard(&mut self.cx, SymBinOp::URem)?;
-            }
-            opcode::SMOD => {
-                state.bin_word_div_zero_guard(&mut self.cx, SymBinOp::SRem)?;
-            }
-            opcode::ADDMOD => {
+            opcode::ADDMOD | opcode::MULMOD => {
                 let a = state.stack.pop()?;
                 let b = state.stack.pop()?;
                 let n = state.stack.pop()?;
-                state.stack.push(SymExpr::ternop(&mut self.cx, SymTernOp::AddMod, a, b, n))?;
+                let tern_op =
+                    if op == opcode::ADDMOD { SymTernOp::AddMod } else { SymTernOp::MulMod };
+                state.stack.push(SymExpr::ternop(&mut self.cx, tern_op, a, b, n))?;
             }
-            opcode::MULMOD => {
-                let a = state.stack.pop()?;
-                let b = state.stack.pop()?;
-                let n = state.stack.pop()?;
-                state.stack.push(SymExpr::ternop(&mut self.cx, SymTernOp::MulMod, a, b, n))?;
-            }
-            opcode::LT => {
+            opcode::LT | opcode::GT | opcode::SLT | opcode::SGT => {
                 let op_pc = state.pc - 1;
-                let condition = state.cmp_word_condition(&mut self.cx, SymCmpOp::Ult)?;
-                return self.push_comparison_result(state, op_pc, op, condition);
-            }
-            opcode::GT => {
-                let op_pc = state.pc - 1;
-                let condition = state.cmp_word_condition(&mut self.cx, SymCmpOp::Ugt)?;
-                return self.push_comparison_result(state, op_pc, op, condition);
-            }
-            opcode::SLT => {
-                let op_pc = state.pc - 1;
-                let condition = state.cmp_word_condition(&mut self.cx, SymCmpOp::Slt)?;
-                return self.push_comparison_result(state, op_pc, op, condition);
-            }
-            opcode::SGT => {
-                let op_pc = state.pc - 1;
-                let condition = state.cmp_word_condition(&mut self.cx, SymCmpOp::Sgt)?;
+                let cmp_op = match op {
+                    opcode::LT => SymCmpOp::Ult,
+                    opcode::GT => SymCmpOp::Ugt,
+                    opcode::SLT => SymCmpOp::Slt,
+                    _ => SymCmpOp::Sgt,
+                };
+                let condition = state.cmp_word_condition(&mut self.cx, cmp_op)?;
                 return self.push_comparison_result(state, op_pc, op, condition);
             }
             opcode::EQ => {
@@ -397,15 +579,6 @@ impl SymbolicExecutor {
                 let value = value.into_zero_bool(&mut self.cx);
                 return self.push_comparison_result(state, op_pc, op, value);
             }
-            opcode::AND => {
-                state.bin_word(&mut self.cx, SymBinOp::And)?;
-            }
-            opcode::OR => {
-                state.bin_word(&mut self.cx, SymBinOp::Or)?;
-            }
-            opcode::XOR => {
-                state.bin_word(&mut self.cx, SymBinOp::Xor)?;
-            }
             opcode::NOT => {
                 let value = state.stack.pop()?;
                 state.stack.push(SymExpr::not(&mut self.cx, value))?;
@@ -420,16 +593,21 @@ impl SymbolicExecutor {
                 let word = state.stack.pop()?;
                 state.stack.push(byte_word_dynamic(&mut self.cx, index, word))?;
             }
-            opcode::SHL => {
-                state.shift_word(&mut self.cx, ShiftKind::Shl)?;
-            }
-            opcode::SHR => {
-                state.shift_word(&mut self.cx, ShiftKind::Shr)?;
-            }
-            opcode::SAR => {
-                state.shift_word(&mut self.cx, ShiftKind::Sar)?;
+            opcode::SHL => state.shift_word(&mut self.cx, SymBinOp::Shl)?,
+            opcode::SHR => state.shift_word(&mut self.cx, SymBinOp::Shr)?,
+            opcode::SAR => state.shift_word(&mut self.cx, SymBinOp::Sar)?,
+            opcode::CLZ => {
+                let value = state.stack.pop()?;
+                state.stack.push(clz_word(&mut self.cx, value))?;
             }
             opcode::KECCAK256 => {
+                let offset = state.stack.peek(0)?.clone();
+                let size = state.stack.peek(1)?.clone();
+                if let Some(outcome) =
+                    self.guard_memory_range(executor, state, worklist, &offset, &size)?
+                {
+                    return Ok(outcome);
+                }
                 let offset = state.stack.pop()?;
                 let size = state.stack.pop()?;
                 match state.constrained_usize_checked(&mut self.cx, &size) {
@@ -469,18 +647,12 @@ impl SymbolicExecutor {
                             }
                         }
                         let max_limit = self.config.max_calldata_bytes as usize;
-                        let max_size = state
-                            .upper_bound_usize(&mut self.cx, &size)
-                            .filter(|size| *size <= max_limit)
-                            .map(Ok)
-                            .unwrap_or_else(|| {
-                                self.solver_upper_bound_usize(
-                                    state,
-                                    &size,
-                                    max_limit,
-                                    "symbolic SHA3 size",
-                                )
-                            })?;
+                        let max_size = self.solver_upper_bound_usize(
+                            state,
+                            &size,
+                            max_limit,
+                            "symbolic SHA3 size",
+                        )?;
                         let bytes = state.memory.read_byte_exprs_symbolic_size(
                             &mut self.cx,
                             offset,
@@ -491,21 +663,14 @@ impl SymbolicExecutor {
                     }
                 }
             }
-            opcode::ADDRESS => {
-                let address = state.address_word.clone();
-                state.stack.push(address)?;
-            }
-            opcode::CALLER => {
-                let caller = state.caller_word.clone();
-                state.stack.push(caller)?;
-            }
-            opcode::ORIGIN => {
-                let origin = state.origin_word.clone();
-                state.stack.push(origin)?;
-            }
-            opcode::CALLVALUE => {
-                let callvalue = state.callvalue.clone();
-                state.stack.push(callvalue)?;
+            opcode::ADDRESS | opcode::CALLER | opcode::ORIGIN | opcode::CALLVALUE => {
+                let value = match op {
+                    opcode::ADDRESS => state.address_word.clone(),
+                    opcode::CALLER => state.caller_word.clone(),
+                    opcode::ORIGIN => state.origin_word.clone(),
+                    _ => state.callvalue.clone(),
+                };
+                state.stack.push(value)?;
             }
             opcode::BLOCKHASH => {
                 let number = state.stack.pop()?;
@@ -532,6 +697,13 @@ impl SymbolicExecutor {
                 state.stack.push(hash)?;
             }
             opcode::EXTCODECOPY => {
+                let dest = state.stack.peek(1)?.clone();
+                let size = state.stack.peek(3)?.clone();
+                if let Some(outcome) =
+                    self.guard_memory_range(executor, state, worklist, &dest, &size)?
+                {
+                    return Ok(outcome);
+                }
                 let target = state.stack.pop()?;
                 let dest = state.stack.pop()?;
                 let offset = state.stack.pop()?;
@@ -545,25 +717,19 @@ impl SymbolicExecutor {
                             offset,
                             size,
                         )?;
-                        state.memory.copy_bytes_offset(&mut self.cx, dest, bytes);
+                        state.memory.store_bytes_offset(&mut self.cx, dest, bytes);
                     }
                     Some(Err(_)) => {
                         return Ok(StepOutcome::Revert);
                     }
                     None => {
                         let max_limit = self.config.max_calldata_bytes as usize;
-                        let max_size = state
-                            .upper_bound_usize(&mut self.cx, &size)
-                            .filter(|size| *size <= max_limit)
-                            .map(Ok)
-                            .unwrap_or_else(|| {
-                                self.solver_upper_bound_usize(
-                                    state,
-                                    &size,
-                                    max_limit,
-                                    "symbolic EXTCODECOPY size",
-                                )
-                            })?;
+                        let max_size = self.solver_upper_bound_usize(
+                            state,
+                            &size,
+                            max_limit,
+                            "symbolic EXTCODECOPY size",
+                        )?;
                         if max_size != 0 {
                             let bytes = state.extcode_bytes_word(
                                 &mut self.cx,
@@ -579,7 +745,7 @@ impl SymbolicExecutor {
             }
             opcode::CALLDATALOAD => {
                 let offset = state.stack.pop()?;
-                let value = state.calldata.load_word(&mut self.cx, offset)?;
+                let value = state.calldata.load_word(&mut self.cx, offset);
                 state.stack.push(value)?;
             }
             opcode::CALLDATASIZE => {
@@ -587,13 +753,27 @@ impl SymbolicExecutor {
                 state.stack.push(size)?;
             }
             opcode::CALLDATACOPY => {
+                let dest = state.stack.peek(0)?.clone();
+                let size = state.stack.peek(2)?.clone();
+                if let Some(outcome) =
+                    self.guard_memory_range(executor, state, worklist, &dest, &size)?
+                {
+                    return Ok(outcome);
+                }
                 let dest = state.stack.pop()?;
                 let offset = state.stack.pop()?;
                 let size = state.stack.pop()?;
                 match state.constrained_usize_checked(&mut self.cx, &size) {
                     Some(Ok(size)) => {
                         if size != 0 {
-                            state.copy_calldata_to_offset(&mut self.cx, dest, offset, size)?;
+                            let CallFrame { memory, calldata, .. } = &mut state.frame;
+                            memory.copy_calldata_to_offset(
+                                &mut self.cx,
+                                dest,
+                                offset,
+                                size,
+                                calldata,
+                            );
                         }
                     }
                     Some(Err(_)) => {
@@ -601,25 +781,21 @@ impl SymbolicExecutor {
                     }
                     None => {
                         let max_limit = self.config.max_calldata_bytes as usize;
-                        let max_size = state
-                            .upper_bound_usize(&mut self.cx, &size)
-                            .filter(|size| *size <= max_limit)
-                            .map(Ok)
-                            .unwrap_or_else(|| {
-                                self.solver_upper_bound_usize(
-                                    state,
-                                    &size,
-                                    max_limit,
-                                    "symbolic CALLDATACOPY size",
-                                )
-                            })?;
+                        let max_size = self.solver_upper_bound_usize(
+                            state,
+                            &size,
+                            max_limit,
+                            "symbolic CALLDATACOPY size",
+                        )?;
                         if max_size != 0 {
-                            state.copy_calldata_symbolic_size(
+                            let CallFrame { memory, calldata, .. } = &mut state.frame;
+                            memory.copy_calldata_symbolic_size(
                                 &mut self.cx,
                                 dest,
                                 offset,
                                 size,
                                 max_size,
+                                calldata,
                             )?;
                         }
                     }
@@ -630,31 +806,32 @@ impl SymbolicExecutor {
                 state.stack.push(value)?;
             }
             opcode::CODECOPY => {
+                let dest = state.stack.peek(0)?.clone();
+                let size = state.stack.peek(2)?.clone();
+                if let Some(outcome) =
+                    self.guard_memory_range(executor, state, worklist, &dest, &size)?
+                {
+                    return Ok(outcome);
+                }
                 let dest = state.stack.pop()?;
                 let offset = state.stack.pop()?;
                 let size = state.stack.pop()?;
                 match state.constrained_usize_checked(&mut self.cx, &size) {
                     Some(Ok(size)) => {
                         let bytes = code.read_bytes_offset(&mut self.cx, offset, size);
-                        state.memory.copy_bytes_offset(&mut self.cx, dest, bytes);
+                        state.memory.store_bytes_offset(&mut self.cx, dest, bytes);
                     }
                     Some(Err(_)) => {
                         return Ok(StepOutcome::Revert);
                     }
                     None => {
                         let max_limit = self.config.max_calldata_bytes as usize;
-                        let max_size = state
-                            .upper_bound_usize(&mut self.cx, &size)
-                            .filter(|size| *size <= max_limit)
-                            .map(Ok)
-                            .unwrap_or_else(|| {
-                                self.solver_upper_bound_usize(
-                                    state,
-                                    &size,
-                                    max_limit,
-                                    "symbolic CODECOPY size",
-                                )
-                            })?;
+                        let max_size = self.solver_upper_bound_usize(
+                            state,
+                            &size,
+                            max_limit,
+                            "symbolic CODECOPY size",
+                        )?;
                         if max_size != 0 {
                             let bytes = code.read_bytes_offset(&mut self.cx, offset, max_size);
                             state.memory.copy_bytes_size_offset(&mut self.cx, dest, size, bytes)?;
@@ -663,24 +840,36 @@ impl SymbolicExecutor {
                 }
             }
             opcode::RETURNDATASIZE => {
-                let size = state.return_data.len_word();
+                let size = state.return_data.len_word.clone();
                 state.stack.push(size)?;
             }
             opcode::RETURNDATACOPY => {
+                let dest = state.stack.peek(0)?.clone();
+                let offset = state.stack.peek(1)?.clone();
+                let size = state.stack.peek(2)?.clone();
+                if let Some(outcome) =
+                    self.guard_memory_range(executor, state, worklist, &dest, &size)?
+                {
+                    return Ok(outcome);
+                }
+                if let Some(outcome) =
+                    self.guard_returndata_copy_range(state, worklist, &offset, &size)?
+                {
+                    return Ok(outcome);
+                }
                 let dest = state.stack.pop()?;
                 let offset = state.stack.pop()?;
                 let size = state.stack.pop()?;
                 match state.constrained_usize_checked(&mut self.cx, &size) {
                     Some(Ok(size)) => {
-                        let size_word = SymExpr::constant(&mut self.cx, U256::from(size));
-                        if !self.assume_returndata_copy_in_bounds(
-                            state,
-                            offset.clone(),
-                            size_word,
-                        )? {
-                            return Ok(StepOutcome::Revert);
-                        }
-                        state.copy_return_data_to_offset(&mut self.cx, dest, offset, size)?;
+                        let CallFrame { memory, return_data, .. } = &mut state.frame;
+                        memory.copy_return_data_to_offset(
+                            &mut self.cx,
+                            dest,
+                            offset,
+                            size,
+                            return_data,
+                        )?;
                     }
                     Some(Err(_)) => {
                         return Ok(StepOutcome::Revert);
@@ -691,34 +880,21 @@ impl SymbolicExecutor {
                             .map(|offset| state.return_data.len().saturating_sub(offset))
                             .unwrap_or(state.return_data.len());
                         let max_limit = available.min(self.config.max_calldata_bytes as usize);
-                        let max_size = state
-                            .upper_bound_usize(&mut self.cx, &size)
-                            .filter(|size| *size <= max_limit)
-                            .map(Ok)
-                            .unwrap_or_else(|| {
-                                self.solver_upper_bound_usize(
-                                    state,
-                                    &size,
-                                    max_limit,
-                                    "symbolic RETURNDATACOPY size",
-                                )
-                            })?;
-                        if max_size != 0 {
-                            if !self.assume_returndata_copy_in_bounds(
-                                state,
-                                offset.clone(),
-                                size.clone(),
-                            )? {
-                                return Ok(StepOutcome::Revert);
-                            }
-                            state.copy_return_data_symbolic_size(
-                                &mut self.cx,
-                                dest,
-                                offset,
-                                size,
-                                max_size,
-                            )?;
-                        }
+                        let max_size = self.solver_upper_bound_usize(
+                            state,
+                            &size,
+                            max_limit,
+                            "symbolic RETURNDATACOPY size",
+                        )?;
+                        let CallFrame { memory, return_data, .. } = &mut state.frame;
+                        memory.copy_return_data_symbolic_size(
+                            &mut self.cx,
+                            dest,
+                            offset,
+                            size,
+                            max_size,
+                            return_data,
+                        )?;
                     }
                 }
             }
@@ -726,19 +902,39 @@ impl SymbolicExecutor {
                 state.stack.pop()?;
             }
             opcode::MLOAD => {
+                let offset = state.stack.peek(0)?.clone();
+                if let Some(outcome) =
+                    self.guard_fixed_memory_access(executor, state, worklist, &offset, 32)?
+                {
+                    return Ok(outcome);
+                }
                 let offset = state.stack.pop()?;
                 let value = state.memory.load_word_offset(&mut self.cx, offset)?;
                 state.stack.push(value)?;
             }
             opcode::MSTORE => {
+                let offset = state.stack.peek(0)?.clone();
+                if let Some(outcome) =
+                    self.guard_fixed_memory_access(executor, state, worklist, &offset, 32)?
+                {
+                    return Ok(outcome);
+                }
                 let offset = state.stack.pop()?;
                 let value = state.stack.pop()?;
-                state.memory.store_word_offset(&mut self.cx, offset, value);
+                let minimum_offset = state.lower_bound_usize(&offset);
+                state.memory.store_word_offset(&mut self.cx, offset, value, minimum_offset);
             }
             opcode::MSTORE8 => {
+                let offset = state.stack.peek(0)?.clone();
+                if let Some(outcome) =
+                    self.guard_fixed_memory_access(executor, state, worklist, &offset, 1)?
+                {
+                    return Ok(outcome);
+                }
                 let offset = state.stack.pop()?;
                 let value = state.stack.pop()?;
-                state.memory.store_byte_offset(&mut self.cx, offset, value);
+                let minimum_offset = state.lower_bound_usize(&offset);
+                state.memory.store_byte_offset(&mut self.cx, offset, value, minimum_offset);
             }
             opcode::SLOAD => {
                 let key = state.stack.pop()?;
@@ -772,8 +968,12 @@ impl SymbolicExecutor {
             }
             opcode::SSTORE => {
                 if state.is_static {
+                    // Forge records the access in `step`, before the static-call check halts.
+                    if let Ok(key) = state.stack.peek(0).cloned() {
+                        state.record_sstore(state.storage_address, key);
+                    }
                     state.return_data = SymReturnData::empty(&mut self.cx);
-                    return Ok(StepOutcome::Revert);
+                    return Ok(StepOutcome::ExceptionalHalt);
                 }
                 let key = state.stack.peek(0)?.clone();
                 state.stack.peek(1)?;
@@ -796,9 +996,11 @@ impl SymbolicExecutor {
                         let store_pc = state.pc - 1;
                         let mut equality_state = state.clone();
                         equality_state.pc = store_pc;
+                        equality_state.depth = equality_state.depth.saturating_sub(1);
                         equality_state.constraints = equality;
                         let mut inequality_state = state.clone();
                         inequality_state.pc = store_pc;
+                        inequality_state.depth = inequality_state.depth.saturating_sub(1);
                         inequality_state.constraints = inequality;
                         worklist.push_back(equality_state);
                         worklist.push_back(inequality_state);
@@ -874,7 +1076,7 @@ impl SymbolicExecutor {
             opcode::TSTORE => {
                 if state.is_static {
                     state.return_data = SymReturnData::empty(&mut self.cx);
-                    return Ok(StepOutcome::Revert);
+                    return Ok(StepOutcome::ExceptionalHalt);
                 }
                 let key = state.stack.pop()?;
                 let value = state.stack.pop()?;
@@ -882,12 +1084,16 @@ impl SymbolicExecutor {
             }
             opcode::JUMP => {
                 let dest = state.stack.pop()?;
-                let dest = state.expect_constrained_usize(
-                    &mut self.cx,
+                let Some(dest) = self.resolve_jump_destination(
+                    state,
+                    jumpdests,
                     dest,
                     "symbolic JUMP destination",
-                )?;
-                ensure_jumpdest(dest, jumpdests)?;
+                )?
+                else {
+                    state.return_data = SymReturnData::empty(&mut self.cx);
+                    return Ok(StepOutcome::ExceptionalHalt);
+                };
                 if !self.take_loop_jump(state, state.pc, dest) {
                     return Ok(StepOutcome::AssumeRejected);
                 }
@@ -895,15 +1101,19 @@ impl SymbolicExecutor {
             }
             opcode::JUMPI => {
                 let dest = state.stack.pop()?;
-                let dest = state.expect_constrained_usize(
-                    &mut self.cx,
-                    dest,
-                    "symbolic JUMPI destination",
-                )?;
-                ensure_jumpdest(dest, jumpdests)?;
                 let cond = state.stack.pop()?;
-                match cond.truth() {
+                match cond.as_const().map(|value| !value.is_zero()) {
                     Some(true) => {
+                        let Some(dest) = self.resolve_jump_destination(
+                            state,
+                            jumpdests,
+                            dest,
+                            "symbolic JUMPI destination",
+                        )?
+                        else {
+                            state.return_data = SymReturnData::empty(&mut self.cx);
+                            return Ok(StepOutcome::ExceptionalHalt);
+                        };
                         if !self.take_loop_jump(state, state.pc, dest) {
                             return Ok(StepOutcome::AssumeRejected);
                         }
@@ -911,9 +1121,32 @@ impl SymbolicExecutor {
                     }
                     Some(false) => {}
                     None => {
+                        let true_cond = cond.nonzero_bool(&mut self.cx);
+                        let dest = match self.resolve_jump_destination(
+                            state,
+                            jumpdests,
+                            dest,
+                            "symbolic JUMPI destination",
+                        ) {
+                            Ok(Some(dest)) => dest,
+                            Ok(None) => {
+                                return self.branch_invalid_jumpi(state, worklist, true_cond);
+                            }
+                            Err(err) => {
+                                let (_, taken_sat) =
+                                    self.constraints_with_condition(state, true_cond.clone())?;
+                                if taken_sat {
+                                    return Err(err);
+                                }
+                                let (_, not_taken_seed_models) =
+                                    state.split_corpus_seed_models(&true_cond);
+                                state.constraints.push(true_cond.not(&mut self.cx));
+                                state.set_corpus_seed_models(not_taken_seed_models);
+                                return Ok(StepOutcome::Continue);
+                            }
+                        };
                         let op_pc = state.pc.saturating_sub(1);
                         let _branch_span = trace_span!("jumpi_branch", pc = op_pc, dest).entered();
-                        let true_cond = cond.nonzero_bool(&mut self.cx);
                         let false_cond = true_cond.clone().not(&mut self.cx);
                         let fallthrough = state.pc;
                         let (true_seed_models, false_seed_models) =
@@ -974,6 +1207,19 @@ impl SymbolicExecutor {
             }
             opcode::JUMPDEST => {}
             opcode::MCOPY => {
+                let dest = state.stack.peek(0)?.clone();
+                let src = state.stack.peek(1)?.clone();
+                let size = state.stack.peek(2)?.clone();
+                if let Some(outcome) =
+                    self.guard_memory_range(executor, state, worklist, &dest, &size)?
+                {
+                    return Ok(outcome);
+                }
+                if let Some(outcome) =
+                    self.guard_memory_range(executor, state, worklist, &src, &size)?
+                {
+                    return Ok(outcome);
+                }
                 let dest = state.stack.pop()?;
                 let src = state.stack.pop()?;
                 let size = state.stack.pop()?;
@@ -986,18 +1232,12 @@ impl SymbolicExecutor {
                     }
                     None => {
                         let max_limit = self.config.max_calldata_bytes as usize;
-                        let max_size = state
-                            .upper_bound_usize(&mut self.cx, &size)
-                            .filter(|size| *size <= max_limit)
-                            .map(Ok)
-                            .unwrap_or_else(|| {
-                                self.solver_upper_bound_usize(
-                                    state,
-                                    &size,
-                                    max_limit,
-                                    "symbolic MCOPY size",
-                                )
-                            })?;
+                        let max_size = self.solver_upper_bound_usize(
+                            state,
+                            &size,
+                            max_limit,
+                            "symbolic MCOPY size",
+                        )?;
                         if max_size != 0 {
                             state.memory.copy_memory_symbolic_size(
                                 &mut self.cx,
@@ -1010,9 +1250,17 @@ impl SymbolicExecutor {
                     }
                 }
             }
-            opcode::RETURN => return self.return_or_revert(state, false),
-            opcode::REVERT => return self.return_or_revert(state, true),
-            opcode::INVALID => return Ok(StepOutcome::Failure),
+            opcode::RETURN | opcode::REVERT => {
+                let offset = state.stack.peek(0)?.clone();
+                let size = state.stack.peek(1)?.clone();
+                if let Some(outcome) =
+                    self.guard_memory_range(executor, state, worklist, &offset, &size)?
+                {
+                    return Ok(outcome);
+                }
+                return self.return_or_revert(state, op == opcode::REVERT);
+            }
+            opcode::INVALID => return Ok(StepOutcome::ExceptionalHalt),
             opcode::CALL => {
                 return self.call(executor, state, worklist, completed_paths, CallKind::Call);
             }
@@ -1046,9 +1294,9 @@ impl SymbolicExecutor {
             opcode::SELFDESTRUCT => {
                 if state.is_static {
                     state.return_data = SymReturnData::empty(&mut self.cx);
-                    return Ok(StepOutcome::Revert);
+                    return Ok(StepOutcome::ExceptionalHalt);
                 }
-                let spec_id: SpecId = executor.spec_id().into();
+                let spec_id = executor.spec_id;
                 let (beneficiary_word, beneficiary) =
                     state.pop_address_word_or_symbolic_slot(&mut self.cx)?;
                 if spec_id < SpecId::CANCUN
@@ -1095,7 +1343,7 @@ impl SymbolicExecutor {
                     index,
                     "symbolic BLOBHASH index",
                 )?;
-                let hash = state.block.blob_hash(index);
+                let hash = state.block.blob_hashes.get(index).copied().unwrap_or_default();
                 let hash = SymExpr::constant(&mut self.cx, U256::from_be_slice(hash.as_slice()));
                 state.stack.push(hash)?;
             }
@@ -1124,12 +1372,23 @@ impl SymbolicExecutor {
                 let value = state.block.blob_basefee.clone();
                 state.stack.push(value)?;
             }
+            opcode::SLOTNUM => {
+                let value = state.block.slot_num.clone();
+                state.stack.push(value)?;
+            }
             opcode::LOG0 | opcode::LOG1 | opcode::LOG2 | opcode::LOG3 | opcode::LOG4 => {
                 if state.is_static {
                     state.return_data = SymReturnData::empty(&mut self.cx);
-                    return Ok(StepOutcome::Revert);
+                    return Ok(StepOutcome::ExceptionalHalt);
                 }
                 let topics = (op - opcode::LOG0) as usize;
+                let offset = state.stack.peek(0)?.clone();
+                let size = state.stack.peek(1)?.clone();
+                if let Some(outcome) =
+                    self.guard_memory_range(executor, state, worklist, &offset, &size)?
+                {
+                    return Ok(outcome);
+                }
                 let offset = state.stack.pop()?;
                 if offset.contains_gasleft() {
                     return Err(SymbolicError::Unsupported("GAS/gasleft() not modeled"));
@@ -1148,18 +1407,12 @@ impl SymbolicExecutor {
                     }
                     None => {
                         let max_limit = self.config.max_calldata_bytes as usize;
-                        let max_size = state
-                            .upper_bound_usize(&mut self.cx, &size)
-                            .filter(|size| *size <= max_limit)
-                            .map(Ok)
-                            .unwrap_or_else(|| {
-                                self.solver_upper_bound_usize(
-                                    state,
-                                    &size,
-                                    max_limit,
-                                    "symbolic LOG size",
-                                )
-                            })?;
+                        let max_size = self.solver_upper_bound_usize(
+                            state,
+                            &size,
+                            max_limit,
+                            "symbolic LOG size",
+                        )?;
                         let data = state.memory.read_bytes_symbolic_size(
                             &mut self.cx,
                             offset,
@@ -1179,6 +1432,7 @@ impl SymbolicExecutor {
                 }
                 return self.handle_log(
                     state,
+                    worklist,
                     SymbolicLog::new(log_topics, data_len, data, state.address),
                 );
             }
@@ -1188,31 +1442,71 @@ impl SymbolicExecutor {
         Ok(StepOutcome::Continue)
     }
 
-    pub(super) fn assume_returndata_copy_in_bounds(
+    fn resolve_jump_destination(
+        &mut self,
+        state: &PathState,
+        jumpdests: &JumpTable,
+        dest: SymExpr,
+        unsupported: &'static str,
+    ) -> Result<Option<usize>, SymbolicError> {
+        let dest = state.expect_constrained_word(&mut self.cx, dest, unsupported)?;
+        let Ok(dest) = usize::try_from(dest) else { return Ok(None) };
+        Ok(jumpdests.is_valid(dest).then_some(dest))
+    }
+
+    fn branch_invalid_jumpi(
         &mut self,
         state: &mut PathState,
-        offset: SymExpr,
-        size: SymExpr,
-    ) -> Result<bool, SymbolicError> {
+        worklist: &mut VecDeque<PathState>,
+        taken: SymBoolExpr,
+    ) -> Result<StepOutcome, SymbolicError> {
+        let (taken_constraints, taken_sat) =
+            self.constraints_with_condition(state, taken.clone())?;
+        let not_taken = taken.clone().not(&mut self.cx);
+        let (taken_seed_models, not_taken_seed_models) = state.split_corpus_seed_models(&taken);
+        if !taken_sat {
+            state.constraints.push(not_taken);
+            state.set_corpus_seed_models(not_taken_seed_models);
+            return Ok(StepOutcome::Continue);
+        }
+
+        let (not_taken_constraints, not_taken_sat) =
+            self.constraints_with_condition(state, not_taken)?;
+        if not_taken_sat {
+            let mut fallthrough = state.clone();
+            fallthrough.constraints = not_taken_constraints;
+            fallthrough.set_corpus_seed_models(not_taken_seed_models);
+            worklist.push_back(fallthrough);
+        }
+        state.constraints = taken_constraints;
+        state.set_corpus_seed_models(taken_seed_models);
+        state.return_data = SymReturnData::empty(&mut self.cx);
+        Ok(StepOutcome::ExceptionalHalt)
+    }
+
+    fn guard_returndata_copy_range(
+        &mut self,
+        state: &mut PathState,
+        worklist: &mut VecDeque<PathState>,
+        offset: &SymExpr,
+        size: &SymExpr,
+    ) -> Result<Option<StepOutcome>, SymbolicError> {
         if offset.contains_gasleft() || size.contains_gasleft() {
             return Err(SymbolicError::Unsupported("GAS/gasleft() not modeled"));
         }
-        let end = SymExpr::binop(&mut self.cx, SymBinOp::Add, offset, size);
-        let in_bounds =
-            SymBoolExpr::cmp(&mut self.cx, SymCmpOp::Ule, end, state.return_data.len_expr());
-        match in_bounds.as_const() {
-            Some(value) => Ok(value),
-            None => {
-                let mut constraints = state.constraints.clone();
-                constraints.push(in_bounds);
-                if self.is_sat_with_state(state, &constraints)? {
-                    state.constraints = constraints;
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
-        }
+        let return_data_len = state.return_data.len_word.clone();
+        let offset_in_bounds = SymBoolExpr::cmp_word_expr(
+            &mut self.cx,
+            SymCmpOp::Ule,
+            offset,
+            return_data_len.clone(),
+        );
+        let remaining =
+            SymExpr::binop(&mut self.cx, SymBinOp::Sub, return_data_len, offset.clone());
+        let size_in_bounds =
+            SymBoolExpr::cmp_word_expr(&mut self.cx, SymCmpOp::Ule, size, remaining);
+        let valid_access = SymBoolExpr::and(&mut self.cx, vec![offset_in_bounds, size_in_bounds]);
+        self.apply_memory_access_guard(state, worklist, valid_access)
     }
 
     pub(super) fn return_or_revert(
@@ -1224,83 +1518,89 @@ impl SymbolicExecutor {
         let size = state.stack.pop()?;
         match state.constrained_usize_checked(&mut self.cx, &size) {
             Some(Ok(size)) => {
-                state.return_data = state.memory.return_data(&mut self.cx, offset.clone(), size)?;
-                if is_revert {
-                    Ok(self.classify_revert(state, offset, size))
-                } else {
-                    Ok(StepOutcome::Halt)
-                }
+                state.return_data = state.memory.return_data(&mut self.cx, offset, size)?;
             }
-            Some(Err(_)) => Ok(StepOutcome::Revert),
+            Some(Err(_)) => return Ok(StepOutcome::Revert),
             None => {
                 let max_limit = self.config.max_calldata_bytes as usize;
-                let max_size = state
-                    .upper_bound_usize(&mut self.cx, &size)
-                    .filter(|size| *size <= max_limit)
-                    .map(Ok)
-                    .unwrap_or_else(|| {
-                        self.solver_upper_bound_usize(
-                            state,
-                            &size,
-                            max_limit,
-                            if is_revert { "symbolic REVERT size" } else { "symbolic RETURN size" },
-                        )
-                    })?;
+                let reason =
+                    if is_revert { "symbolic REVERT size" } else { "symbolic RETURN size" };
+                let max_size = self.solver_upper_bound_usize(state, &size, max_limit, reason)?;
                 state.return_data =
                     state.memory.return_data_symbolic_size(&mut self.cx, offset, size, max_size)?;
-                Ok(if is_revert { StepOutcome::Revert } else { StepOutcome::Halt })
             }
         }
+        if is_revert { self.classify_revert(state) } else { Ok(StepOutcome::Halt) }
     }
 
     pub(super) fn classify_revert(
         &mut self,
-        state: &PathState,
-        offset: SymExpr,
-        size: usize,
-    ) -> StepOutcome {
-        if state.call_depth == 0
-            && let Some(offset) = offset.as_const()
-            && let Ok(offset) = usize::try_from(offset)
-            && let Ok(data) = state.memory.read_concrete(&mut self.cx, offset, size)
-            && is_assertion_revert(&data)
-        {
-            StepOutcome::Failure
-        } else {
-            StepOutcome::Revert
+        state: &mut PathState,
+    ) -> Result<StepOutcome, SymbolicError> {
+        if state.call_depth != 0 {
+            return Ok(StepOutcome::Revert);
         }
+        let data = state.return_data.read_concrete(&mut self.cx, "symbolic revert data");
+        // Like Forge's fuzz and invariant runners, a `vm.assumeNoRevert` rejection that reaches the
+        // top frame discards the run. Invariant predicates still treat it as a revert.
+        if !state.invariant_predicate && data.as_deref().is_ok_and(|data| data == MAGIC_ASSUME) {
+            return Ok(StepOutcome::AssumeRejected);
+        }
+        // In `check*`/`prove*` tests, a `CheatcodeError` that reaches the top frame, such as an
+        // unmet `vm.expectRevert`, is a failure. Invariant handlers treat it as a revert.
+        // Match its selector independently of the memory address and the rest of the payload.
+        if state.root_calldata.is_some()
+            && let Some(condition) =
+                cheatcode_error_revert_condition(&mut self.cx, &state.return_data)
+            && let Some(constraints) = self.constraints_for_condition(state, condition)?
+        {
+            state.constraints = constraints;
+            return Ok(StepOutcome::Failure);
+        }
+        if data.is_ok_and(|data| is_assertion_revert(&data)) {
+            return Ok(StepOutcome::Failure);
+        }
+        Ok(StepOutcome::Revert)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn empty_state(executor: &mut SymbolicExecutor) -> PathState {
-        let calldata =
-            SymbolicCalldata::selector_only(&mut executor.cx, &Function::parse("empty()").unwrap())
-                .unwrap();
-        PathState::new(&mut executor.cx, Address::ZERO, Address::ZERO, U256::ZERO, calldata, false)
+/// Returns the activation fork for opcodes implemented by the symbolic executor.
+const fn opcode_activation(op: u8) -> SpecId {
+    match op {
+        opcode::DELEGATECALL => SpecId::HOMESTEAD,
+        opcode::RETURNDATASIZE | opcode::RETURNDATACOPY | opcode::STATICCALL | opcode::REVERT => {
+            SpecId::BYZANTIUM
+        }
+        opcode::SHL | opcode::SHR | opcode::SAR | opcode::EXTCODEHASH | opcode::CREATE2 => {
+            SpecId::PETERSBURG
+        }
+        opcode::CHAINID | opcode::SELFBALANCE => SpecId::ISTANBUL,
+        opcode::BASEFEE => SpecId::LONDON,
+        opcode::PUSH0 => SpecId::SHANGHAI,
+        opcode::TLOAD | opcode::TSTORE | opcode::MCOPY | opcode::BLOBHASH | opcode::BLOBBASEFEE => {
+            SpecId::CANCUN
+        }
+        opcode::CLZ => SpecId::OSAKA,
+        opcode::SLOTNUM | opcode::DUPN | opcode::SWAPN | opcode::EXCHANGE => SpecId::AMSTERDAM,
+        _ => SpecId::FRONTIER,
     }
+}
 
-    #[test]
-    fn branch_target_constraint_is_one_shot_after_target_reached() {
-        let mut executor = SymbolicExecutor::new(SymbolicConfig::default());
-        let mut state = empty_state(&mut executor);
-        state.set_branch_target(Some(SymbolicBranchTarget::new(
-            Address::ZERO,
-            0,
-            opcode::EQ,
-            false,
-        )));
-        state.mark_branch_target_reached();
+/// Decodes the EIP-8024 `DUPN`/`SWAPN` immediate into a stack depth.
+///
+/// Bytes `0x5b..=0x7f` are invalid so that the immediate is never a `JUMPDEST` or `PUSH` opcode.
+const fn decode_stack_immediate(immediate: u8) -> Option<usize> {
+    let x = immediate as usize;
+    if x <= 90 || x >= 128 { Some((x + 145) % 256) } else { None }
+}
 
-        let condition = SymBoolExpr::constant(&mut executor.cx, false);
-        let accepted =
-            executor.apply_branch_target_constraint(&mut state, 0, opcode::EQ, &condition).unwrap();
-
-        assert!(accepted);
-        assert!(state.constraints.is_empty());
-        assert!(state.satisfies_branch_target());
+/// Decodes the EIP-8024 `EXCHANGE` immediate into a pair of stack depths `n < m`.
+const fn decode_exchange_immediate(immediate: u8) -> Option<(usize, usize)> {
+    let x = immediate as usize;
+    if x > 81 && x < 128 {
+        return None;
     }
+    let k = x ^ 143;
+    let (q, r) = (k / 16, k % 16);
+    if q < r { Some((q + 1, r + 1)) } else { Some((r + 1, 29 - q)) }
 }

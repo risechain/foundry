@@ -499,19 +499,15 @@ contract CheckOverrides is ForgeTest {
 
         vm.stopBroadcast();
 
-        // startBroadcast(msg.sender)
+        // Use the saved script caller when the broadcast sender differs.
         vm.startBroadcast(address(0x1337));
         require(tx.origin == script_caller);
-        require(msg.sender == script_caller);
-        require(msg.sender != address(0x1337));
 
         ContractB b = new ContractB(script_caller);
         require(tx.origin == script_caller);
-        require(msg.sender == script_caller);
 
         b.method(script_caller);
         require(tx.origin == script_caller);
-        require(msg.sender == script_caller);
 
         vm.stopBroadcast();
     }
@@ -565,5 +561,40 @@ contract ScriptSign is ForgeTest {
         address actual = ecrecover(digest, v, r, s);
 
         assertEq(actual, sender);
+    }
+}
+
+library BroadcastLib {
+    event Set(uint256 value);
+
+    function set(uint256 value) public {
+        emit Set(value);
+    }
+}
+
+contract BroadcastDelegatecallTest is ForgeTest {
+    bytes constant ERR = "`delegatecall`s and `callcode`s cannot be broadcast; use a regular `call` instead";
+
+    function broadcastLibraryCall() external {
+        vm.startBroadcast();
+        // External library calls are delegatecalls.
+        BroadcastLib.set(42);
+        vm.stopBroadcast();
+    }
+
+    function testRevertIfBroadcastDelegatecall() public {
+        vm.expectRevert(ERR);
+        this.broadcastLibraryCall();
+    }
+
+    function testRevertIfBroadcastCallcode() public {
+        vm.startBroadcast();
+        bool ok;
+        assembly {
+            // A callcode to an account without code only fails if it is rejected.
+            ok := callcode(gas(), 0xdead, 0, 0, 0, 0, 0)
+        }
+        assertTrue(!ok);
+        vm.stopBroadcast();
     }
 }

@@ -1,5 +1,9 @@
-use alloy_evm::{Evm, EvmEnv, EvmFactory};
+use alloy_consensus::BlockHeader;
+use alloy_evm::{Evm, EvmEnv, EvmFactory, FromRecoveredTx};
 use alloy_monad_evm::{MonadEvm, MonadEvmFactory, MonadPrecompilesMap};
+use alloy_network::{BlockResponse, Ethereum, TransactionResponse};
+use alloy_provider::Provider;
+use alloy_rpc_types::BlockTransactions;
 use alloy_sol_types::SolCall;
 use eyre::WrapErr;
 use foundry_fork_db::DatabaseError;
@@ -22,22 +26,32 @@ use monad_revm::{
 };
 use revm::{
     context::{
-        BlockEnv, ContextTr, LocalContextTr, Transaction, TransactionType, TxEnv,
+        BlockEnv, ContextTr, Transaction, TransactionType, TxEnv,
         journaled_state::account::JournaledAccountTr,
         result::{EVMError, ResultAndState},
     },
     context_interface::{Cfg, ContextSetters, transaction::AuthorizationTr},
-    handler::{EthFrame, EvmTr, FrameResult, Handler},
+    handler::{EthFrame, EvmTr, FrameResult},
     inspector::{InspectSystemCallEvm, Inspector, InspectorHandler},
-    interpreter::{FrameInput, GasTracker, SharedMemory, interpreter_action::FrameInit},
+    interpreter::FrameInput,
     primitives::{Address, Bytes, HashSet, U256},
 };
 
 use crate::{
-    FoundryContextExt, FoundryInspectorExt,
+    FoundryChain, FoundryContextExt, FoundryInspectorExt, FoundryJournal,
     backend::{DatabaseExt, JournaledState},
-    evm::{FoundryEvmFactory, NestedEvm, NestedEvmFor},
+    evm::{
+        BlockResponseFor, ChainFor, FoundryEvmFactory, FoundryEvmNetwork, NestedEvm, NestedEvmFor,
+        TxEnvFor, run_inspected_frame,
+    },
 };
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MonadEvmNetwork;
+impl FoundryEvmNetwork for MonadEvmNetwork {
+    type Network = Ethereum;
+    type EvmFactory = MonadEvmFactory;
+}
 
 type MonadEvmHandler<'db, I> =
     MonadHandler<MonadRevmEvm<'db, I>, EVMError<DatabaseError>, EthFrame>;
@@ -48,6 +62,294 @@ pub type MonadRevmEvm<'db, I> = RevmMonadEvm<
     MonadInstructions<MonadContext<&'db mut dyn DatabaseExt<MonadEvmFactory>>>,
     MonadPrecompilesMap,
 >;
+
+impl FoundryChain<TxEnv> for MonadChainContext {
+    fn for_transaction(tx: &TxEnv) -> Self {
+        monad_context_from_participants(
+            Default::default(),
+            Default::default(),
+            std::slice::from_ref(tx),
+            0,
+        )
+    }
+
+    fn for_block(
+        grandparent: &[TxEnv],
+        parent: &[TxEnv],
+        current: &[TxEnv],
+        current_tx_index: usize,
+    ) -> Self {
+        monad_context_from_participants(
+            monad_block_participants(grandparent),
+            monad_block_participants(parent),
+            current,
+            current_tx_index,
+        )
+    }
+
+    fn refresh_journal<J: FoundryJournal>(&self, journal: &mut J) {
+        let mut tracker = journal.capture_reserve_balance();
+        tracker.rebase(self, journal.evm_state());
+        journal.restore_reserve_balance(tracker);
+    }
+}
+
+impl FoundryEvmFactory for MonadEvmFactory {
+    type Chain = MonadChainContext;
+
+    type FoundryContext<'db> = MonadContext<&'db mut dyn DatabaseExt<Self>>;
+
+    type FoundryEvm<'db, I: FoundryInspectorExt<Self::FoundryContext<'db>>> =
+        MonadEvm<&'db mut dyn DatabaseExt<Self>, I>;
+
+    fn create_foundry_evm_with_inspector<'db, I: FoundryInspectorExt<Self::FoundryContext<'db>>>(
+        &self,
+        db: &'db mut dyn DatabaseExt<Self>,
+        evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
+        inspector: I,
+    ) -> Self::FoundryEvm<'db, I> {
+        let mut monad_evm = self.create_evm_with_inspector(db, evm_env, inspector);
+        monad_evm.cfg.tx_chain_id_check = true;
+        monad_evm
+    }
+
+    fn create_nested_evm_with_inspector<'db, I>(
+        &self,
+        db: &'db mut dyn DatabaseExt<Self>,
+        evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
+        inspector: I,
+    ) -> NestedEvmFor<'db, Self>
+    where
+        I: FoundryInspectorExt<Self::FoundryContext<'db>> + 'db,
+    {
+        let spec = evm_env.cfg_env.spec;
+        let monad_cfg = MonadCfgEnv::from(evm_env.cfg_env);
+        let mut evm = monad_context_with_db(db)
+            .with_block(evm_env.block_env)
+            .with_cfg(monad_cfg)
+            .build_monad_with_inspector(inspector)
+            .with_precompiles(MonadPrecompilesMap::new_with_spec(spec));
+
+        evm.0.ctx.cfg.tx_chain_id_check = true;
+        Box::new(evm)
+    }
+}
+
+impl<'db, I: FoundryInspectorExt<MonadContext<&'db mut dyn DatabaseExt<MonadEvmFactory>>>> NestedEvm
+    for MonadRevmEvm<'db, I>
+{
+    type Spec = MonadHardfork;
+    type Block = BlockEnv;
+    type Tx = TxEnv;
+    type Chain = MonadChainContext;
+    type Journal = MonadJournal<&'db mut dyn DatabaseExt<MonadEvmFactory>>;
+
+    fn tx_mut(&mut self) -> &mut Self::Tx {
+        self.ctx_mut().tx_mut()
+    }
+
+    fn journal_inner_mut(&mut self) -> &mut JournaledState {
+        &mut self.ctx_mut().journaled_state.inner
+    }
+
+    fn chain_mut(&mut self) -> &mut Self::Chain {
+        &mut self.ctx_mut().chain
+    }
+
+    fn precompiles_mut(&mut self) -> &mut alloy_evm::precompiles::PrecompilesMap {
+        &mut self.0.precompiles
+    }
+
+    fn journal_mut(&mut self) -> &mut Self::Journal {
+        &mut self.ctx_mut().journaled_state
+    }
+
+    fn run_execution(&mut self, frame: FrameInput) -> Result<FrameResult, EVMError<DatabaseError>> {
+        run_inspected_frame(self, MonadEvmHandler::<I>::new(), frame)
+    }
+
+    fn transact_raw(&mut self, tx: Self::Tx) -> eyre::Result<ResultAndState> {
+        let Some(system_call) = protocol_system_call(&tx)? else {
+            ContextSetters::set_tx(&mut self.0.ctx, tx);
+
+            let mut handler = MonadEvmHandler::<I>::new();
+            let result = handler.inspect_run(self)?;
+
+            return Ok(ResultAndState::new(
+                result,
+                self.ctx_ref().journaled_state.inner.state.clone(),
+            ));
+        };
+
+        system_call.validate_chain_id(self.ctx_ref().cfg().chain_id())?;
+        let journal = self.ctx_ref().journal_inner().clone();
+        let chain = self.ctx_ref().chain.clone();
+        let reserve_balance = self.ctx_ref().journaled_state.reserve_balance().clone();
+        let result = (|| {
+            let (db, journal) = self.0.ctx.db_journal_inner_mut();
+            system_call.apply_prestate(db, journal)?;
+            let result = self
+                .inspect_system_call_with_caller(
+                    system_call.caller,
+                    system_call.contract,
+                    system_call.data,
+                )
+                .wrap_err("failed to execute protocol system transaction")?;
+            finish_protocol_system_call(result)
+        })();
+        // Restore EVM-owned protocol state. Callers that require atomic inspector state isolate
+        // the inspector and database, as the Executor/Cow replay path does.
+        if result.is_err() {
+            self.ctx_mut().set_journal_inner(journal);
+            self.ctx_mut().chain = chain;
+            *self.ctx_mut().journaled_state.reserve_balance_mut() = reserve_balance;
+        }
+        result
+    }
+
+    fn transact_replay(
+        &mut self,
+        tx: Self::Tx,
+        is_system: bool,
+    ) -> eyre::Result<Option<ResultAndState>> {
+        if is_system && protocol_system_call(&tx)?.is_none() {
+            return Ok(None);
+        }
+        self.transact_raw(tx).map(Some)
+    }
+
+    fn to_evm_env(&self) -> EvmEnv<Self::Spec, Self::Block> {
+        self.ctx_ref().evm_clone()
+    }
+}
+
+/// Transaction metadata for an exact block and its two ancestors.
+#[derive(Clone, Debug)]
+pub struct BlockContext<FEN: FoundryEvmNetwork> {
+    grandparent: Vec<TxEnvFor<FEN>>,
+    parent: Vec<TxEnvFor<FEN>>,
+    current: Vec<TxEnvFor<FEN>>,
+}
+
+impl<FEN: FoundryEvmNetwork> BlockContext<FEN> {
+    /// Creates block context from grandparent, parent, and current block transactions.
+    pub const fn new(
+        grandparent: Vec<TxEnvFor<FEN>>,
+        parent: Vec<TxEnvFor<FEN>>,
+        current: Vec<TxEnvFor<FEN>>,
+    ) -> Self {
+        Self { grandparent, parent, current }
+    }
+
+    /// Fetches all transaction bodies needed to replay transactions in `block` exactly.
+    pub async fn fetch<P: Provider<FEN::Network>>(
+        provider: &P,
+        block: &BlockResponseFor<FEN>,
+    ) -> eyre::Result<Self> {
+        let current = transaction_envs::<FEN>(block)?;
+        let parent = fetch_parent::<FEN, P>(provider, block).await?;
+        let grandparent = if let Some(parent) = &parent {
+            fetch_parent::<FEN, P>(provider, parent).await?
+        } else {
+            None
+        };
+
+        Ok(Self::new(
+            grandparent.as_ref().map(transaction_envs::<FEN>).transpose()?.unwrap_or_default(),
+            parent.as_ref().map(transaction_envs::<FEN>).transpose()?.unwrap_or_default(),
+            current,
+        ))
+    }
+
+    /// Builds context for the transaction at `index` in the current block.
+    pub fn transaction(&self, index: usize) -> ChainFor<FEN> {
+        ChainFor::<FEN>::for_block(&self.grandparent, &self.parent, &self.current, index)
+    }
+
+    /// Returns a cursor positioned immediately before `index` in the current block.
+    pub fn before_transaction(mut self, index: usize) -> eyre::Result<Self> {
+        if index > self.current.len() {
+            eyre::bail!(
+                "transaction index {index} exceeds block transaction count {}",
+                self.current.len()
+            );
+        }
+        self.current.truncate(index);
+        Ok(self)
+    }
+
+    /// Returns a cursor positioned at the start of a child block.
+    pub fn into_child(mut self) -> Self {
+        self.grandparent = std::mem::take(&mut self.parent);
+        self.parent = std::mem::take(&mut self.current);
+        self
+    }
+
+    /// Builds context for the next transaction at the cursor's current block position.
+    pub fn next_transaction(&self, tx: &TxEnvFor<FEN>) -> ChainFor<FEN> {
+        let mut current = self.current.clone();
+        let index = current.len();
+        current.push(tx.clone());
+        ChainFor::<FEN>::for_block(&self.grandparent, &self.parent, &current, index)
+    }
+
+    /// Records a committed transaction at the cursor's current block position.
+    pub fn record_transaction(&mut self, tx: TxEnvFor<FEN>) {
+        self.current.push(tx);
+    }
+
+    /// Advances the cursor to the start of the next block.
+    pub fn advance_block(&mut self) {
+        self.grandparent = std::mem::take(&mut self.parent);
+        self.parent = std::mem::take(&mut self.current);
+    }
+}
+
+async fn fetch_parent<FEN, P>(
+    provider: &P,
+    block: &BlockResponseFor<FEN>,
+) -> eyre::Result<Option<BlockResponseFor<FEN>>>
+where
+    FEN: FoundryEvmNetwork,
+    P: Provider<FEN::Network>,
+{
+    let parent_hash = block.header().parent_hash();
+    if parent_hash.is_zero() {
+        return Ok(None);
+    }
+
+    provider
+        .get_block_by_hash(parent_hash)
+        .full()
+        .await
+        .wrap_err_with(|| format!("failed to fetch ancestor block {parent_hash}"))?
+        .map(Some)
+        .ok_or_else(|| eyre::eyre!("ancestor block {parent_hash} not found"))
+}
+
+fn transaction_envs<FEN: FoundryEvmNetwork>(
+    block: &BlockResponseFor<FEN>,
+) -> eyre::Result<Vec<TxEnvFor<FEN>>> {
+    let BlockTransactions::Full(transactions) = block.transactions() else {
+        eyre::bail!("block {} does not contain full transactions", block.header().number());
+    };
+    Ok(transactions
+        .iter()
+        .map(|tx| TxEnvFor::<FEN>::from_recovered_tx(tx.as_ref(), tx.from()))
+        .collect())
+}
+
+/// Refreshes journal state derived from a context's active Monad chain position.
+pub fn refresh_chain_journal<CTX: FoundryContextExt>(context: &mut CTX) {
+    let chain = context.chain().clone();
+    chain.refresh_journal(context.journal_mut());
+}
+
+/// Refreshes journal state derived from a nested EVM's active Monad chain position.
+pub fn refresh_nested_chain_journal<E: NestedEvm + ?Sized>(evm: &mut E) {
+    let chain = evm.chain_mut().clone();
+    chain.refresh_journal(evm.journal_mut());
+}
 
 /// Senders and EIP-7702 authorities that participated in one Monad block.
 pub type MonadBlockParticipants = HashSet<Address>;
@@ -81,13 +383,6 @@ pub fn monad_context_from_participants(
         current_tx_index,
         ..Default::default()
     }
-}
-
-pub(crate) fn rebase_monad_context<DB: revm::Database>(context: &mut MonadContext<DB>) {
-    let chain = context.chain.clone();
-    let mut tracker = std::mem::take(context.journaled_state.reserve_balance_mut());
-    tracker.rebase(&chain, &context.journaled_state.inner.state);
-    *context.journaled_state.reserve_balance_mut() = tracker;
 }
 
 /// A canonical Monad protocol system transaction.
@@ -164,7 +459,7 @@ impl ProtocolSystemCall {
 ///
 /// Returns an error when the transaction uses Monad's reserved protocol sender but does not
 /// satisfy the canonical envelope rules.
-pub fn protocol_system_call(tx: &TxEnv) -> eyre::Result<Option<ProtocolSystemCall>> {
+pub fn protocol_system_call<T: Transaction>(tx: &T) -> eyre::Result<Option<ProtocolSystemCall>> {
     if tx.caller() != SYSTEM_ADDRESS {
         return Ok(None);
     }
@@ -186,23 +481,23 @@ pub fn protocol_system_call(tx: &TxEnv) -> eyre::Result<Option<ProtocolSystemCal
         "invalid Monad protocol system transaction: gas price must be zero"
     );
     eyre::ensure!(
-        tx.gas_priority_fee.is_none(),
+        tx.max_priority_fee_per_gas().is_none(),
         "invalid Monad protocol system transaction: priority fee must be absent"
     );
     eyre::ensure!(
-        tx.access_list.0.is_empty(),
+        tx.access_list().is_none_or(|mut list| list.next().is_none()),
         "invalid Monad protocol system transaction: access list must be empty"
     );
     eyre::ensure!(
-        tx.blob_hashes.is_empty(),
+        tx.blob_versioned_hashes().is_empty(),
         "invalid Monad protocol system transaction: blob hashes must be empty"
     );
     eyre::ensure!(
-        tx.max_fee_per_blob_gas == 0,
+        tx.max_fee_per_blob_gas() == 0,
         "invalid Monad protocol system transaction: blob gas fee must be zero"
     );
     eyre::ensure!(
-        tx.authorization_list.is_empty(),
+        tx.authorization_list_len() == 0,
         "invalid Monad protocol system transaction: authorization list must be empty"
     );
 
@@ -296,7 +591,8 @@ fn finish_protocol_system_call<H>(
     Ok(result)
 }
 
-fn try_transact_monad_system_replay<DB, I>(
+/// Tries to execute a canonical Monad system transaction on an existing Monad EVM.
+pub fn try_transact_monad_system_replay<DB, I>(
     evm: &mut MonadEvm<DB, I>,
     tx: &TxEnv,
 ) -> eyre::Result<Option<ResultAndState>>
@@ -320,6 +616,8 @@ where
             .wrap_err("failed to execute protocol system transaction")?;
         finish_protocol_system_call(result)
     })();
+    // Restore EVM-owned protocol state. Callers that require atomic inspector state isolate the
+    // inspector and database, as the Executor/Cow replay path does.
     if result.is_err() {
         evm.ctx_mut().set_journal_inner(journal);
         evm.ctx_mut().chain = chain;
@@ -328,204 +626,11 @@ where
     result.map(Some)
 }
 
-impl FoundryEvmFactory for MonadEvmFactory {
-    type Chain = MonadChainContext;
-
-    type FoundryContext<'db> = MonadContext<&'db mut dyn DatabaseExt<Self>>;
-
-    type FoundryEvm<'db, I: FoundryInspectorExt<Self::FoundryContext<'db>>> =
-        MonadEvm<&'db mut dyn DatabaseExt<Self>, I>;
-
-    fn chain_context_for_transaction(&self, tx: &Self::Tx) -> Self::Chain {
-        monad_context_from_participants(
-            Default::default(),
-            Default::default(),
-            std::slice::from_ref(tx),
-            0,
-        )
-    }
-
-    fn chain_context_for_block(
-        &self,
-        grandparent: &[Self::Tx],
-        parent: &[Self::Tx],
-        current: &[Self::Tx],
-        current_tx_index: usize,
-    ) -> Self::Chain {
-        monad_context_from_participants(
-            monad_block_participants(grandparent),
-            monad_block_participants(parent),
-            current,
-            current_tx_index,
-        )
-    }
-
-    fn create_evm_with_context<DB: alloy_evm::Database>(
-        &self,
-        db: DB,
-        evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
-        chain_context: Self::Chain,
-    ) -> Self::Evm<DB, revm::inspector::NoOpInspector> {
-        let mut evm = self.create_evm(db, evm_env);
-        evm.ctx_mut().chain = chain_context;
-        evm
-    }
-
-    fn create_foundry_evm_with_inspector<'db, I: FoundryInspectorExt<Self::FoundryContext<'db>>>(
-        &self,
-        db: &'db mut dyn DatabaseExt<Self>,
-        evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
-        chain_context: Self::Chain,
-        inspector: I,
-    ) -> Self::FoundryEvm<'db, I> {
-        let mut monad_evm = self.create_evm_with_inspector(db, evm_env, inspector);
-        monad_evm.ctx_mut().chain = chain_context;
-        monad_evm.cfg.tx_chain_id_check = true;
-        monad_evm.inspector().get_networks().inject_precompiles(monad_evm.precompiles_mut());
-        monad_evm
-    }
-
-    fn try_transact_system_replay<DB, I>(
-        &self,
-        evm: &mut Self::Evm<DB, I>,
-        tx: &Self::Tx,
-    ) -> eyre::Result<Option<ResultAndState<Self::HaltReason>>>
-    where
-        DB: alloy_evm::Database,
-        I: Inspector<Self::Context<DB>>,
-    {
-        try_transact_monad_system_replay(evm, tx)
-    }
-
-    fn try_transact_foundry_system_replay<
-        'db,
-        I: FoundryInspectorExt<Self::FoundryContext<'db>>,
-    >(
-        &self,
-        evm: &mut Self::FoundryEvm<'db, I>,
-        tx: &Self::Tx,
-    ) -> eyre::Result<Option<ResultAndState<Self::HaltReason>>> {
-        try_transact_monad_system_replay(evm, tx)
-    }
-
-    fn create_foundry_nested_evm<'db>(
-        &self,
-        db: &'db mut dyn DatabaseExt<Self>,
-        evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
-        chain_context: Self::Chain,
-        inspector: &'db mut dyn FoundryInspectorExt<Self::FoundryContext<'db>>,
-    ) -> NestedEvmFor<'db, Self> {
-        let spec = evm_env.cfg_env.spec;
-        let monad_cfg = MonadCfgEnv::from(evm_env.cfg_env);
-        let mut evm = monad_context_with_db(db)
-            .with_block(evm_env.block_env)
-            .with_cfg(monad_cfg)
-            .build_monad_with_inspector(inspector)
-            .with_precompiles(MonadPrecompilesMap::new_with_spec(spec));
-
-        evm.0.ctx.chain = chain_context;
-        evm.0.ctx.cfg.tx_chain_id_check = true;
-        evm.0.inspector.get_networks().inject_precompiles(&mut evm.0.precompiles);
-
-        Box::new(evm)
-    }
-}
-
-impl<'db, I: FoundryInspectorExt<MonadContext<&'db mut dyn DatabaseExt<MonadEvmFactory>>>> NestedEvm
-    for MonadRevmEvm<'db, I>
-{
-    type Spec = MonadHardfork;
-    type Block = BlockEnv;
-    type Tx = TxEnv;
-    type Chain = MonadChainContext;
-    type Journal = MonadJournal<&'db mut dyn DatabaseExt<MonadEvmFactory>>;
-
-    fn tx_mut(&mut self) -> &mut Self::Tx {
-        self.ctx_mut().tx_mut()
-    }
-
-    fn journal_inner_mut(&mut self) -> &mut JournaledState {
-        &mut self.ctx_mut().journaled_state.inner
-    }
-
-    fn chain_mut(&mut self) -> &mut Self::Chain {
-        &mut self.ctx_mut().chain
-    }
-
-    fn journal_mut(&mut self) -> &mut Self::Journal {
-        &mut self.ctx_mut().journaled_state
-    }
-
-    fn refresh_chain_dependent_state(&mut self) {
-        rebase_monad_context(self.ctx_mut());
-    }
-
-    fn run_execution(&mut self, frame: FrameInput) -> Result<FrameResult, EVMError<DatabaseError>> {
-        let mut handler = MonadEvmHandler::<I>::new();
-
-        let memory =
-            SharedMemory::new_with_buffer(self.ctx_ref().local().shared_memory_buffer().clone());
-        let first_frame_input = FrameInit { depth: 0, memory, frame_input: frame };
-
-        let mut frame_result = handler.inspect_run_exec_loop(self, first_frame_input)?;
-
-        let mut parent_gas = GasTracker::new(
-            frame_result.gas().limit(),
-            frame_result.gas().remaining(),
-            frame_result.gas().reservoir(),
-        );
-        handler.last_frame_result(self, &mut frame_result, &mut parent_gas)?;
-
-        Ok(frame_result)
-    }
-
-    fn transact_raw(&mut self, tx: Self::Tx) -> Result<ResultAndState, EVMError<DatabaseError>> {
-        ContextSetters::set_tx(&mut self.0.ctx, tx);
-
-        let mut handler = MonadEvmHandler::<I>::new();
-        let result = handler.inspect_run(self)?;
-
-        Ok(ResultAndState::new(result, self.ctx_ref().journaled_state.inner.state.clone()))
-    }
-
-    fn transact_replay(&mut self, tx: Self::Tx) -> eyre::Result<ResultAndState> {
-        let Some(system_call) = protocol_system_call(&tx)? else {
-            return self.transact_raw(tx).map_err(Into::into);
-        };
-
-        system_call.validate_chain_id(self.ctx_ref().cfg().chain_id())?;
-        let journal = self.ctx_ref().journal_inner().clone();
-        let chain = self.ctx_ref().chain.clone();
-        let reserve_balance = self.ctx_ref().journaled_state.reserve_balance().clone();
-        let result = (|| {
-            let (db, journal) = self.0.ctx.db_journal_inner_mut();
-            system_call.apply_prestate(db, journal)?;
-            let result = self
-                .inspect_system_call_with_caller(
-                    system_call.caller,
-                    system_call.contract,
-                    system_call.data,
-                )
-                .wrap_err("failed to execute protocol system transaction")?;
-            finish_protocol_system_call(result)
-        })();
-        if result.is_err() {
-            self.ctx_mut().set_journal_inner(journal);
-            self.ctx_mut().chain = chain;
-            *self.ctx_mut().journaled_state.reserve_balance_mut() = reserve_balance;
-        }
-        result
-    }
-
-    fn to_evm_env(&self) -> EvmEnv<Self::Spec, Self::Block> {
-        self.ctx_ref().evm_clone()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evm::{BlockContext, MonadEvmNetwork};
+    use crate::{backend::Backend, evm::EthEvmNetwork};
+    use alloy_evm::EthEvmFactory;
     use alloy_sol_types::SolEvent;
     use monad_revm::{
         reserve_balance::tracker::ReserveBalanceInit,
@@ -552,6 +657,81 @@ mod tests {
         state::{Account, AccountInfo, EvmState},
     };
 
+    #[test]
+    fn ethereum_replay_skips_monad_system_envelopes() {
+        let tx = system_transaction(syscallSnapshotCall {}.abi_encode(), U256::ZERO);
+        let factory = EthEvmFactory::default();
+        let evm_env = EvmEnv::default();
+        let mut db = Backend::<EthEvmNetwork>::spawn(None).unwrap();
+        db.set_networks(foundry_evm_networks::NetworkConfigs::with_monad());
+        let mut nested = factory.create_nested_evm(&mut db, evm_env);
+        assert!(nested.transact_replay(tx.clone(), true).unwrap().is_none());
+        assert!(nested.journal_inner_mut().state.is_empty());
+        let error = nested.transact_raw(tx).unwrap_err();
+        assert!(format!("{error:?}").contains("gas"), "{error:?}");
+    }
+
+    #[test]
+    fn nested_replay_executes_monad_envelopes_once_and_skips_foreign_systems() {
+        let factory = MonadEvmFactory::default();
+        let evm_env =
+            EvmEnv::new(CfgEnv::new_with_spec(MonadHardfork::MonadNine), BlockEnv::default());
+        let mut db = Backend::<MonadEvmNetwork>::spawn(None).unwrap();
+        db.insert_account_info(SYSTEM_ADDRESS, AccountInfo { nonce: 3, ..Default::default() });
+        let mut evm = factory.create_nested_evm(&mut db, evm_env.clone());
+
+        // The RPC system classification must survive decoding into an ordinary TxEnv.
+        let foreign = TxEnv { caller: Address::with_last_byte(42), ..Default::default() };
+        assert!(evm.transact_replay(foreign, true).unwrap().is_none());
+        assert!(evm.journal_inner_mut().state.is_empty());
+
+        let tx = system_transaction(syscallSnapshotCall {}.abi_encode(), U256::ZERO);
+        let result = evm.transact_replay(tx.clone(), true).unwrap().unwrap();
+        assert!(result.result.is_success());
+        assert_eq!(result.result.tx_gas_used(), 0);
+        drop(evm);
+        db.commit(result.state);
+        assert_eq!(db.basic(SYSTEM_ADDRESS).unwrap().unwrap().nonce, 4);
+
+        let mut evm = factory.create_nested_evm(&mut db, evm_env);
+        assert!(evm.transact_replay(tx, true).unwrap_err().to_string().contains("nonce"));
+        assert!(evm.journal_inner_mut().state.is_empty());
+        drop(evm);
+        assert_eq!(db.basic(SYSTEM_ADDRESS).unwrap().unwrap().nonce, 4);
+    }
+
+    #[test]
+    fn nested_replay_failure_restores_monad_prestate() {
+        let initial_balance = U256::from(3) * MON;
+        let mut db = Backend::<MonadEvmNetwork>::spawn(None).unwrap();
+        db.insert_account_info(SYSTEM_ADDRESS, AccountInfo { nonce: 3, ..Default::default() });
+        db.insert_account_info(
+            STAKING_ADDRESS,
+            AccountInfo { balance: initial_balance, ..Default::default() },
+        );
+        let tx = system_transaction(
+            syscallRewardCall { blockAuthor: Address::with_last_byte(42) }.abi_encode(),
+            U256::from(25) * MON,
+        );
+        let factory = MonadEvmFactory::default();
+        let evm_env =
+            EvmEnv::new(CfgEnv::new_with_spec(MonadHardfork::MonadNine), BlockEnv::default());
+        let mut evm = factory.create_nested_evm(&mut db, evm_env);
+        let journal_before = evm.journal_inner_mut().clone();
+        let chain_before = evm.chain_mut().clone();
+        let tracker_before = evm.journal_mut().reserve_balance().clone();
+
+        let error = evm.transact_replay(tx, true).unwrap_err();
+        assert!(error.to_string().contains("reverted or halted"), "{error:?}");
+        assert_eq!(evm.journal_inner_mut().state, journal_before.state);
+        assert_eq!(evm.chain_mut(), &chain_before);
+        assert_eq!(evm.journal_mut().reserve_balance(), &tracker_before);
+        drop(evm);
+        assert_eq!(db.basic(SYSTEM_ADDRESS).unwrap().unwrap().nonce, 3);
+        assert_eq!(db.basic(STAKING_ADDRESS).unwrap().unwrap().balance, initial_balance);
+        assert_eq!(db.storage(STAKING_ADDRESS, global_slots::PROPOSER_VAL_ID).unwrap(), U256::ZERO);
+    }
+
     #[derive(Default)]
     struct ProtocolPrestateInspector {
         call_count: usize,
@@ -577,7 +757,7 @@ mod tests {
 
     fn transaction(caller: Address, authority: Address) -> TxEnv {
         let authorization = RecoveredAuthorization::new_unchecked(
-            Authorization { chain_id: U256::from(1), address: Address::ZERO, nonce: 0 },
+            Authorization { chain_id: U256::ONE, address: Address::ZERO, nonce: 0 },
             RecoveredAuthority::Valid(authority),
         );
         TxEnv {
@@ -647,7 +827,7 @@ mod tests {
 
         evm.ctx_mut().chain = new_chain.clone();
         evm.ctx_mut().journaled_state.inner.state = EvmState::from_iter([(sender, account)]);
-        rebase_monad_context(evm.ctx_mut());
+        refresh_chain_journal(evm.ctx_mut());
 
         assert_eq!(evm.ctx().chain, new_chain);
         assert!(evm.ctx().journaled_state.reserve_balance().has_violation());
@@ -693,7 +873,7 @@ mod tests {
         let chain_before = evm.ctx().chain.clone();
         let tracker_before = evm.ctx().journaled_state.reserve_balance().clone();
 
-        assert!(factory.try_transact_system_replay(&mut evm, &tx).unwrap().is_none());
+        assert!(try_transact_monad_system_replay(&mut evm, &tx).unwrap().is_none());
         assert_eq!(evm.tx(), &tx_before);
         assert_eq!(evm.ctx().journal_inner().state, journal_before.state);
         assert_eq!(evm.ctx().chain, chain_before);
@@ -775,7 +955,7 @@ mod tests {
             "snapshot calldata must be 4 bytes",
         );
         assert_invalid_system_transaction(
-            system_transaction(syscallSnapshotCall {}.abi_encode(), U256::from(1)),
+            system_transaction(syscallSnapshotCall {}.abi_encode(), U256::ONE),
             "snapshot value must be zero",
         );
 
@@ -792,7 +972,7 @@ mod tests {
             "invalid Monad protocol system epoch calldata",
         );
         assert_invalid_system_transaction(
-            system_transaction(syscallOnEpochChangeCall { epoch: 9 }.abi_encode(), U256::from(1)),
+            system_transaction(syscallOnEpochChangeCall { epoch: 9 }.abi_encode(), U256::ONE),
             "epoch value must be zero",
         );
     }
@@ -811,7 +991,7 @@ mod tests {
 
     #[test]
     fn protocol_prestate_updates_nonce_and_balance() {
-        let caller = address!("00000000000000000000000000000000000000fe");
+        let caller = Address::with_last_byte(0xfe);
         let recipient = address!("0000000000000000000000000000000000001000");
         let mut db = InMemoryDB::default();
         db.insert_account_info(caller, AccountInfo { nonce: 7, ..Default::default() });
@@ -839,7 +1019,7 @@ mod tests {
 
     #[test]
     fn protocol_prestate_rejects_nonce_mismatch() {
-        let caller = address!("00000000000000000000000000000000000000fe");
+        let caller = Address::with_last_byte(0xfe);
         let mut db = InMemoryDB::default();
         db.insert_account_info(caller, AccountInfo { nonce: 3, ..Default::default() });
         let call = ProtocolSystemCall {
@@ -860,7 +1040,7 @@ mod tests {
 
     #[test]
     fn protocol_prestate_rejects_nonce_overflow() {
-        let caller = address!("00000000000000000000000000000000000000fe");
+        let caller = Address::with_last_byte(0xfe);
         let mut db = InMemoryDB::default();
         db.insert_account_info(caller, AccountInfo { nonce: u64::MAX, ..Default::default() });
         let call = ProtocolSystemCall {
@@ -881,8 +1061,8 @@ mod tests {
 
     #[test]
     fn reward_envelope_replays_mint_nonce_storage_and_log() {
-        let block_author = address!("1111111111111111111111111111111111111111");
-        let validator_auth = address!("2222222222222222222222222222222222222222");
+        let block_author = Address::repeat_byte(0x11);
+        let validator_auth = Address::repeat_byte(0x22);
         let validator_id = 7;
         let reward = U256::from(25) * MON;
         let initial_staking_balance = U256::from(3) * MON;
@@ -932,7 +1112,7 @@ mod tests {
         let mut evm =
             factory.create_evm_with_inspector(db, evm_env, ProtocolPrestateInspector::default());
 
-        let result = factory.try_transact_system_replay(&mut evm, &tx).unwrap().unwrap();
+        let result = try_transact_monad_system_replay(&mut evm, &tx).unwrap().unwrap();
 
         assert!(result.result.is_success());
         assert_eq!(result.result.tx_gas_used(), 0);
@@ -964,7 +1144,7 @@ mod tests {
 
     #[test]
     fn failed_reward_envelope_does_not_commit_prestate() {
-        let unknown_author = address!("1111111111111111111111111111111111111111");
+        let unknown_author = Address::repeat_byte(0x11);
         let reward = U256::from(25) * MON;
         let initial_staking_balance = U256::from(3) * MON;
         let mut db = InMemoryDB::default();
@@ -992,7 +1172,7 @@ mod tests {
         let chain_before = evm.ctx().chain.clone();
         let tracker_before = evm.ctx().journaled_state.reserve_balance().clone();
 
-        let error = factory.try_transact_system_replay(&mut evm, &tx).unwrap_err();
+        let error = try_transact_monad_system_replay(&mut evm, &tx).unwrap_err();
 
         assert!(error.to_string().contains("reverted or halted"));
         assert!(evm.inspector().call_count > 0);
@@ -1013,14 +1193,14 @@ mod tests {
 
     #[test]
     fn monad_context_tracks_senders_authorities_and_current_index() {
-        let grandparent_sender = Address::from([1; 20]);
-        let grandparent_authority = Address::from([2; 20]);
-        let parent_sender = Address::from([3; 20]);
-        let parent_authority = Address::from([4; 20]);
-        let current_sender = Address::from([5; 20]);
-        let current_authority = Address::from([6; 20]);
-        let next_sender = Address::from([7; 20]);
-        let next_authority = Address::from([8; 20]);
+        let grandparent_sender = Address::repeat_byte(1);
+        let grandparent_authority = Address::repeat_byte(2);
+        let parent_sender = Address::repeat_byte(3);
+        let parent_authority = Address::repeat_byte(4);
+        let current_sender = Address::repeat_byte(5);
+        let current_authority = Address::repeat_byte(6);
+        let next_sender = Address::repeat_byte(7);
+        let next_authority = Address::repeat_byte(8);
 
         let grandparent = [transaction(grandparent_sender, grandparent_authority)];
         let parent = [transaction(parent_sender, parent_authority)];
@@ -1051,12 +1231,12 @@ mod tests {
 
     #[test]
     fn child_context_advances_fork_ancestry() {
-        let parent_sender = Address::from([1; 20]);
-        let parent_authority = Address::from([2; 20]);
-        let current_sender = Address::from([3; 20]);
-        let current_authority = Address::from([4; 20]);
-        let child_sender = Address::from([5; 20]);
-        let child_authority = Address::from([6; 20]);
+        let parent_sender = Address::repeat_byte(1);
+        let parent_authority = Address::repeat_byte(2);
+        let current_sender = Address::repeat_byte(3);
+        let current_authority = Address::repeat_byte(4);
+        let child_sender = Address::repeat_byte(5);
+        let child_authority = Address::repeat_byte(6);
 
         let context = BlockContext::<MonadEvmNetwork>::new(
             Vec::new(),
@@ -1079,10 +1259,10 @@ mod tests {
 
     #[test]
     fn transaction_cursor_replaces_target_and_excludes_future_transactions() {
-        let preceding_sender = Address::from([1; 20]);
-        let target_sender = Address::from([2; 20]);
-        let future_sender = Address::from([3; 20]);
-        let synthetic_sender = Address::from([4; 20]);
+        let preceding_sender = Address::repeat_byte(1);
+        let target_sender = Address::repeat_byte(2);
+        let future_sender = Address::repeat_byte(3);
+        let synthetic_sender = Address::repeat_byte(4);
 
         let cursor = BlockContext::<MonadEvmNetwork>::new(
             Vec::new(),
@@ -1105,9 +1285,9 @@ mod tests {
 
     #[test]
     fn transaction_cursor_accumulates_same_block_transactions() {
-        let fork_sender = Address::from([1; 20]);
-        let first_sender = Address::from([2; 20]);
-        let second_sender = Address::from([3; 20]);
+        let fork_sender = Address::repeat_byte(1);
+        let first_sender = Address::repeat_byte(2);
+        let second_sender = Address::repeat_byte(3);
         let mut cursor = BlockContext::<MonadEvmNetwork>::new(
             Vec::new(),
             Vec::new(),
@@ -1125,10 +1305,10 @@ mod tests {
 
     #[test]
     fn transaction_cursor_rotates_separate_blocks() {
-        let fork_parent_sender = Address::from([1; 20]);
-        let fork_sender = Address::from([2; 20]);
-        let first_sender = Address::from([3; 20]);
-        let second_sender = Address::from([4; 20]);
+        let fork_parent_sender = Address::repeat_byte(1);
+        let fork_sender = Address::repeat_byte(2);
+        let first_sender = Address::repeat_byte(3);
+        let second_sender = Address::repeat_byte(4);
         let mut cursor = BlockContext::<MonadEvmNetwork>::new(
             Vec::new(),
             vec![transaction(fork_parent_sender, Address::ZERO)],

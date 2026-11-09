@@ -19,20 +19,19 @@ pub trait PrecompileFactory: Send + Sync + Unpin + Debug {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
 
     use crate::PrecompileFactory;
     use alloy_evm::{
         EthEvm, Evm,
         eth::EthEvmContext,
-        precompiles::{DynPrecompile, PrecompilesMap},
+        precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap},
     };
     use alloy_primitives::{Address, Bytes, TxKind, address};
     use itertools::Itertools;
     use revm::{
         Journal,
         context::{BlockEnv, CfgEnv, Evm as RevmEvm, JournalTr, LocalContext, TxEnv},
-        database::{EmptyDB, EmptyDBTyped},
+        database::EmptyDB,
         handler::{EthPrecompiles, instructions::EthInstructions},
         inspector::NoOpInspector,
         interpreter::interpreter::EthInterpreter,
@@ -41,21 +40,18 @@ mod tests {
     };
 
     // A precompile activated in the `Prague` spec (BLS12-381 G2 map).
-    pub(super) const ETH_PRAGUE_PRECOMPILE: Address =
-        address!("0x0000000000000000000000000000000000000011");
+    pub(super) const ETH_PRAGUE_PRECOMPILE: Address = Address::with_last_byte(0x11);
 
     // A precompile activated in the `Osaka` spec (EIP-7951).
     const ETH_OSAKA_PRECOMPILE: Address = address!("0x0000000000000000000000000000000000000100");
 
     // A custom precompile address and payload for testing.
-    pub(super) const PRECOMPILE_ADDR: Address =
-        address!("0x0000000000000000000000000000000000000071");
+    pub(super) const PRECOMPILE_ADDR: Address = Address::with_last_byte(0x71);
     const DYNAMIC_PRECOMPILE_ADDR: Address = address!("0xdead000000000000000000000000000000000071");
     const DYNAMIC_PRECOMPILE_PREFIX: [u8; 2] = [0xde, 0xad];
     pub(super) const PAYLOAD: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
 
     fn echo_precompile() -> DynPrecompile {
-        use alloy_evm::precompiles::PrecompileInput;
         DynPrecompile::from(|input: PrecompileInput<'_>| {
             Ok(PrecompileOutput {
                 status: PrecompileStatus::Success,
@@ -94,9 +90,7 @@ mod tests {
     }
 
     /// Creates a new Eth EVM instance.
-    fn create_eth_evm(
-        spec: SpecId,
-    ) -> (TxEnv, EthEvm<EmptyDBTyped<Infallible>, NoOpInspector, PrecompilesMap>) {
+    fn create_eth_evm(spec: SpecId) -> (TxEnv, EthEvm<EmptyDB, NoOpInspector, PrecompilesMap>) {
         let tx_env = TxEnv {
             kind: TxKind::Call(PRECOMPILE_ADDR),
             data: PAYLOAD.into(),
@@ -109,7 +103,7 @@ mod tests {
             cfg: CfgEnv::new_with_spec(spec),
             tx: tx_env.clone(),
             chain: (),
-            local: LocalContext::default(),
+            local: LocalContext::new(),
             error: Ok(()),
         };
 

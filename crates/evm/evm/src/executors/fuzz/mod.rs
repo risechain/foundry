@@ -5,16 +5,16 @@ use crate::executors::{
         CorpusSyncCoordinator, GlobalCorpusMetrics, ReplayTarget, StatelessReplayTarget,
         WorkerCorpus,
     },
-    should_ignore_revert,
+    should_ignore_revert, worker_seed,
 };
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
 use alloy_primitives::{
-    Address, Bytes, Log, U256, keccak256,
+    Address, Bytes, Log, U256,
     map::{AddressHashMap, HashMap},
 };
 use eyre::Result;
-use foundry_common::sh_println;
+use foundry_common::{sh_println, sh_warn};
 use foundry_config::FuzzConfig;
 use foundry_evm_core::{
     Breakpoints,
@@ -35,16 +35,22 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde_json::json;
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 mod frontier;
 mod types;
-use frontier::{FuzzBranchFrontier, FuzzBranchFrontierArtifact, FuzzFrontierRecorder};
+pub use frontier::FuzzBranchFrontier;
+use frontier::FuzzBranchFrontierArtifact;
+pub(super) use frontier::{
+    FuzzFrontierRecorder, StatefulFuzzBranchFrontierArtifact, comparison_result, merge_frontiers,
+    write_frontier_artifact,
+};
 pub use types::{CaseOutcome, CounterExampleOutcome, FuzzOutcome};
 
 /// Corpus syncs across workers every `SYNC_INTERVAL` runs.
@@ -71,6 +77,8 @@ struct WorkerState<FEN: FoundryEvmNetwork> {
     debug_bytecodes: AddressHashMap<Bytes>,
     /// Last breakpoints from this worker
     breakpoints: Option<Breakpoints>,
+    /// The input of the last collected trace and the run that generated it.
+    last_case: Option<(BasicTxDetails, Option<FuzzRunMetadata>)>,
     /// Coverage collected by this worker
     coverage: Option<HitMaps>,
     /// Logs from all cases this worker ran
@@ -105,6 +113,7 @@ impl<FEN: FoundryEvmNetwork> WorkerState<FEN> {
             traces: Vec::new(),
             debug_bytecodes: HashMap::default(),
             breakpoints: None,
+            last_case: None,
             coverage: None,
             logs: Vec::new(),
             cpu_snapshots: BTreeMap::new(),
@@ -134,6 +143,8 @@ struct SharedFuzzState {
     total_rejects: Arc<AtomicU32>,
     /// Fuzz timer
     timer: FuzzTestTimer,
+    /// Whether a worker stopped because the timer expired.
+    timed_out: AtomicBool,
     /// Global corpus metrics
     global_corpus_metrics: GlobalCorpusMetrics,
 
@@ -151,6 +162,7 @@ impl SharedFuzzState {
             failed_worker_id: OnceLock::new(),
             total_rejects: Arc::new(AtomicU32::new(0)),
             timer: FuzzTestTimer::new(timeout),
+            timed_out: AtomicBool::new(false),
             global_corpus_metrics: GlobalCorpusMetrics::default(),
             global_early_exit: early_exit,
             local_early_exit: EarlyExit::new(true),
@@ -169,9 +181,22 @@ impl SharedFuzzState {
 
     /// Returns `true` if the worker should continue running.
     fn should_continue(&self) -> bool {
-        !(self.global_early_exit.should_stop()
-            || self.local_early_exit.should_stop()
-            || self.timer.is_timed_out())
+        if self.global_early_exit.should_stop() || self.local_early_exit.should_stop() {
+            return false;
+        }
+        if self.timer.is_timed_out() {
+            self.timed_out.store(true, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Returns `true` if fail-fast or Ctrl-C stopped the campaign before its timeout or
+    /// `planned_runs`.
+    fn interrupted(&self, planned_runs: u32) -> bool {
+        self.global_early_exit.should_stop()
+            && !self.timed_out.load(Ordering::Relaxed)
+            && self.total_runs.load(Ordering::Relaxed) < planned_runs
     }
 
     /// Returns true if the worker was able to claim the failure, false if failure was set by
@@ -203,6 +228,8 @@ pub struct FuzzedExecutor<FEN: FoundryEvmNetwork> {
     config: FuzzConfig,
     /// The persisted counterexample to be replayed, if any.
     persisted_failure: Option<BaseCounterExample>,
+    /// An existing corpus to replay before persisting into the configured corpus directory.
+    corpus_replay_dir: Option<PathBuf>,
     /// The number of parallel workers.
     num_workers: usize,
 }
@@ -215,6 +242,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         sender: Address,
         config: FuzzConfig,
         persisted_failure: Option<BaseCounterExample>,
+        corpus_replay_dir: Option<PathBuf>,
     ) -> Self {
         let run_limit = if config.run.is_some() { 1 } else { config.runs };
         let max_workers = if run_limit == 0 {
@@ -225,12 +253,18 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             Ord::max(1, run_limit / MIN_RUNS_PER_WORKER)
         };
         let num_workers = Ord::min(rayon::current_num_threads(), max_workers as usize);
-        Self { executor_f: executor, runner, sender, config, persisted_failure, num_workers }
+        Self {
+            executor_f: executor,
+            runner,
+            sender,
+            config,
+            persisted_failure,
+            corpus_replay_dir,
+            num_workers,
+        }
     }
 
     /// Fuzzes the provided function, assuming it is available at the contract at `address`
-    /// If `should_fail` is set to `true`, then it will stop only when there's a success
-    /// test case.
     ///
     /// Returns a list of all the consumed gas and calldata of every fuzz case.
     #[allow(clippy::too_many_arguments)]
@@ -246,6 +280,9 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         tokio_handle: &tokio::runtime::Handle,
     ) -> Result<FuzzTestResult> {
         let shared_state = SharedFuzzState::new(state, self.config.timeout, early_exit.clone());
+        // Every run would append its steps to the shared step table, so the campaign runs without
+        // the debug recorder and the shown case runs again with it.
+        let recorder = self.executor_f.inspector_mut().debug_recorder.take();
 
         let worker_ids = self.worker_ids();
         debug!(n = worker_ids.len(), "spawning workers");
@@ -275,9 +312,62 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 debug!("finished in {:?}", timer.elapsed());
                 r
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>();
+        self.executor_f.inspector_mut().debug_recorder = recorder;
 
-        Ok(self.aggregate_results(workers, func, &shared_state))
+        let (mut result, shown_case) = self.aggregate_results(workers?, func, &shared_state);
+        if self.executor_f.inspector().debug_recorder.is_some()
+            && let Some(case) = shown_case
+        {
+            self.record_case(&mut result, address, case)?;
+        }
+        Ok(result)
+    }
+
+    /// Runs `case` again and replaces the shown trace of `result` with the one it records, along
+    /// with its bytecodes and breakpoints.
+    fn record_case(
+        &mut self,
+        result: &mut FuzzTestResult,
+        address: Address,
+        (mut tx, run): (BasicTxDetails, Option<FuzzRunMetadata>),
+    ) -> Result<()> {
+        if let Some(cheats) = self.executor_f.inspector_mut().cheatcodes.as_mut()
+            && let Some(run) = run
+            && let Some(seed) = run.seed.or(self.config.seed)
+        {
+            let worker = run.worker.unwrap_or(0) as usize;
+            cheats.core.set_seed(Self::fuzz_run_seed(seed, worker, run.run.unwrap_or(1)));
+        }
+        tx.sender = self.sender;
+        tx.call_details.target = address;
+        tx.warp = None;
+        tx.roll = None;
+        self.resolve_stateless_tx_with_executor(&self.executor_f, &mut tx)?;
+        let mut call = self.executor_f.call_raw(
+            tx.sender,
+            tx.call_details.target,
+            tx.call_details.calldata,
+            tx.call_details.value.unwrap_or_default(),
+        )?;
+        // State outside the EVM, such as files or environment variables, can change the outcome.
+        let success = should_ignore_revert(
+            self.config.fail_on_revert,
+            address,
+            call.reverter,
+            self.executor_f.inspector().extra_cheatcode_addresses(),
+        ) || self.executor_f.is_raw_call_mut_success(address, &mut call);
+        if success != result.success {
+            let _ = sh_warn!(
+                "the debugged fuzz case {} when run again, unlike in the campaign, so the debugger \
+                 may show a different path",
+                if success { "passed" } else { "failed" }
+            );
+        }
+        result.traces = call.traces;
+        result.debug_bytecodes = call.debug_bytecodes;
+        result.breakpoints = call.cheatcodes.map(|cheats| cheats.breakpoints.clone());
+        Ok(())
     }
 
     /// Replays the persisted single-call counterexample exactly once.
@@ -304,7 +394,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         {
             let run = failure.fuzz.run.unwrap_or(1);
             let worker = failure.fuzz.worker.unwrap_or(0) as usize;
-            cheats.set_seed(Self::fuzz_run_seed(seed, worker, run));
+            cheats.core.set_seed(Self::fuzz_run_seed(seed, worker, run));
         }
 
         let mut tx = BasicTxDetails {
@@ -347,8 +437,8 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             self.config.fail_on_revert,
             address,
             call.reverter,
-            self.executor_f.inspector().networks.extra_cheatcode_addresses(),
-        ) || self.executor_f.is_raw_call_mut_success(address, &mut call, false);
+            self.executor_f.inspector().extra_cheatcode_addresses(),
+        ) || self.executor_f.is_raw_call_mut_success(address, &mut call);
 
         let mut result = FuzzTestResult {
             success,
@@ -414,7 +504,6 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         let campaign = FuzzCampaign::new(FuzzCampaignMode::Stateless);
         let mut state = (executor, tx);
         let mut cmp_values = Vec::new();
-        let mut new_coverage = false;
         let mut checked = None;
         campaign
             .run_sequence(
@@ -427,7 +516,6 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                     match event {
                         CampaignEvent::Feedback(call) => {
                             cmp_values = call.evm_cmp_values.take().unwrap_or_default();
-                            new_coverage = coverage_metrics.merge_edge_coverage(call);
                         }
                         CampaignEvent::Check { result, kind, .. } => {
                             checked = Some((
@@ -447,21 +535,36 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             .map_err(|e| TestCaseError::fail(e.to_string()))?;
         let (mut call, kind) = checked.expect("depth-one campaign emits a check event");
         let tx = state.1.clone();
-        // `new_coverage` is only meaningful when edge coverage is collected; otherwise
-        // `merge_edge_coverage` always returns `false`, so record it as unknown for frontiers.
-        let frontier_new_coverage =
-            self.config.corpus.collect_edge_coverage().then_some(new_coverage);
-        frontier_recorder.capture_stateless_call(fuzz_run, &tx, &cmp_values, frontier_new_coverage);
-        coverage_metrics.process_inputs(
-            std::slice::from_ref(&tx),
-            &[cmp_values],
-            new_coverage,
-            None,
-        );
 
-        // Handle `vm.assume`.
+        // Handle `vm.assume` before recording coverage or persisting the input.
         if kind == CampaignCallKind::AssumptionRejected {
+            // Account for the attempted corpus mutation without retaining or crediting the input.
+            coverage_metrics.process_inputs(&[], &[], false, None);
             return Err(TestCaseError::reject(FuzzError::AssumeReject));
+        }
+
+        if call.skip_reason().is_some() {
+            // Account for the attempted corpus mutation without retaining or crediting the input.
+            coverage_metrics.process_inputs(&[], &[], false, None);
+        } else {
+            let new_coverage = coverage_metrics.merge_edge_coverage(&mut call);
+            // `new_coverage` is only meaningful when edge coverage is collected; otherwise
+            // `merge_edge_coverage` always returns `false`, so record it as unknown for frontiers.
+            let frontier_new_coverage =
+                self.config.corpus.collect_edge_coverage().then_some(new_coverage);
+            frontier_recorder.capture_call(
+                fuzz_run,
+                std::slice::from_ref(&tx),
+                0,
+                &cmp_values,
+                frontier_new_coverage,
+            );
+            coverage_metrics.process_inputs(
+                std::slice::from_ref(&tx),
+                &[cmp_values],
+                new_coverage,
+                None,
+            );
         }
 
         let (breakpoints, deprecated_cheatcodes, cpu_snapshots) =
@@ -479,8 +582,8 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             self.config.fail_on_revert,
             address,
             call.reverter,
-            state.0.inspector().networks.extra_cheatcode_addresses(),
-        ) || state.0.is_raw_call_mut_success(address, &mut call, false);
+            state.0.inspector().extra_cheatcode_addresses(),
+        ) || state.0.is_raw_call_mut_success(address, &mut call);
 
         if success {
             Ok(FuzzOutcome::Case(CaseOutcome {
@@ -517,19 +620,20 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         Ok(())
     }
 
-    /// Aggregates the results from all workers
+    /// Aggregates the results from all workers, and returns the input of the shown trace with the
+    /// run that generated it.
     fn aggregate_results(
         &self,
         mut workers: Vec<WorkerState<FEN>>,
         func: &Function,
         shared_state: &SharedFuzzState,
-    ) -> FuzzTestResult {
+    ) -> (FuzzTestResult, Option<(BasicTxDetails, Option<FuzzRunMetadata>)>) {
         self.write_branch_frontiers(&mut workers, func);
 
         let mut result = FuzzTestResult::default();
         if workers.is_empty() {
             result.success = true;
-            return result;
+            return (result, None);
         }
 
         // Find first case and last run worker. Set `failed_corpus_replays`.
@@ -554,6 +658,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         result.first_case = first_case_candidate.map(|(_, case)| case).unwrap_or_default();
         let (_, last_run_worker_idx) = last_run_worker.expect("at least one worker");
         let mut output_worker_idx = last_run_worker_idx;
+        let shown_case;
 
         if let Some(&failed_worker_id) = shared_state.failed_worker_id.get() {
             result.success = false;
@@ -563,6 +668,8 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             let failed_worker = &mut workers[failed_worker_idx];
 
             let counterexample = failed_worker.counterexample.take();
+            shown_case =
+                counterexample.as_ref().map(|(tx, _)| (tx.clone(), failed_worker.failure_run));
             if let Some((_, call)) = &counterexample {
                 result.labels.clone_from(&call.labels);
                 result.traces.clone_from(&call.traces);
@@ -603,9 +710,15 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         } else {
             let last_run_worker = &workers[last_run_worker_idx];
             result.success = true;
+            let planned_runs = if self.config.run.is_some() { 1 } else { self.config.runs };
+            if shared_state.interrupted(planned_runs) {
+                result.skipped = true;
+                result.reason = Some("interrupted".to_string());
+            }
             result.traces = last_run_worker.traces.last().cloned();
             result.debug_bytecodes.clone_from(&last_run_worker.debug_bytecodes);
             result.breakpoints = last_run_worker.breakpoints.clone();
+            shown_case = last_run_worker.last_case.clone();
         }
 
         if !self.config.show_logs {
@@ -643,7 +756,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             result.reason = reason.0;
         }
 
-        result
+        (result, shown_case)
     }
 
     fn write_branch_frontiers(&self, workers: &mut [WorkerState<FEN>], func: &Function) {
@@ -706,11 +819,13 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             stateless: Some(StatelessReplayTarget { function: func, address }),
             fuzzed_contracts: None,
             dynamic: None,
+            senders: None,
         };
         let mut corpus = WorkerCorpus::new(
             worker_id,
             self.config.corpus.clone(),
             generator,
+            self.corpus_replay_dir.as_deref(),
             // Master worker replays the persisted corpus using the executor
             (worker_id == 0).then_some(&self.executor_f),
             replay_target,
@@ -735,7 +850,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         runner_config.cases = worker_runs;
 
         let mut runner = if let Some(seed) = self.config.seed {
-            let worker_seed = Self::fuzz_worker_seed(seed, worker_id);
+            let worker_seed = worker_seed(seed, worker_id as u32);
             trace!(target: "forge::test", ?worker_seed, "deterministic seed for worker {worker_id}");
             let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &worker_seed.to_be_bytes::<32>());
             TestRunner::new_with_rng(runner_config, rng)
@@ -781,7 +896,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 {
                     let run = failure.fuzz.run.unwrap_or(1);
                     let worker = failure.fuzz.worker.unwrap_or(worker_id as u32) as usize;
-                    cheats.set_seed(Self::fuzz_run_seed(seed, worker, run));
+                    cheats.core.set_seed(Self::fuzz_run_seed(seed, worker, run));
                 }
 
                 (
@@ -823,7 +938,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 if let Some(cheats) = executor.inspector_mut().cheatcodes.as_mut()
                     && let Some(seed) = self.config.seed
                 {
-                    cheats.set_seed(Self::fuzz_run_seed(seed, worker_id, fuzz_run));
+                    cheats.core.set_seed(Self::fuzz_run_seed(seed, worker_id, fuzz_run));
                 }
 
                 let input = match corpus.new_sequence(&mut runner) {
@@ -865,6 +980,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             };
 
             worker.last_run_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+            let case_input = input.clone();
             match self.single_fuzz(
                 &mut executor,
                 address,
@@ -915,6 +1031,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                             worker.traces.push(call_traces);
                             worker.debug_bytecodes = case.debug_bytecodes;
                             worker.breakpoints = Some(case.breakpoints);
+                            worker.last_case = Some((case_input, fuzz_run));
                         }
 
                         // Always store logs from the last run in test_data.logs for display at
@@ -933,9 +1050,11 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                     }
                     FuzzOutcome::CounterExample(CounterExampleOutcome {
                         exit_reason: status,
-                        counterexample: outcome,
+                        counterexample: mut outcome,
                         ..
                     }) => {
+                        // Keep the lines the failing input ran, as a failing unit test does.
+                        HitMaps::merge_opt(&mut worker.coverage, outcome.1.line_coverage.take());
                         if !is_persisted_replay {
                             inc_runs();
                         }
@@ -1025,20 +1144,9 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         }
     }
 
-    /// Derives the deterministic RNG seed for a fuzz worker.
-    fn fuzz_worker_seed(seed: U256, worker_id: usize) -> U256 {
-        if worker_id == 0 {
-            seed
-        } else {
-            let worker_id = worker_id as u32;
-            let seed_data = [&seed.to_be_bytes::<32>()[..], &worker_id.to_be_bytes()[..]].concat();
-            U256::from_be_bytes(keccak256(seed_data).0)
-        }
-    }
-
     /// Derives the deterministic RNG seed for cheatcode randomness in a worker-local run.
     fn fuzz_run_seed(seed: U256, worker_id: usize, run: u32) -> U256 {
-        Self::fuzz_worker_seed(seed, worker_id).wrapping_add(U256::from(run.saturating_sub(1)))
+        worker_seed(seed, worker_id as u32).wrapping_add(U256::from(run.saturating_sub(1)))
     }
 }
 

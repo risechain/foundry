@@ -1,9 +1,9 @@
 use super::*;
 
 impl SymbolicExecutor {
-    pub(super) fn create<FEN: FoundryEvmNetwork>(
+    pub(super) fn create(
         &mut self,
-        executor: &Executor<FEN>,
+        executor: &ExecutorView<'_>,
         state: &mut PathState,
         worklist: &mut VecDeque<PathState>,
         completed_paths: &mut usize,
@@ -11,7 +11,13 @@ impl SymbolicExecutor {
     ) -> Result<StepOutcome, SymbolicError> {
         if state.is_static {
             state.return_data = SymReturnData::empty(&mut self.cx);
-            return Ok(StepOutcome::Revert);
+            return Ok(StepOutcome::ExceptionalHalt);
+        }
+
+        let offset = state.stack.peek(1)?.clone();
+        let size = state.stack.peek(2)?.clone();
+        if let Some(outcome) = self.guard_memory_range(executor, state, worklist, &offset, &size)? {
+            return Ok(outcome);
         }
 
         let value = state.stack.pop()?;
@@ -21,28 +27,37 @@ impl SymbolicExecutor {
             Some(Ok(size)) => BoundedCopySize::Concrete(size),
             Some(Err(_)) => {
                 state.return_data = SymReturnData::empty(&mut self.cx);
-                state.stack.push(SymExpr::zero(&mut self.cx))?;
-                return Ok(StepOutcome::Continue);
+                return Ok(StepOutcome::Revert);
             }
             None => {
                 let max_limit = self.config.max_calldata_bytes as usize;
-                let max_size = state
-                    .upper_bound_usize(&mut self.cx, &size)
-                    .filter(|size| *size <= max_limit)
-                    .map(Ok)
-                    .unwrap_or_else(|| {
-                        self.solver_upper_bound_usize(
-                            state,
-                            &size,
-                            max_limit,
-                            "symbolic CREATE initcode size",
-                        )
-                    })?;
+                let max_size = self.solver_upper_bound_usize(
+                    state,
+                    &size,
+                    max_limit,
+                    "symbolic CREATE initcode size",
+                )?;
                 BoundedCopySize::Symbolic { size, max_size }
             }
         };
         let salt =
             if matches!(kind, CreateKind::Create2) { Some(state.stack.pop()?) } else { None };
+
+        size.expand_memory(&mut self.cx, &mut state.memory, offset.clone());
+
+        // A create beyond the call depth limit fails before it increments the creator's
+        // nonce or transfers value. Concrete Forge settles a pending revert cheatcode against
+        // such a create differently from a joined create outcome, depending on its config.
+        if state.at_call_depth_limit() {
+            if state.expected_revert.is_some() || state.assume_no_revert_next_call.is_some() {
+                return Err(SymbolicError::Unsupported(
+                    "revert cheatcode on a CREATE beyond the call depth limit",
+                ));
+            }
+            state.return_data = SymReturnData::empty(&mut self.cx);
+            state.stack.push(SymExpr::zero(&mut self.cx))?;
+            return Ok(StepOutcome::Continue);
+        }
 
         let initcode = match &size {
             BoundedCopySize::Concrete(size) => {
@@ -85,8 +100,7 @@ impl SymbolicExecutor {
 
         if failure_world.has_code_or_nonce(&mut self.cx, executor, created)? {
             state.world = failure_world;
-            state.return_data = SymReturnData::empty(&mut self.cx);
-            state.stack.push(SymExpr::zero(&mut self.cx))?;
+            self.fail_create_before_frame(executor, state)?;
             return Ok(StepOutcome::Continue);
         }
 
@@ -103,14 +117,19 @@ impl SymbolicExecutor {
         );
         frame.address_word = created_word.clone();
         frame.caller_word = state.address_word.clone();
+        // Isolation runs a CREATE, but not a CREATE2, as its own transaction.
+        let isolated =
+            matches!(kind, CreateKind::Create) && state.starts_isolated_transaction(executor);
         let mut child = state.child(frame);
-        let pending_expected_creates = std::mem::take(&mut child.expected_creates);
         child.world = failure_world.clone();
+        if isolated {
+            child.world.clear_transient_storage();
+            child.call_depth_base = child.call_depth;
+        }
         child.world.mark_current_transaction_created(created);
+        child.persistent_writes.push(PersistentWrite::Created(created));
         child.world.set_nonce(created, 1);
         child.world.transfer(&mut self.cx, executor, state.address, created, value);
-        child.expected_revert = None;
-        child.assume_no_revert_next_call = None;
 
         let outcomes = self.execute_external_call(executor, child, &initcode, completed_paths)?;
         if outcomes.is_empty() {
@@ -119,214 +138,166 @@ impl SymbolicExecutor {
 
         let mut parents = VecDeque::with_capacity(outcomes.len());
         for mut outcome in outcomes {
-            let mut parent = state.clone();
-            parent.take_call_outcome_state(&mut outcome.state);
-            parent.return_data = SymReturnData::empty(&mut self.cx);
-
-            if let Some(assumption) = parent.assume_no_revert_next_call.take()
-                && matches!(outcome.status, CallStatus::Revert)
-                && self.assume_no_revert_rejects(
-                    &mut parent,
-                    &assumption,
-                    created,
-                    &outcome.state.frame.return_data,
-                )?
+            // Forge records a CREATE as the reverter only when it reverts, not when it halts, such
+            // as on the runtime code checks below.
+            let failed_callee = matches!(outcome.status, CallStatus::Revert).then_some(created);
+            let runtime = &outcome.state.frame.return_data;
+            let spec_id = executor.spec_id;
+            let mut rejected_runtime = false;
+            if matches!(outcome.status, CallStatus::Success) {
+                if runtime_exceeds_code_size_limit(executor.max_code_size, spec_id, runtime) {
+                    outcome.status = CallStatus::Revert;
+                    outcome.state.frame.return_data = SymReturnData::empty(&mut self.cx);
+                } else if runtime_has_rejected_prefix(&mut self.cx, spec_id, runtime)? {
+                    outcome.status = CallStatus::Revert;
+                    rejected_runtime = true;
+                }
+            }
+            if !matches!(outcome.status, CallStatus::Success)
+                && state.expected_revert.as_ref().is_some_and(ExpectedRevert::repeats_with_reverter)
             {
-                continue;
+                return Err(SymbolicError::Unsupported(
+                    "symbolic vm.expectRevert reverter count on CREATE",
+                ));
             }
-
-            if let Some(mut expected) = parent.expected_revert.clone() {
-                match outcome.status {
-                    CallStatus::Success => {
-                        *state = parent;
-                        return Ok(StepOutcome::Failure);
-                    }
-                    CallStatus::Revert | CallStatus::Failure => {
-                        if !self.expected_revert_matches(
-                            &mut parent,
-                            &expected,
-                            created,
-                            &outcome.state.frame.return_data,
-                        )? {
-                            *state = parent;
-                            return Ok(StepOutcome::Failure);
-                        }
-                        if expected.consume_one() {
-                            parent.expected_revert = None;
-                        } else {
-                            parent.expected_revert = Some(expected);
-                        }
-                        parent.expected_calls = outcome.state.expected_calls;
-                        parent.expected_creates = pending_expected_creates.clone();
-                        parent.call_mocks = outcome.state.call_mocks;
-                        parent.function_mocks = outcome.state.function_mocks;
-                        parent.world = failure_world.clone();
-                        parent.stack.push(created_word.clone())?;
-                        parents.push_back(parent);
-                        continue;
-                    }
-                }
-            }
-
-            match outcome.status {
-                CallStatus::Success => {
-                    parent.world = outcome.state.world;
-                    parent.block = outcome.state.block;
-                    parent.expected_emit = outcome.state.expected_emit;
-                    parent.expected_calls = outcome.state.expected_calls;
-                    parent.expected_creates = pending_expected_creates.clone();
-                    parent.call_mocks = outcome.state.call_mocks;
-                    parent.function_mocks = outcome.state.function_mocks;
-                    self.observe_expected_create(
-                        &mut parent,
-                        state.address,
-                        kind,
-                        &outcome.state.frame.return_data,
-                    )?;
-                    if !parent.world.is_destroyed(created) {
-                        parent.world.install_code(
-                            created,
-                            outcome.state.frame.return_data.to_code(&mut self.cx)?,
-                        );
-                        parent.world.set_nonce(created, 1);
-                    }
-                    parent.stack.push(created_word.clone())?;
-                }
-                CallStatus::Revert => {
-                    parent.world = failure_world.clone();
-                    parent.return_data = outcome.state.frame.return_data;
-                    parent.stack.push(SymExpr::zero(&mut self.cx))?;
-                }
-                CallStatus::Failure => {
+            // Like Forge's `create_end`, a CREATE leaves `vm.assumeNoRevert` for the next call.
+            match self.join_call_outcome(
+                executor,
+                state,
+                &failure_world,
+                outcome,
+                failed_callee,
+                None,
+            )? {
+                JoinedCallOutcome::Failure(mut parent) => {
+                    parent.return_data = SymReturnData::empty(&mut self.cx);
                     *state = parent;
                     return Ok(StepOutcome::Failure);
                 }
+                JoinedCallOutcome::ExceptionalHalt(mut parent) => {
+                    parent.return_data = SymReturnData::empty(&mut self.cx);
+                    parent.stack.push(SymExpr::zero(&mut self.cx))?;
+                    parents.push_back(parent);
+                }
+                JoinedCallOutcome::ExpectedRevert(mut parent) => {
+                    parent.return_data = SymReturnData::empty(&mut self.cx);
+                    let address = address_word(DUMMY_CREATE_ADDRESS);
+                    parent.stack.push(SymExpr::constant(&mut self.cx, address))?;
+                    parents.push_back(parent);
+                }
+                JoinedCallOutcome::Success { mut parent, child, unmet_expected_revert } => {
+                    parent.return_data = SymReturnData::empty(&mut self.cx);
+                    let runtime = &child.frame.return_data;
+                    parent.world = child.world;
+                    if isolated {
+                        parent.world.restore_transient_storage(&failure_world);
+                    }
+                    parent.expected_emit = child.expected_emit;
+                    // Under an unmet `vm.expectRevert`, the caller sees a failed CREATE, but the
+                    // code stays deployed and `expectCreate` does not count it.
+                    if !unmet_expected_revert {
+                        self.observe_expected_create(&mut parent, state.address, kind, runtime)?;
+                    }
+                    if !parent.world.is_destroyed(created) {
+                        parent.world.install_code(created, runtime.to_code(&mut self.cx)?);
+                        parent.world.set_nonce(created, 1);
+                    }
+                    if unmet_expected_revert {
+                        parent.return_data = error_string_return_data(
+                            &mut self.cx,
+                            "next call did not revert as expected",
+                        );
+                        parent.stack.push(SymExpr::zero(&mut self.cx))?;
+                    } else {
+                        parent.stack.push(created_word.clone())?;
+                    }
+                    parents.push_back(parent);
+                }
+                JoinedCallOutcome::Revert { mut parent, child } => {
+                    parent.return_data = SymReturnData::empty(&mut self.cx);
+                    if !rejected_runtime {
+                        parent.return_data = child.frame.return_data;
+                    }
+                    parent.stack.push(SymExpr::zero(&mut self.cx))?;
+                    parents.push_back(parent);
+                }
             }
-
-            parents.push_back(parent);
         }
 
-        let Some(first) = self.pop_next_path(&mut parents) else {
-            return Ok(StepOutcome::AssumeRejected);
-        };
-        *state = first;
-        worklist.extend(parents);
-        Ok(StepOutcome::Continue)
+        Ok(self.resume_parent_paths(state, worklist, parents))
     }
 
-    pub(super) fn execute_external_call<FEN: FoundryEvmNetwork>(
+    pub(super) fn execute_external_call(
         &mut self,
-        executor: &Executor<FEN>,
+        executor: &ExecutorView<'_>,
         initial: PathState,
         code: &SymCode,
         completed_paths: &mut usize,
     ) -> Result<Vec<CallOutcome>, SymbolicError> {
-        let mut worklist = VecDeque::from([initial]);
-        let mut outcomes = Vec::new();
-        let path_limit = self.config.path_width() as usize;
-        let depth_limit = self.config.execution_depth() as usize;
-
-        while let Some(mut state) = self.pop_next_feasible_path(&mut worklist)? {
-            if *completed_paths >= path_limit {
-                return Err(SymbolicError::Unsupported("symbolic path limit exceeded"));
-            }
-            if std::mem::take(&mut state.pending_storage_hook_revert) {
-                *completed_paths += 1;
-                outcomes.push(CallOutcome { status: CallStatus::Revert, state });
-                continue;
-            }
-
-            loop {
-                self.check_timeout()?;
-                if state.depth >= depth_limit {
-                    return Err(SymbolicError::Unsupported("symbolic depth limit exceeded"));
-                }
-                state.depth += 1;
-
-                let op = match code.guarded_opcode(&mut self.cx, state.pc)? {
-                    GuardedOpcode::End => {
-                        *completed_paths += 1;
-                        outcomes.push(CallOutcome {
-                            status: if state.storage_hook_active || state.expectations_satisfied() {
-                                CallStatus::Success
-                            } else {
-                                CallStatus::Failure
-                            },
-                            state,
-                        });
-                        break;
-                    }
-                    GuardedOpcode::Concrete(op) => op,
-                    GuardedOpcode::SymbolicSize { condition, opcode } => {
-                        let mut in_bounds_constraints = state.constraints.clone();
-                        in_bounds_constraints.push(condition.clone());
-                        let in_bounds_sat =
-                            self.is_sat_with_state(&state, &in_bounds_constraints)?;
-
-                        let mut out_of_bounds_constraints = state.constraints.clone();
-                        out_of_bounds_constraints.push(condition.not(&mut self.cx));
-                        if self.is_sat_with_state(&state, &out_of_bounds_constraints)? {
-                            let mut halted = state.clone();
-                            halted.constraints = out_of_bounds_constraints;
-                            *completed_paths += 1;
-                            outcomes.push(CallOutcome {
-                                status: if halted.storage_hook_active
-                                    || halted.expectations_satisfied()
-                                {
-                                    CallStatus::Success
-                                } else {
-                                    CallStatus::Failure
-                                },
-                                state: halted,
-                            });
-                        }
-
-                        if in_bounds_sat {
-                            state.constraints = in_bounds_constraints;
-                            opcode
-                        } else {
-                            break;
-                        }
-                    }
-                };
-
-                match self.step(
-                    executor,
-                    code,
-                    code.jump_table(),
-                    &mut state,
-                    &mut worklist,
-                    completed_paths,
-                    op,
-                )? {
-                    StepOutcome::Continue => {}
-                    StepOutcome::Halt => {
-                        *completed_paths += 1;
-                        outcomes.push(CallOutcome {
-                            status: if state.storage_hook_active || state.expectations_satisfied() {
-                                CallStatus::Success
-                            } else {
-                                CallStatus::Failure
-                            },
-                            state,
-                        });
-                        break;
-                    }
-                    StepOutcome::Revert => {
-                        *completed_paths += 1;
-                        outcomes.push(CallOutcome { status: CallStatus::Revert, state });
-                        break;
-                    }
-                    StepOutcome::Failure => {
-                        *completed_paths += 1;
-                        outcomes.push(CallOutcome { status: CallStatus::Failure, state });
-                        break;
-                    }
-                    StepOutcome::AssumeRejected | StepOutcome::Forked => break,
-                }
-            }
-        }
-
-        Ok(outcomes)
+        // Each nested frame recurses on the native stack, so grow it on demand.
+        stacker::maybe_grow(CALL_FRAME_STACK_RED_ZONE, CALL_FRAME_STACK_GROWTH, || {
+            let mut worklist = VecDeque::from([initial]);
+            let mut deferred_worklist = VecDeque::new();
+            self.execute_call_path_batch(
+                executor,
+                code,
+                &mut worklist,
+                &mut deferred_worklist,
+                completed_paths,
+                CallPathKind::External,
+            )
+        })
     }
+
+    /// Fails a CREATE before its frame runs, such as on an insufficient balance or an address
+    /// collision. Like Forge's `create_end`, a pending `vm.expectRevert` is consumed with a depth
+    /// error, because nothing ran below the cheatcode. Reports `Unsupported` where Forge would
+    /// instead match the failure like a revert.
+    pub(super) fn fail_create_before_frame(
+        &mut self,
+        executor: &ExecutorView<'_>,
+        state: &mut PathState,
+    ) -> Result<(), SymbolicError> {
+        state.return_data = match state.expected_revert.take() {
+            None => SymReturnData::empty(&mut self.cx),
+            // Here Forge's depth check is skipped or already passed, so it matches the failure
+            // like a revert.
+            Some(expected) if executor.internal_expect_revert || expected.matched_any() => {
+                return Err(SymbolicError::Unsupported(
+                    "symbolic vm.expectRevert on CREATE that fails before running",
+                ));
+            }
+            Some(_) => error_string_return_data(
+                &mut self.cx,
+                "call didn't revert at a lower depth than cheatcode call depth",
+            ),
+        };
+        state.stack.push(SymExpr::zero(&mut self.cx))?;
+        Ok(())
+    }
+}
+
+fn runtime_exceeds_code_size_limit(
+    max_code_size: usize,
+    spec_id: SpecId,
+    runtime: &SymReturnData,
+) -> bool {
+    spec_id >= SpecId::SPURIOUS_DRAGON
+        && runtime.len_word.as_const().is_some()
+        && runtime.len() > max_code_size
+}
+
+fn runtime_has_rejected_prefix(
+    cx: &mut SymCx,
+    spec_id: SpecId,
+    runtime: &SymReturnData,
+) -> Result<bool, SymbolicError> {
+    if spec_id < SpecId::LONDON || runtime.len() == 0 {
+        return Ok(false);
+    }
+    let first_byte = runtime.byte(cx, 0);
+    let Some(first_byte) = first_byte.as_const() else {
+        return Err(SymbolicError::Unsupported("CREATE with symbolic runtime prefix not modeled"));
+    };
+    Ok(first_byte == U256::from(0xef))
 }

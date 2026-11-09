@@ -22,7 +22,7 @@ use solar::{
     sema::{Compiler, Gcx, Source},
 };
 
-use std::{path::Path, sync::Arc};
+use std::{fmt::Write, path::Path, sync::Arc};
 
 pub use foundry_config::fmt::*;
 
@@ -174,7 +174,6 @@ fn format_inner(
 }
 
 fn diff(first: &str, second: &str) -> impl std::fmt::Display {
-    use std::fmt::Write;
     let diff = similar::TextDiff::from_lines(first, second);
     let mut s = String::new();
     for change in diff.iter_all_changes() {
@@ -236,13 +235,7 @@ pub fn format_ast<'ast>(
     let ast = source.ast.as_ref()?;
     let inline_config = parse_inline_config(gcx.sess, &comments, ast);
 
-    let mut state = state::State::new(
-        gcx.sess.source_map(),
-        source.file.start_pos,
-        config,
-        inline_config,
-        comments,
-    );
+    let mut state = state::State::new(&source.file, config, inline_config, comments);
     state.print_source_unit(ast);
     Some(state.s.eof())
 }

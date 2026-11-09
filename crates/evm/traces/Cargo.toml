@@ -22,6 +22,7 @@ foundry-config.workspace = true
 foundry-evm-core.workspace = true
 foundry-evm-hardforks.workspace = true
 foundry-evm-networks.workspace = true
+foundry-cheatcodes-spec.workspace = true
 
 alloy-dyn-abi = { workspace = true, features = ["arbitrary", "eip712"] }
 alloy-json-abi.workspace = true
@@ -37,9 +38,11 @@ revm-inspectors.workspace = true
 tempo-contracts.workspace = true
 tempo-precompiles.workspace = true
 monad-revm = { workspace = true, optional = true }
+base-common-precompiles = { workspace = true, optional = true, features = ["std"] }
 
 async-trait.workspace = true
 anstyle.workspace = true
+ciborium.workspace = true
 colorchoice = "1.0"
 cpu-time.workspace = true
 eyre.workspace = true
@@ -52,6 +55,7 @@ revm.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 serde.workspace = true
 solar.workspace = true
+soldb-core.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["time", "macros"] }
 tracing.workspace = true
@@ -60,7 +64,6 @@ yansi.workspace = true
 [dev-dependencies]
 ron.workspace = true
 snapbox.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = ["optimism"]
@@ -69,6 +72,13 @@ monad = [
     "foundry-evm-core/monad",
     "foundry-evm-hardforks/monad",
     "foundry-evm-networks/monad",
+]
+base = [
+    "dep:base-common-precompiles",
+    "foundry-common/base",
+    "foundry-evm-core/base",
+    "foundry-evm-hardforks/base",
+    "foundry-evm-networks/base",
 ]
 optimism = [
     "foundry-common/optimism",

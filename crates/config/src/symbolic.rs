@@ -40,7 +40,16 @@ pub struct SymbolicConfig {
     pub corpus_seed_limit: usize,
     /// Whether fuzz branch frontiers should guide targeted symbolic fuzz-test seeding.
     pub use_fuzz_frontiers: bool,
-    /// Maximum number of fuzz branch frontiers to try for one symbolic run.
+    /// Whether invariant frontier seeding should first search for a property-breaking call.
+    #[serde(default)]
+    pub check_invariant_frontiers: bool,
+    /// Whether one bounded symbolic worker assists a running invariant campaign.
+    ///
+    /// Off by default. Uses `timeout`, `max_solver_queries`, and `frontier_limit` as
+    /// campaign-wide budgets. Candidates must pass normal concrete campaign execution.
+    #[serde(default)]
+    pub live: bool,
+    /// Maximum imported frontiers per symbolic run or submitted live frontiers per campaign.
     pub frontier_limit: usize,
     /// Fuzz branch frontier artifact IDs to import. Empty imports by artifact order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -59,8 +68,8 @@ pub struct SymbolicConfig {
     /// Solver names or exact commands to race in parallel. Ignored when `solver_command` is set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub solver_portfolio: Vec<String>,
-    /// Optional SMT solver timeout in seconds. Also bounds wall-clock symbolic invariant
-    /// exploration before falling back to invariant fuzzing.
+    /// Optional SMT solver timeout in seconds. Also bounds the stateless deferred hard-arithmetic
+    /// solver phase and wall-clock symbolic invariant exploration before falling back to fuzzing.
     pub timeout: Option<u32>,
     /// Halmos-compatible loop bound accepted by config and annotations.
     #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
@@ -115,6 +124,8 @@ impl Default for SymbolicConfig {
             use_fuzz_corpus: false,
             corpus_seed_limit: 32,
             use_fuzz_frontiers: false,
+            check_invariant_frontiers: false,
+            live: false,
             frontier_limit: 256,
             frontier_ids: Vec::new(),
             frontier_pcs: Vec::new(),
@@ -197,5 +208,6 @@ mod tests {
         let config: SymbolicConfig = serde_json::from_value(value).unwrap();
 
         assert_eq!(config.exploration_order, SymbolicExplorationOrder::Bfs);
+        assert!(!config.live);
     }
 }

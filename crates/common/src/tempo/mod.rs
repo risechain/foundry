@@ -3,21 +3,30 @@
 pub mod auth;
 
 use crate::FoundryTransactionBuilder;
-use alloy_chains::Chain;
-use alloy_network::{Network, NetworkTransactionBuilder, TransactionBuilder};
+use alloy_network::{Network, TransactionBuilder};
 use alloy_primitives::{Address, B256, Signature, TxKind, address};
 use alloy_provider::Provider;
 use alloy_signer::Signer;
 use alloy_sol_types::SolCall;
 use eyre::{Context, Result};
-use foundry_wallets::{RawWalletOpts, WalletOpts, WalletSigner};
+use foundry_wallets::{
+    RawWalletOpts, TempoWalletSpec, WalletOpts, WalletSigner, wallet_browser::signer::BrowserSigner,
+};
 use std::sync::Arc;
 pub use tempo_alloy::contracts::precompiles::PATH_USD_ADDRESS;
-use tempo_alloy::contracts::precompiles::{
-    IFeeManager, IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
+use tempo_alloy::{
+    TempoNetwork,
+    accounts::TempoAccountsWallet,
+    contracts::precompiles::{
+        IFeeManager, IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
+    },
 };
-use tempo_primitives::TempoAddressExt;
+use tempo_primitives::{
+    TempoAddressExt,
+    transaction::{KeyAuthorization, SignedKeyAuthorization},
+};
 
+mod hardfork;
 mod keystore;
 mod lane;
 mod session;
@@ -28,6 +37,9 @@ mod tip20;
 
 pub(crate) use auth::is_known_tempo_endpoint;
 pub use auth::{AccessKeyOutcome, EnsureAccessKeyConfig, ensure_access_key};
+pub use hardfork::{
+    active_tempo_hardfork, ensure_expiring_nonce_discriminator_active, is_tempo_hardfork_active,
+};
 pub use keystore::*;
 pub use lane::{PaymentLane, PaymentLaneClassification, PaymentLaneReason, classify_payment_lane};
 pub use session::*;
@@ -46,11 +58,6 @@ pub(crate) use test_utils::test_env_mutex;
 #[cfg(test)]
 mod tests;
 
-/// Placeholder rendered by `Debug` impls in place of secret key material.
-fn redacted_debug(value: &str) -> &'static str {
-    if value.trim().is_empty() { "<empty>" } else { "<redacted>" }
-}
-
 /// Reserved Tempo TIP20 fee-token addresses created during Foundry genesis.
 ///
 /// Unlike [`PATH_USD_ADDRESS`], these tokens are not defined by the canonical
@@ -59,218 +66,7 @@ fn redacted_debug(value: &str) -> &'static str {
 pub const ALPHA_USD_ADDRESS: Address = address!("0x20C0000000000000000000000000000000000001");
 pub const BETA_USD_ADDRESS: Address = address!("0x20C0000000000000000000000000000000000002");
 pub const THETA_USD_ADDRESS: Address = address!("0x20C0000000000000000000000000000000000003");
-
-/// Resolves and applies the Tempo fee token selected by the network.
-///
-/// This must happen before computing a sponsor digest, because Tempo sponsor signatures commit to
-/// the fee token.
-pub async fn resolve_and_set_fee_token<N>(
-    provider: Option<&dyn Provider<N>>,
-    chain: Option<Chain>,
-    tx: &mut N::TransactionRequest,
-    fee_payer: Option<Address>,
-) -> Result<Option<Address>>
-where
-    N: Network,
-    N::TransactionRequest: Default + FoundryTransactionBuilder<N>,
-{
-    if let Some(fee_token) = tx.fee_token() {
-        return Ok(Some(fee_token));
-    }
-    if !chain.is_some_and(Chain::is_tempo) {
-        return Ok(None);
-    }
-    let fee_payer = fee_payer.or_else(|| tx.from());
-    let calls = tx.tempo_calls();
-    let has_call_list = tx.has_tempo_call_list();
-    let is_aa = tx.is_tempo_aa();
-    let tx_from = tx.from();
-
-    // A stored fee-token preference would classify a contract creation as Tempo AA, but AA
-    // transactions require a non-empty call list. Leave CREATE requests as Ethereum transactions;
-    // the protocol still applies the account's stored fee-token preference when charging fees.
-    if !has_call_list && calls.iter().any(|(to, _)| matches!(to, TxKind::Create)) {
-        return Ok(None);
-    }
-
-    let immediate_user_token =
-        infer_fee_token_from_set_user_token_call(&calls, is_aa, tx_from, fee_payer);
-    let stored_fee_token = if immediate_user_token.is_none()
-        && let (Some(provider), Some(fee_payer)) = (provider, fee_payer)
-    {
-        stored_user_fee_token(provider, fee_payer).await?
-    } else {
-        None
-    };
-    let inferred_fee_token =
-        if immediate_user_token.is_none() && stored_fee_token.is_none() && !calls.is_empty() {
-            infer_fee_token_from_tip20_calls(&calls, tx_from, fee_payer)
-                .or_else(|| infer_fee_token_from_stablecoin_dex_calls(&calls, has_call_list))
-        } else {
-            None
-        };
-    let fee_token = immediate_user_token.or(stored_fee_token).or(inferred_fee_token);
-
-    let Some(fee_token) = fee_token else { return Ok(None) };
-    tx.set_fee_token(fee_token);
-    Ok(Some(fee_token))
-}
-
-async fn stored_user_fee_token<N>(
-    provider: &dyn Provider<N>,
-    fee_payer: Address,
-) -> Result<Option<Address>>
-where
-    N: Network,
-    N::TransactionRequest: Default + NetworkTransactionBuilder<N>,
-{
-    let call = IFeeManager::userTokensCall { user: fee_payer };
-    let tx = N::TransactionRequest::default()
-        .with_to(TIP_FEE_MANAGER_ADDRESS)
-        .with_input(call.abi_encode());
-    let output = provider
-        .call(tx)
-        .await
-        .wrap_err_with(|| format!("failed to resolve Tempo fee token for {fee_payer}"))?;
-    let fee_token = IFeeManager::userTokensCall::abi_decode_returns(&output)
-        .wrap_err("failed to decode Tempo fee token lookup")?;
-    Ok((!fee_token.is_zero()).then_some(fee_token))
-}
-
-fn infer_fee_token_from_tip20_calls(
-    calls: &[(TxKind, &[u8])],
-    tx_from: Option<Address>,
-    fee_payer: Option<Address>,
-) -> Option<Address> {
-    if calls.is_empty() || !calls.iter().all(|(_, input)| is_tip20_fee_token_call(input)) {
-        return None;
-    }
-
-    let target = common_call_target(calls)?;
-    if fee_payer != tx_from {
-        return None;
-    }
-    target.is_tip20().then_some(target)
-}
-
-fn infer_fee_token_from_set_user_token_call(
-    calls: &[(TxKind, &[u8])],
-    is_aa: bool,
-    tx_from: Option<Address>,
-    fee_payer: Option<Address>,
-) -> Option<Address> {
-    if is_aa || fee_payer != tx_from {
-        return None;
-    }
-
-    let (to, input) = calls.first()?;
-    if *to != TxKind::Call(TIP_FEE_MANAGER_ADDRESS) {
-        return None;
-    }
-
-    let call = IFeeManager::setUserTokenCall::abi_decode(input).ok()?;
-    call.token.is_tip20().then_some(call.token)
-}
-
-fn infer_fee_token_from_stablecoin_dex_calls(
-    calls: &[(TxKind, &[u8])],
-    has_call_list: bool,
-) -> Option<Address> {
-    if has_call_list && calls.len() != 1 {
-        return None;
-    }
-    let (to, input) = calls.first()?;
-    if *to != TxKind::Call(STABLECOIN_DEX_ADDRESS) {
-        return None;
-    }
-    decode_stablecoin_dex_fee_token(input)
-}
-
-fn common_call_target(calls: &[(TxKind, &[u8])]) -> Option<Address> {
-    let mut targets = calls.iter().map(|(to, _)| match to {
-        TxKind::Call(target) => Some(*target),
-        TxKind::Create => None,
-    });
-    let target = targets.next()??;
-    targets.all(|next| next == Some(target)).then_some(target)
-}
-
-fn is_tip20_fee_token_call(input: &[u8]) -> bool {
-    input.get(..4).is_some_and(|selector| {
-        selector == ITIP20::transferCall::SELECTOR
-            || selector == ITIP20::transferWithMemoCall::SELECTOR
-    })
-}
-
-fn decode_stablecoin_dex_fee_token(input: &[u8]) -> Option<Address> {
-    let selector = input.get(..4)?;
-    let token = if selector == IStablecoinDEX::swapExactAmountInCall::SELECTOR {
-        IStablecoinDEX::swapExactAmountInCall::abi_decode(input).ok().map(|call| call.tokenIn)
-    } else if selector == IStablecoinDEX::swapExactAmountOutCall::SELECTOR {
-        IStablecoinDEX::swapExactAmountOutCall::abi_decode(input).ok().map(|call| call.tokenIn)
-    } else {
-        None
-    }?;
-    token.is_tip20().then_some(token)
-}
-
-/// Returns the known symbol for a Tempo fee token without making an RPC call.
-pub const fn known_fee_token_symbol(fee_token: Address) -> Option<&'static str> {
-    match fee_token {
-        PATH_USD_ADDRESS => Some("PathUSD"),
-        ALPHA_USD_ADDRESS => Some("AlphaUSD"),
-        BETA_USD_ADDRESS => Some("BetaUSD"),
-        THETA_USD_ADDRESS => Some("ThetaUSD"),
-        _ => None,
-    }
-}
-
-async fn resolve_fee_token_symbol<N, P>(provider: &P, fee_token: Address) -> Option<String>
-where
-    N: Network,
-    N::TransactionRequest: Default + NetworkTransactionBuilder<N>,
-    P: Provider<N>,
-{
-    if let Some(symbol) = known_fee_token_symbol(fee_token) {
-        return Some(symbol.to_string());
-    }
-
-    let tx = N::TransactionRequest::default()
-        .with_to(fee_token)
-        .with_input(ITIP20::symbolCall.abi_encode());
-    let output = provider.call(tx).await.ok()?;
-    let symbol = ITIP20::symbolCall::abi_decode_returns(&output).ok()?;
-    (!symbol.is_empty()).then_some(symbol)
-}
-
-/// Prints the fee token selected for display.
-///
-/// Unknown symbols are resolved on-chain only when a provider is supplied, because some provider
-/// modes such as `--curl` must preserve the first RPC request for the user's intended action.
-pub async fn maybe_print_fee_token<N, P>(
-    provider: Option<&P>,
-    fee_token: Option<Address>,
-) -> Result<()>
-where
-    N: Network,
-    N::TransactionRequest: Default + NetworkTransactionBuilder<N>,
-    P: Provider<N>,
-{
-    if let Some(fee_token) = fee_token {
-        let symbol = if let Some(symbol) = known_fee_token_symbol(fee_token) {
-            Some(symbol.to_string())
-        } else if let Some(provider) = provider {
-            resolve_fee_token_symbol(provider, fee_token).await
-        } else {
-            None
-        };
-        match symbol {
-            Some(symbol) => sh_status!("Paying gas in {} ({})", symbol, fee_token)?,
-            None => sh_status!("Paying gas in {}", fee_token)?,
-        }
-    }
-    Ok(())
-}
+pub const OUSD_ADDRESS: Address = address!("0x20c0000000000000000000006a37DA5C996874BE");
 
 /// Gas sponsor configuration for Tempo fee-payer signatures.
 #[derive(Clone, Debug)]
@@ -300,14 +96,13 @@ impl TempoSponsor {
     pub async fn resolve_and_set_fee_token<N>(
         &self,
         provider: Option<&dyn Provider<N>>,
-        chain: Option<Chain>,
         tx: &mut N::TransactionRequest,
     ) -> Result<Option<Address>>
     where
         N: Network,
-        N::TransactionRequest: Default + FoundryTransactionBuilder<N>,
+        N::TransactionRequest: FoundryTransactionBuilder<N>,
     {
-        resolve_and_set_fee_token(provider, chain, tx, Some(self.sponsor)).await
+        resolve_and_set_fee_token(provider, tx, Some(self.sponsor)).await
     }
 
     pub async fn attach_and_print<N: Network>(
@@ -465,4 +260,293 @@ pub async fn resolve_tempo_sponsor_signer(spec: &str) -> Result<WalletSigner> {
             );
         }
     }
+}
+
+/// Placeholder rendered by `Debug` impls in place of secret key material.
+fn redacted_debug(value: &str) -> &'static str {
+    if value.trim().is_empty() { "<empty>" } else { "<redacted>" }
+}
+
+/// Resolves and applies the Tempo fee token selected by the network.
+///
+/// This must happen before computing a sponsor digest, because Tempo sponsor signatures commit to
+/// the fee token. The selected network's request type decides whether a fee token applies, so a
+/// local Tempo node is handled the same way as a canonical Tempo chain.
+pub async fn resolve_and_set_fee_token<N>(
+    provider: Option<&dyn Provider<N>>,
+    tx: &mut N::TransactionRequest,
+    fee_payer: Option<Address>,
+) -> Result<Option<Address>>
+where
+    N: Network,
+    N::TransactionRequest: FoundryTransactionBuilder<N>,
+{
+    if let Some(fee_token) = tx.fee_token() {
+        return Ok(Some(fee_token));
+    }
+    if !tx.supports_fee_token() {
+        return Ok(None);
+    }
+    let fee_payer = fee_payer.or_else(|| tx.from());
+    let calls = tx.tempo_calls();
+    let has_call_list = tx.has_tempo_call_list();
+    let is_aa = tx.is_tempo_aa();
+    let tx_from = tx.from();
+
+    // A stored fee-token preference would classify a contract creation as Tempo AA, but AA
+    // transactions require a non-empty call list. Leave CREATE requests as Ethereum transactions;
+    // the protocol still applies the account's stored fee-token preference when charging fees.
+    if !has_call_list && calls.iter().any(|(to, _)| to.is_create()) {
+        return Ok(None);
+    }
+
+    let immediate_user_token =
+        infer_fee_token_from_set_user_token_call(&calls, is_aa, tx_from, fee_payer);
+    let stored_fee_token = if immediate_user_token.is_none()
+        && let (Some(provider), Some(fee_payer)) = (provider, fee_payer)
+    {
+        stored_user_fee_token(provider, fee_payer).await?
+    } else {
+        None
+    };
+    let inferred_fee_token =
+        if immediate_user_token.is_none() && stored_fee_token.is_none() && !calls.is_empty() {
+            infer_fee_token_from_tip20_calls(&calls, tx_from, fee_payer)
+                .or_else(|| infer_fee_token_from_stablecoin_dex_calls(&calls, has_call_list))
+        } else {
+            None
+        };
+    let fee_token = immediate_user_token.or(stored_fee_token).or(inferred_fee_token);
+
+    let Some(fee_token) = fee_token else { return Ok(None) };
+    tx.set_fee_token(fee_token);
+    Ok(Some(fee_token))
+}
+
+async fn stored_user_fee_token<N>(
+    provider: &dyn Provider<N>,
+    fee_payer: Address,
+) -> Result<Option<Address>>
+where
+    N: Network,
+{
+    let call = IFeeManager::userTokensCall { user: fee_payer };
+    let tx = N::TransactionRequest::default()
+        .with_to(TIP_FEE_MANAGER_ADDRESS)
+        .with_input(call.abi_encode());
+    let output = provider
+        .call(tx)
+        .await
+        .wrap_err_with(|| format!("failed to resolve Tempo fee token for {fee_payer}"))?;
+    let fee_token = IFeeManager::userTokensCall::abi_decode_returns(&output)
+        .wrap_err("failed to decode Tempo fee token lookup")?;
+    Ok((!fee_token.is_zero()).then_some(fee_token))
+}
+
+fn infer_fee_token_from_tip20_calls(
+    calls: &[(TxKind, &[u8])],
+    tx_from: Option<Address>,
+    fee_payer: Option<Address>,
+) -> Option<Address> {
+    if calls.is_empty() || !calls.iter().all(|(_, input)| is_tip20_fee_token_call(input)) {
+        return None;
+    }
+
+    let target = common_call_target(calls)?;
+    if fee_payer != tx_from {
+        return None;
+    }
+    target.is_tip20().then_some(target)
+}
+
+fn infer_fee_token_from_set_user_token_call(
+    calls: &[(TxKind, &[u8])],
+    is_aa: bool,
+    tx_from: Option<Address>,
+    fee_payer: Option<Address>,
+) -> Option<Address> {
+    if is_aa || fee_payer != tx_from {
+        return None;
+    }
+
+    let (to, input) = calls.first()?;
+    if *to != TxKind::Call(TIP_FEE_MANAGER_ADDRESS) {
+        return None;
+    }
+
+    let call = IFeeManager::setUserTokenCall::abi_decode(input).ok()?;
+    call.token.is_tip20().then_some(call.token)
+}
+
+fn infer_fee_token_from_stablecoin_dex_calls(
+    calls: &[(TxKind, &[u8])],
+    has_call_list: bool,
+) -> Option<Address> {
+    if has_call_list && calls.len() != 1 {
+        return None;
+    }
+    let (to, input) = calls.first()?;
+    if *to != TxKind::Call(STABLECOIN_DEX_ADDRESS) {
+        return None;
+    }
+    decode_stablecoin_dex_fee_token(input)
+}
+
+fn common_call_target(calls: &[(TxKind, &[u8])]) -> Option<Address> {
+    let mut targets = calls.iter().map(|(to, _)| match to {
+        TxKind::Call(target) => Some(*target),
+        TxKind::Create => None,
+    });
+    let target = targets.next()??;
+    targets.all(|next| next == Some(target)).then_some(target)
+}
+
+fn is_tip20_fee_token_call(input: &[u8]) -> bool {
+    input.get(..4).is_some_and(|selector| {
+        selector == ITIP20::transferCall::SELECTOR
+            || selector == ITIP20::transferWithMemoCall::SELECTOR
+    })
+}
+
+fn decode_stablecoin_dex_fee_token(input: &[u8]) -> Option<Address> {
+    let selector = input.get(..4)?;
+    let token = if selector == IStablecoinDEX::swapExactAmountInCall::SELECTOR {
+        IStablecoinDEX::swapExactAmountInCall::abi_decode(input).ok().map(|call| call.tokenIn)
+    } else if selector == IStablecoinDEX::swapExactAmountOutCall::SELECTOR {
+        IStablecoinDEX::swapExactAmountOutCall::abi_decode(input).ok().map(|call| call.tokenIn)
+    } else {
+        None
+    }?;
+    token.is_tip20().then_some(token)
+}
+
+/// Returns the known symbol for a Tempo fee token without making an RPC call.
+pub const fn known_fee_token_symbol(fee_token: Address) -> Option<&'static str> {
+    match fee_token {
+        PATH_USD_ADDRESS => Some("PathUSD"),
+        ALPHA_USD_ADDRESS => Some("AlphaUSD"),
+        BETA_USD_ADDRESS => Some("BetaUSD"),
+        THETA_USD_ADDRESS => Some("ThetaUSD"),
+        OUSD_ADDRESS => Some("OUSD"),
+        _ => None,
+    }
+}
+
+async fn resolve_fee_token_symbol<N, P>(provider: &P, fee_token: Address) -> Option<String>
+where
+    N: Network,
+    P: Provider<N>,
+{
+    if let Some(symbol) = known_fee_token_symbol(fee_token) {
+        return Some(symbol.to_string());
+    }
+
+    let tx = N::TransactionRequest::default()
+        .with_to(fee_token)
+        .with_input(ITIP20::symbolCall.abi_encode());
+    let output = provider.call(tx).await.ok()?;
+    let symbol = ITIP20::symbolCall::abi_decode_returns(&output).ok()?;
+    (!symbol.is_empty()).then_some(symbol)
+}
+
+/// Prints the fee token selected for display.
+///
+/// Unknown symbols are resolved on-chain only when a provider is supplied, because some provider
+/// modes such as `--curl` must preserve the first RPC request for the user's intended action.
+pub async fn maybe_print_fee_token<N, P>(
+    provider: Option<&P>,
+    fee_token: Option<Address>,
+) -> Result<()>
+where
+    N: Network,
+    P: Provider<N>,
+{
+    if let Some(fee_token) = fee_token {
+        let symbol = if let Some(symbol) = known_fee_token_symbol(fee_token) {
+            Some(symbol.to_string())
+        } else if let Some(provider) = provider {
+            resolve_fee_token_symbol(provider, fee_token).await
+        } else {
+            None
+        };
+        match symbol {
+            Some(symbol) => sh_status!("Paying gas in {} ({})", symbol, fee_token)?,
+            None => sh_status!("Paying gas in {}", fee_token)?,
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the signer and Tempo Accounts wallet selected by `wallet`, pinning the Tempo wallet
+/// to `chain_id` when given.
+///
+/// `foundry-wallets` only describes the Tempo wallet so that it does not link its own
+/// `tempo-alloy`; the wallet is built here with Foundry's.
+pub async fn maybe_signer(
+    wallet: &WalletOpts,
+    chain_id: Option<u64>,
+) -> Result<(Option<WalletSigner>, Option<TempoAccountsWallet>)> {
+    let (signer, spec) = wallet.maybe_signer().await?;
+    let tempo_wallet = match spec {
+        None => None,
+        Some(TempoWalletSpec::AccessKey { root_account, signer }) => {
+            Some(TempoAccountsWallet::from_secp256k1(root_account, signer, None))
+        }
+        Some(TempoWalletSpec::Store { from }) => {
+            match TempoAccountsWallet::try_from_default_store()? {
+                Some(store) if store.has_account(from)? => Some(store),
+                _ => None,
+            }
+        }
+    };
+    let tempo_wallet = match chain_id {
+        Some(chain_id) => tempo_wallet.map(|wallet| wallet.with_chain_id(chain_id)),
+        None => tempo_wallet,
+    };
+    Ok((signer, tempo_wallet))
+}
+
+/// Asks the browser wallet to sign `authorization` with its connected root account, and verifies
+/// the result.
+///
+/// The browser wallet cannot display T5/T6 fields (witness, account, admin) yet, so callers must
+/// reject them before starting the browser flow.
+pub async fn sign_key_authorization_with_browser(
+    browser: &BrowserSigner<TempoNetwork>,
+    authorization: KeyAuthorization,
+) -> Result<SignedKeyAuthorization> {
+    let signed = browser
+        .sign_key_authorization(
+            serde_json::to_value(&authorization)?,
+            authorization.chain_id,
+            authorization.signature_hash(),
+        )
+        .await?;
+    verify_browser_key_authorization(&signed, &authorization, browser.address())
+}
+
+/// Decodes a `SignedKeyAuthorization` returned by the browser wallet and checks that it signs
+/// exactly `requested` and recovers to `root_account`.
+fn verify_browser_key_authorization(
+    signed: &[u8],
+    requested: &KeyAuthorization,
+    root_account: Address,
+) -> Result<SignedKeyAuthorization> {
+    let signed = alloy_rlp::decode_exact::<SignedKeyAuthorization>(signed)
+        .wrap_err("invalid SignedKeyAuthorization RLP from wallet")?;
+    eyre::ensure!(
+        signed.authorization == *requested,
+        "wallet returned a mutated KeyAuthorization payload: signed digest {} but requested {}",
+        signed.authorization.signature_hash(),
+        requested.signature_hash(),
+    );
+    let recovered = signed
+        .recover_signer()
+        .wrap_err("wallet returned an unrecoverable SignedKeyAuthorization signature")?;
+    eyre::ensure!(
+        recovered == root_account,
+        "wallet returned a SignedKeyAuthorization signed by {recovered} but the connected root \
+         account is {root_account}"
+    );
+    Ok(signed)
 }

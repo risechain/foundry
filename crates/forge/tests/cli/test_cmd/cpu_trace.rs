@@ -82,7 +82,8 @@ contract NestedOpcodeCpuTest {
 }
 "#;
 
-forgetest_init!(cpu_trace_disabled_output_remains_exact, |prj, cmd| {
+#[forgetest_init]
+fn cpu_trace_disabled_output_remains_exact(prj: _, cmd: _) {
     prj.add_test("CpuTrace.t.sol", FIXTURE);
 
     cmd.forge_fuse().args(["test", "-vvvv"]).assert_success().stdout_eq(str![[r#"
@@ -102,9 +103,10 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
-});
+}
 
-forgetest_init!(cpu_trace_enabled_renders_cpu_beside_gas, |prj, cmd| {
+#[forgetest_init]
+fn cpu_trace_enabled_renders_cpu_beside_gas(prj: _, cmd: _) {
     prj.add_test("CpuTrace.t.sol", FIXTURE);
 
     cmd.forge_fuse().args(["test", "--cpu-trace", "-vvvv"]);
@@ -125,8 +127,9 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
-});
-forgetest_init!(cpu_trace_renders_cpu_for_selected_opcodes, |prj, cmd| {
+}
+#[forgetest_init]
+fn cpu_trace_renders_cpu_for_selected_opcodes(prj: _, cmd: _) {
     prj.add_test("OpcodeCpuTrace.t.sol", OPCODE_FIXTURE);
 
     cmd.forge_fuse().args(["test", "--cpu-trace", "--opcodes", "SLOAD,SSTORE", "-vvvvv"]);
@@ -145,9 +148,10 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
-});
+}
 
-forgetest_init!(selected_opcodes_remain_gas_only_without_cpu_trace, |prj, cmd| {
+#[forgetest_init]
+fn selected_opcodes_remain_gas_only_without_cpu_trace(prj: _, cmd: _) {
     prj.add_test("OpcodeCpuTrace.t.sol", OPCODE_FIXTURE);
 
     cmd.forge_fuse().args(["test", "--opcodes", "SLOAD,SSTORE", "-vvvvv"]);
@@ -166,9 +170,10 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
-});
+}
 
-forgetest_init!(cpu_trace_times_nested_call_and_child_opcode, |prj, cmd| {
+#[forgetest_init]
+fn cpu_trace_times_nested_call_and_child_opcode(prj: _, cmd: _) {
     prj.add_test("NestedOpcodeCpuTrace.t.sol", NESTED_OPCODE_FIXTURE);
 
     cmd.forge_fuse().args(["test", "--cpu-trace", "--opcodes", "CALL,SSTORE", "-vvvvv"]);
@@ -191,9 +196,10 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
-});
+}
 
-forgetest_init!(cpu_flamechart_writes_cpu_weighted_svg, |prj, cmd| {
+#[forgetest_init]
+fn cpu_flamechart_writes_cpu_weighted_svg(prj: _, cmd: _) {
     prj.add_test("CpuTrace.t.sol", FIXTURE);
 
     cmd.forge_fuse().args(["test", "--cpu-flamechart", "--no-open"]).assert_success();
@@ -206,9 +212,10 @@ forgetest_init!(cpu_flamechart_writes_cpu_weighted_svg, |prj, cmd| {
     assert!(flamechart.contains("CpuTraceTest.testCpuTrace()"));
     assert!(flamechart.contains("CpuTraceTarget.ping()"));
     assert!(flamechart.contains("cpu nanoseconds"));
-});
+}
 
-forgetest_async!(cpu_trace_enabled_renders_cpu_on_fork, |prj, cmd| {
+#[forgetest]
+async fn cpu_trace_enabled_renders_cpu_on_fork(prj: _, cmd: _) {
     let (_, handle) = anvil::spawn(anvil::NodeConfig::test().with_chain_id(Some(424242u64))).await;
     prj.add_test("ForkCpuTrace.t.sol", FORK_FIXTURE);
 
@@ -230,4 +237,4 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
-});
+}

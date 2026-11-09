@@ -8,7 +8,6 @@ CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 MONAD_WORKFLOW = ROOT / ".github" / "workflows" / "monad.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 DOCKER_WORKFLOW = ROOT / ".github" / "workflows" / "docker-publish.yml"
-STABLE_VERSION_WORKFLOW = ROOT / ".github" / "workflows" / "stable-version-pr.yml"
 MAKEFILE = ROOT / "Makefile"
 
 
@@ -40,15 +39,6 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
         self.assertNotIn("      - monad\n", ci_workflow)
         self.assertFalse(MONAD_WORKFLOW.exists())
 
-    def test_fork_skips_upstream_stable_version_reconciliation(self):
-        workflow = STABLE_VERSION_WORKFLOW.read_text(encoding="utf-8")
-
-        self.assertIn(
-            "if: github.ref == 'refs/heads/master' && "
-            "github.repository == 'foundry-rs/foundry'",
-            workflow,
-        )
-
     def test_packaged_builds_exclude_unused_monad_feature(self):
         for build_path in (WORKFLOW, RELEASE_WORKFLOW, DOCKER_WORKFLOW, MAKEFILE):
             with self.subTest(build=build_path.name):
@@ -62,10 +52,10 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
         workflow = self.workflow()
 
         self.assertIn(
-            "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
+            "dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8",
             workflow,
         )
-        self.assertIn("toolchain: 1.96", workflow)
+        self.assertIn("toolchain: 1.98", workflow)
         self.assertIn("test_cmd::cpu_trace::", workflow)
         self.assertIn(
             'run: "cargo test --locked -p forge --test cli '

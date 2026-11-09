@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, U256, map::HashMap};
+use alloy_primitives::{Address, map::HashMap};
 use foundry_evm_core::constants::{CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS};
 use foundry_evm_traces::RevertDiagnostic as DetailedRevertReason;
 use revm::{
@@ -10,9 +10,24 @@ use revm::{
 
 const IGNORE: [Address; 2] = [HARDHAT_CONSOLE_ADDRESS, CHEATCODE_ADDRESS];
 
-/// Checks if the call scheme corresponds to any sort of delegate call
-pub const fn is_delegatecall(scheme: CallScheme) -> bool {
-    matches!(scheme, CallScheme::DelegateCall | CallScheme::CallCode)
+/// An `EXTCODESIZE` probe of an address without executable code.
+///
+/// The probe is cached optimistically when the opcode starts, and validated against the opcode's
+/// output when it ends.
+#[derive(Clone, Copy, Debug)]
+enum SizeCheck {
+    /// `EXTCODESIZE` is executing; its output is validated in `step_end`.
+    Pending { addr: Address, depth: usize },
+    /// `EXTCODESIZE` did not report any code for the address.
+    NonContract { addr: Address, depth: usize },
+}
+
+impl SizeCheck {
+    const fn target(self) -> (Address, usize) {
+        match self {
+            Self::Pending { addr, depth } | Self::NonContract { addr, depth } => (addr, depth),
+        }
+    }
 }
 
 /// An inspector that tracks call context to enhances revert diagnostics.
@@ -36,9 +51,7 @@ pub struct RevertDiagnostic {
     /// Tracks calls with calldata that target an address without executable code.
     non_contract_call: Option<(Address, CallScheme, usize)>,
     /// Tracks EXTCODESIZE checks that target an address without executable code.
-    non_contract_size_check: Option<(Address, usize)>,
-    /// Whether the step opcode is EXTCODESIZE or not.
-    is_extcodesize_step: bool,
+    non_contract_size_check: Option<SizeCheck>,
     /// Diagnostic detected for the currently executing frame.
     pending: Option<DetailedRevertReason>,
     /// Trace nodes for active frames. `None` means the tracer did not create a node.
@@ -60,7 +73,8 @@ impl RevertDiagnostic {
             return Some(reason);
         }
 
-        if let Some((addr, _)) = self.non_contract_size_check {
+        if let Some(check) = self.non_contract_size_check {
+            let (addr, _) = check.target();
             // unknown schema as the call never took place --> output most generic reason
             return Some(DetailedRevertReason::CallToNonContract(addr));
         }
@@ -120,7 +134,8 @@ impl RevertDiagnostic {
             }
 
             // Check empty revert with same depth as a non-contract size check
-            if let Some((_, depth)) = self.non_contract_size_check {
+            if let Some(check) = self.non_contract_size_check {
+                let (_, depth) = check.target();
                 if depth == ctx.journal_ref().depth() {
                     self.pending = self.reason();
                 } else {
@@ -144,26 +159,28 @@ impl RevertDiagnostic {
 
             // Optimistically cache --> validated and cleared (if necessary) at `fn
             // step_end()`
-            self.non_contract_size_check = Some((addr, ctx.journal_ref().depth()));
-            self.is_extcodesize_step = true;
+            self.non_contract_size_check =
+                Some(SizeCheck::Pending { addr, depth: ctx.journal_ref().depth() });
         }
     }
 
-    /// Tracks `EXTCODESIZE` output. If the bytecode size is NOT 0, clears the cache.
+    /// Validates a pending `EXTCODESIZE` probe against its output: a non-zero size clears it,
+    /// otherwise the address is confirmed to have no code and supersedes any earlier non-contract
+    /// call.
     #[cold]
-    fn handle_extcodesize_output(&mut self, interp: &mut Interpreter) {
-        if let Ok(size) = interp.stack.peek(0)
-            && size != U256::ZERO
-        {
-            self.non_contract_size_check = None;
-        }
-
-        self.is_extcodesize_step = false;
+    fn handle_extcodesize_output(&mut self, interp: &mut Interpreter, addr: Address, depth: usize) {
+        self.non_contract_size_check = match interp.stack.peek(0) {
+            Ok(size) if !size.is_zero() => None,
+            _ => {
+                self.non_contract_call = None;
+                Some(SizeCheck::NonContract { addr, depth })
+            }
+        };
     }
 }
 
 impl<CTX: ContextTr> Inspector<CTX> for RevertDiagnostic {
-    /// Tracks the first call with non-zero calldata that targets a non-contract address. Excludes
+    /// Tracks the latest call with non-zero calldata that targets a non-contract address. Excludes
     /// precompiles and test addresses.
     fn call(&mut self, ctx: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         if inputs.input.is_empty() {
@@ -174,7 +191,7 @@ impl<CTX: ContextTr> Inspector<CTX> for RevertDiagnostic {
         let target = if is_delegatecall(inputs.scheme) {
             inputs.bytecode_address
         } else {
-            inputs.target_address
+            inputs.transfer_to()
         };
 
         if IGNORE.contains(&target) || ctx.journal_ref().precompile_addresses().contains(&target) {
@@ -185,6 +202,8 @@ impl<CTX: ContextTr> Inspector<CTX> for RevertDiagnostic {
             && state.is_empty()
         {
             self.non_contract_call = Some((target, inputs.scheme, ctx.journal_ref().depth()));
+            // The latest observation explains a following empty revert.
+            self.non_contract_size_check = None;
         }
         None
     }
@@ -199,8 +218,61 @@ impl<CTX: ContextTr> Inspector<CTX> for RevertDiagnostic {
     }
 
     fn step_end(&mut self, interp: &mut Interpreter, _ctx: &mut CTX) {
-        if self.is_extcodesize_step {
-            self.handle_extcodesize_output(interp);
+        if let Some(SizeCheck::Pending { addr, depth }) = self.non_contract_size_check {
+            self.handle_extcodesize_output(interp, addr, depth);
         }
+    }
+}
+
+/// Checks if the call scheme corresponds to any sort of delegate call
+pub const fn is_delegatecall(scheme: CallScheme) -> bool {
+    matches!(scheme, CallScheme::DelegateCall | CallScheme::CallCode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{TxKind, hex};
+    use revm::{
+        Context, InspectEvm, MainBuilder, MainContext,
+        context::TxEnv,
+        database::InMemoryDB,
+        state::{AccountInfo, Bytecode},
+    };
+
+    #[test]
+    fn latest_non_contract_observation_explains_empty_revert() {
+        let target = Address::with_last_byte(0x40);
+        let probed = Address::with_last_byte(0xe2);
+        let mut db = InMemoryDB::default();
+        let code = hex::decode(concat!(
+            "5f5f60015f5f60e15af150", // CALL(gas, 0xe1, 0, 0, 1, 0, 0) to an address without code.
+            "60e23b50",               // EXTCODESIZE(0xe2), which has no code either.
+            "5f5ffd"                  // REVERT(0, 0).
+        ))
+        .unwrap();
+        db.insert_account_info(target, AccountInfo::from_bytecode(Bytecode::new_raw(code.into())));
+        let mut diagnostic = RevertDiagnostic::default();
+        let result = Context::mainnet()
+            .with_db(db)
+            .build_mainnet_with_inspector(&mut diagnostic)
+            .inspect_one_tx(
+                TxEnv::builder()
+                    .caller(Address::with_last_byte(0x30))
+                    .kind(TxKind::Call(target))
+                    .gas_limit(1_000_000)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!result.is_success());
+        assert!(
+            matches!(
+                diagnostic.pending,
+                Some(DetailedRevertReason::CallToNonContract(addr)) if addr == probed
+            ),
+            "{:?}",
+            diagnostic.pending
+        );
     }
 }

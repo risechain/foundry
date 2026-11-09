@@ -4,31 +4,12 @@
 //! Gas consumption is used as the value unit, so flame graph widths represent gas usage.
 
 use super::schema::{EventedProfile, Frame, Profile, SpeedscopeFile, ValueUnit};
-use alloy_primitives::hex::ToHexExt;
+use alloy_primitives::{hex::ToHexExt, map::HashMap};
 use revm_inspectors::tracing::{
     CallTraceArena,
     types::{CallTraceNode, CallTraceStep, DecodedTraceStep, TraceMemberOrder},
 };
-use std::{borrow::Cow, collections::HashMap};
-
-/// Builds a speedscope profile from a call trace arena.
-///
-/// Walks the trace arena directly so the Time Order view preserves execution order.
-pub fn build<'a>(
-    arena: &CallTraceArena,
-    test_name: &str,
-    contract_name: &str,
-    isolate: bool,
-) -> SpeedscopeFile<'a> {
-    let name = format!("{contract_name}::{test_name}");
-    let mut builder = SpeedscopeBuilder::new(name);
-
-    if !arena.nodes().is_empty() {
-        builder.process_call_node(arena.nodes(), 0, isolate);
-    }
-
-    builder.build()
-}
+use std::borrow::Cow;
 
 struct SpeedscopeBuilder<'a> {
     file: SpeedscopeFile<'a>,
@@ -42,7 +23,7 @@ impl<'a> SpeedscopeBuilder<'a> {
         Self {
             file: SpeedscopeFile::new(name.clone()),
             profile: EventedProfile::new(name, ValueUnit::None),
-            frame_cache: HashMap::new(),
+            frame_cache: HashMap::default(),
             cumulative_gas: 0,
         }
     }
@@ -53,11 +34,12 @@ impl<'a> SpeedscopeBuilder<'a> {
         self.file
     }
 
-    fn process_call_node(&mut self, nodes: &[CallTraceNode], idx: usize, isolate: bool) {
+    fn process_call_node(&mut self, nodes: &[CallTraceNode], idx: usize) {
         let node = &nodes[idx];
         let frame_idx = self.frame_idx(call_frame_name(node));
         let start_gas = self.cumulative_gas;
-        let gas_used = call_gas_used(node, isolate);
+        // Call gas is gross: refunds are only subtracted from the test's reported gas.
+        let gas_used = node.trace.gas_used;
 
         self.profile.open_frame(frame_idx, self.cumulative_gas);
 
@@ -72,7 +54,7 @@ impl<'a> SpeedscopeBuilder<'a> {
                 }
                 TraceMemberOrder::Call(child_idx) => {
                     let child_node_idx = node.children[*child_idx];
-                    self.process_call_node(nodes, child_node_idx, isolate);
+                    self.process_call_node(nodes, child_node_idx);
                 }
                 TraceMemberOrder::Log(_) => {}
             }
@@ -131,6 +113,24 @@ struct StepExit {
     frame_idx: usize,
 }
 
+/// Builds a speedscope profile from a call trace arena.
+///
+/// Walks the trace arena directly so the Time Order view preserves execution order.
+pub fn build<'a>(
+    arena: &CallTraceArena,
+    test_name: &str,
+    contract_name: &str,
+) -> SpeedscopeFile<'a> {
+    let name = format!("{contract_name}::{test_name}");
+    let mut builder = SpeedscopeBuilder::new(name);
+
+    if !arena.nodes().is_empty() {
+        builder.process_call_node(arena.nodes(), 0);
+    }
+
+    builder.build()
+}
+
 fn call_frame_name(node: &CallTraceNode) -> String {
     if node.trace.kind.is_any_create() {
         let contract_name =
@@ -157,15 +157,6 @@ fn call_frame_name(node: &CallTraceNode) -> String {
     }
 }
 
-const fn call_gas_used(node: &CallTraceNode, isolate: bool) -> u64 {
-    let mut gas_used = node.trace.gas_used;
-    let max_refund_adjust_depth = if isolate { 1 } else { 0 };
-    if node.trace.depth <= max_refund_adjust_depth {
-        gas_used = gas_used.saturating_add(node.trace.gas_refund_counter);
-    }
-    gas_used
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +176,9 @@ mod tests {
             gas_refund_counter: 0,
             gas_used: 0,
             gas_cost,
+            state_gas_cost: None,
+            state_gas_reservoir: None,
+            state_gas_spent: 0,
             storage_change: None,
             status: Some(InstructionResult::Stop),
             immediate_bytes: None,
@@ -203,7 +197,7 @@ mod tests {
     #[test]
     fn test_empty_profile() {
         let arena = CallTraceArena::default();
-        let profile = build(&arena, "testExample", "TestContract", false);
+        let profile = build(&arena, "testExample", "TestContract");
         let json = serde_json::to_string_pretty(&profile).unwrap();
 
         snapbox::assert_data_eq!(
@@ -302,7 +296,7 @@ mod tests {
             ..Default::default()
         });
 
-        let file = build(&arena, "test", "Test", false);
+        let file = build(&arena, "test", "Test");
         let json = serde_json::to_string_pretty(&file).unwrap();
 
         snapbox::assert_data_eq!(
@@ -402,7 +396,7 @@ mod tests {
             ..Default::default()
         });
 
-        let file = build(&arena, "test", "Test", false);
+        let file = build(&arena, "test", "Test");
 
         // Extract events
         if let Profile::Evented(profile) = &file.profiles[0] {

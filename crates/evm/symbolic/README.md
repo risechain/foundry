@@ -22,7 +22,10 @@ import "forge-std/Test.sol";
 
 contract MathSymbolicTest is Test {
     function check_average(uint256 a, uint256 b) external pure {
-        uint256 average = (a + b) / 2;
+        uint256 average;
+        unchecked {
+            average = (a + b) / 2;
+        }
 
         // Forge should find an overflow counterexample.
         assertGe(average, a <= b ? a : b);
@@ -40,7 +43,8 @@ Requirements:
 
 - The configured solver must be available. The default solver command is `z3`.
   Install it locally with your package manager, for example `brew install z3`
-  on macOS or `sudo apt-get install z3` on Ubuntu.
+  on macOS or `sudo apt-get install z3` on Ubuntu. Foundry avoids launching it
+  when bounded local model search can validate a satisfiable path directly.
 - `check*` and `prove*` tests are only selected when `--symbolic` is enabled
   and the contract is in a source path Forge compiles for the current project.
 - A reported counterexample must replay concretely before Forge prints it as a
@@ -122,27 +126,51 @@ follow-up:
 forge test --match-test test_hard_branch --fuzz-frontier-dir fuzz_frontiers
 ```
 
+Invariant campaigns can capture the same EVM-level comparisons together with
+the concrete transaction prefix that reached each stateful site:
+
+```sh
+forge fuzz run --match-test invariant_ \
+  --runs 1000 \
+  --depth 500 \
+  --frontier-dir fuzz_frontiers
+```
+
 For example, a fuzz run may pass after reaching `feeMultiplier == 100` at a
 `feeMultiplier < 100` guard; the frontier gives symbolic execution the replay
 calldata and comparison site needed to solve the adjacent missed branch.
 
-Forge writes one bounded artifact per fuzz test at
-`<fuzz_frontier_dir>/<contract>/<test>/branch-frontiers.json`. The artifact
-uses schema `foundry:fuzz.branch-frontiers@v1` and records the test signature,
+Forge writes one bounded artifact per stateless fuzz test at
+`<fuzz_frontier_dir>/<contract>/<test>/branch-frontiers.json`. Stateful artifacts
+use a collision-free v2 namespace under
+`<fuzz_frontier_dir>/v2/<contract>-<artifact-hash>/<execution-profile>/<execution-pass>`;
+merged boolean campaigns add `shared/branch-frontiers.json`, while isolated
+boolean and optimization campaigns add `isolated/<test>/branch-frontiers.json`.
+Stateless artifacts use schema `foundry:fuzz.branch-frontiers@v1`. Invariant
+artifacts use `foundry:fuzz.branch-frontiers@v2`, storing concrete sequences
+once in a top-level `sequences` array and referencing them by `sequence_index`
+to avoid repeating long transaction prefixes. Both record the test signature,
 configured record limit, and a `frontiers` array. Each frontier contains:
 
 - a stable record index (`id`) within the artifact
-- fuzz replay metadata (`seed`, `run`, `worker`) when available
-- the concrete one-call sequence that reached the site
+- the concrete call sequence, directly or by `sequence_index`, and the index of
+  the call whose prefix reached the site
 - the EVM comparison site (`address`, `pc`, `opcode`, `opcode_name`)
 - concrete operands (`lhs`, `rhs`), the comparison result, and an
   `operand_delta` priority score interpreted according to opcode signedness
-- whether the call also expanded the worker's coverage map (`new_coverage`),
-  present only when edge coverage is collected via a corpus directory, edge
-  coverage metrics, or sancov, and omitted otherwise
 
-Frontier capture is opt-in and bounded by `fuzz.frontier_limit` (default 256).
-It reuses the fuzzer's comparison-operand inspector and does not store traces.
+Stateless records additionally contain fuzz replay metadata (`seed`, `run`,
+`worker`) when available and `new_coverage` when edge coverage is collected.
+
+Frontier capture is opt-in and bounded by `fuzz.frontier_limit` or
+`invariant.frontier_limit` (both default to 256). It reuses the fuzzer's
+comparison-operand inspector and does not store traces. Parallel invariant
+campaigns capture on worker 0 only. The recorder keeps the first distinct
+site/result pairs up to the record limit, replaces them with closer operands,
+and prefers the shorter sequence when distances tie. The limit bounds records,
+not bytes; retained sequence storage can scale with the limit and campaign
+depth. Campaigns using `invariant.call_override` do not write frontier artifacts
+because the artifact does not encode randomized inner calls.
 
 Symbolic execution can consume those artifacts to solve the opposite side of
 captured comparisons and write replay-confirmed inputs into the fuzz corpus:
@@ -158,6 +186,62 @@ Forge imports up to `symbolic.frontier_limit` records (default 256), replays the
 recorded one-call seed as a path-priority hint, constrains symbolic execution to
 flip the captured comparison result, and persists only candidates that replay
 with the expected concrete outcome.
+For an invariant campaign, point the follow-up run at both the captured
+frontiers and an invariant corpus directory:
+
+```sh
+forge test --match-test invariant_ \
+  --invariant-frontier-dir fuzz_frontiers \
+  --invariant-corpus-dir fuzz_corpus \
+  --symbolic-use-fuzz-frontiers \
+  --symbolic-timeout 1
+```
+
+Forge replays each recorded prefix into a fresh EVM, symbolically solves only
+the call that reached the retained comparison, and writes a branch candidate
+only when concrete replay observes the opposite result at that exact comparison
+site. Every accepted input produced by that solve is also replayed against each
+remaining invariant predicate and the suite hook, and exact failures are
+reported only at checkpoints where the concrete campaign would evaluate them;
+other candidates remain corpus seeds. `afterInvariant` failures are reported
+only at a terminal depth allowed by the configured depth mode. This uses the
+existing solver results; it does not issue additional symbolic queries.
+Reverting candidates are retained only when they contain an assertion failure
+or the invariant suite enables `fail_on_revert`. Target calls carrying nonzero
+value are currently skipped because symbolic root calls do not yet apply the
+corresponding balance transfer. Replay the resulting corpus to check every
+persisted sequence deterministically:
+
+```sh
+forge fuzz replay --match-test invariant_ --corpus-dir fuzz_corpus
+```
+
+Pass `--symbolic-check-invariant-frontiers` to enable invariant frontier seeding
+and first check whether one symbolic invocation of each selected target can
+break a suite predicate from its replayed
+concrete prefix. Without `afterInvariant`, each invariant function is checked
+independently from the same post-call symbolic state. Forge uses the concrete
+campaign semantics: assertions and reverts indicate failure, while a Solidity
+`bool` return value is ignored. With `afterInvariant`, the property attempt uses
+the current campaign anchor and its hook.
+
+Property checking catches correlated inputs that violate an invariant even when
+flipping the recorded comparison is harmless. Forge persists only a one-call
+symbolic suffix with no symbolic initial-storage assignments that replays
+concretely through the full prefix and fails the exact predicate. Unsupported or
+bounded predicates do not discard candidates already found, but an empty search
+does not prove the suite safe. Forge performs comparison flipping after the
+property search regardless of whether that search found a candidate, and does
+not symbolize or repair earlier calls in the recorded prefix.
+Configured symbolic limits apply separately to the property attempt and
+comparison-flipping pass for each imported frontier.
+
+This is an explicit follow-up to a concrete campaign, not automatic symbolic
+work in every fuzz run. A short solver timeout keeps iteration bounded; increase
+it for frontiers that report incomplete. Use frontier IDs, PCs, selectors, or a
+lower `symbolic.frontier_limit` when only selected sites should consume solver
+time. Frontier capture currently covers direct EVM comparison opcodes; branch
+conditions compiled into arithmetic followed by `JUMPI` are not targeted yet.
 
 To focus solver time on specific captured sites, pass frontier artifact IDs,
 comparison PCs, or calldata selectors:
@@ -176,10 +260,15 @@ forge test --match-test test_hard_branch \
 `symbolic.frontier_selectors` default to `[]`, meaning any value for that
 dimension. Non-empty filters compose conjunctively, so the example imports only
 records matching one of the requested IDs, one of the requested PCs, and one of
-the requested selectors. Forge keeps the artifact order as the priority order
-after filtering, imports up to `symbolic.frontier_limit` records, reports how
-many records were imported or skipped by target filters, and warns if a
-requested target cannot be imported.
+the requested selectors. Stateless imports keep artifact order. Automatic
+stateful imports represent distinct recorded sequence/call contexts within each
+priority tier before revisiting other comparisons from the same contexts, while
+sampling across call depths. Records at sites whose two outcomes are both
+retained in the bounded artifact remain lower priority rather than being
+discarded; one deep such record is reserved when possible, and they fill
+otherwise unused solver budget. Explicit frontier filters use the matching
+records directly. Forge imports up to `symbolic.frontier_limit` matching records
+and warns if a requested stateless target cannot be imported.
 
 > **Hash-model caveat:** `PASS` also assumes collision and preimage resistance
 > for symbolic `KECCAK256` and hash-like precompile terms. The executor may use
@@ -210,7 +299,41 @@ Current modeling notes:
   symbolic transaction, otherwise it transfers balance and halts while
   preserving code and storage. Cancun beneficiaries must resolve to concrete
   addresses; unresolved symbolic beneficiaries report incomplete.
+- With call isolation (`isolate`, on by default), a `CALL`, `CREATE` (not
+  `CREATE2`), or `vm.deployCode` made by the test, a handler, or an invariant
+  predicate runs as its own transaction, as in concrete Forge: it starts with
+  empty transient storage, the caller's transient storage is restored after
+  it, and a `CALL` increments the nonce of the caller (the pranked sender under
+  a prank) even when it fails. Cheatcode, console, and `vm.mockCall` calls are
+  not isolated.
 - Counterexamples are shown only after successful concrete replay.
+
+### Checked XOR specialization
+
+Before launching an SMT solver, the executor can solve affine systems of 256-bit
+EVM `XOR` and `NOT` equalities using Gaussian elimination. It also detects when
+those equalities contradict an asserted disequality. Other word expressions,
+including masked values, are treated as opaque terms without assuming they are
+independent.
+The recognizer recovers equality boundaries compiled through constant addition
+or subtraction using wrapping EVM arithmetic; addition inside an XOR remains
+opaque because of carries.
+
+Every specialist answer is checked against the original query. A candidate model
+must satisfy all original constraints, including predicates outside the affine
+system, and counterexamples still require concrete replay. An unsatisfiable
+answer carries a selection of asserted equalities; a separate checker XORs their
+original terms to verify a contradiction or an equality forbidden by an asserted
+disequality. The checker does not trust the elimination rows. These checks are
+implemented in Rust; they are not a formally verified proof-checking toolchain.
+
+The specialist handles at most 256 relations and 256 opaque terms, with bounded
+expression traversal. Exceeding a limit, an unsupported query, or a failed check
+falls through to the existing solver pipeline. This applies the workload-specific,
+checked-result approach from
+[The Case for Automated Hyperspecialization: Evidence from SAT](https://arxiv.org/abs/2609.14836v1)
+to one EVM query family; it does not change the configured exploration bounds or
+the meaning of `PASS`.
 
 ## Writing Symbolic Tests
 
@@ -328,11 +451,21 @@ contract RiddleTest is Test {
 In this style:
 
 - `require(...)` prunes paths when the condition is false.
-- `vm.assume(...)` also prunes paths.
+- `vm.assume(...)` also prunes paths. If assumptions reject every path, Forge
+  reports an incomplete result instead of a proof.
 - `assert`, forge-std assertions, and DSTest failure signals are treated as
   properties to disprove.
 - User reverts terminate the current path. If every path reverts, Forge reports
   a revert-all result instead of a proof.
+- Exceptional halts, such as `INVALID`, memory accesses beyond `memory_limit`,
+  or `RETURNDATACOPY` past the return data, fail the test as in concrete
+  execution.
+- Solidity panics other than `assert` failures (Panic 0x01), such as arithmetic
+  overflow or underflow (0x11), division or modulo by zero (0x12), and
+  out-of-bounds array access (0x32), are reverts too. They prune the path
+  instead of failing the test. To check for overflow, compute in an `unchecked`
+  block and assert the property explicitly; `unchecked` does not disable the
+  division-by-zero or bounds checks.
 
 Dynamic ABI inputs are bounded. Use `forge-config:` inline annotations or
 `foundry.toml` to choose lengths.
@@ -382,6 +515,8 @@ Supported ABI shapes include:
 
 When `--symbolic` is enabled, `invariant*` and `statefulFuzz*` functions use a
 bounded symbolic call sequence instead of the normal invariant fuzzer.
+Each selected symbolic invariant runs in a separate campaign with its own inline
+configuration, result, and counterexample replay.
 
 ```solidity
 contract CounterInvariant is Test {
@@ -404,6 +539,12 @@ senders. The symbolic executor chooses a bounded sequence from that discovered
 set, generates symbolic arguments with the same ABI model used for stateless
 tests, preserves symbolic world state between calls, and replays a concrete
 sequence before reporting a counterexample.
+
+Within an invariant predicate or `afterInvariant`, including nested calls,
+`vm.assume` is supported only when the current path constraints imply its
+condition. If the assumption could reject a reachable state, symbolic execution
+reports incomplete instead of restricting the property to the accepted states.
+Assumptions in target handler calls continue to discard inputs normally.
 
 Some invariant harnesses deploy dependency contracts in `setUp`, then rely on
 those dependencies having satisfiable environment state during the campaign. For
@@ -457,6 +598,8 @@ solver = "z3"
 # `solver_command` is set. Entries with spaces/quotes/backslashes are parsed as
 # argv strings, not shell snippets.
 # solver_portfolio = ["yices", "z3"]
+# Per SMT query and, for stateless tests, the deferred hard-arithmetic phase.
+# This is the overall wall-clock bound for symbolic invariant exploration.
 timeout = 30
 max_depth = 10000
 max_paths = 1024
@@ -470,6 +613,9 @@ default_array_lengths = []
 default_bytes_lengths = []
 max_calldata_bytes = 4096
 invariant_depth = 10
+use_fuzz_frontiers = false
+check_invariant_frontiers = false
+frontier_limit = 256
 frontier_ids = []
 frontier_pcs = []
 frontier_selectors = []
@@ -539,33 +685,7 @@ For latency-sensitive local runs, start with a small portfolio such as
 can still use more CPU and be slower when one fast solver already handles most
 queries. `--symbolic-dump-smt` prints each solver's configured order and launch
 delay with the per-query portfolio outcomes so solver mixes can be compared
-without changing execution semantics. It also prints an aggregate portfolio
-summary at the end of the run, for example:
-
-```text
---- symbolic solver portfolio summary ---
-queries: 48
-solver runs: 64
-rescue solver runs: 0
-not-started solver runs: 32
-non-primary wins: 0
-rescue wins: 0
-cancelled after winner: 0
-invalid models: 0
-solver errors: 0
-winner counts:
-  yices-smt2 --bvconst-in-decimal: 48
-launch counts:
-  yices-smt2 --bvconst-in-decimal: 48
-  z3 -in -smt2: 16
-outcome counts:
-  not-started: 32
-  sat-valid: 32
-  unsat: 32
-```
-
-Forge warns when a configured portfolio is degraded because one or more solver
-entries are not available, but it still uses the entries that can be invoked.
+without changing execution semantics.
 
 Security note: `symbolic.solver_command`, custom `symbolic.solver` values, and
 custom or command-like `symbolic.solver_portfolio` entries execute local programs
@@ -667,8 +787,7 @@ Important internal pieces:
   storage, logs, returndata, snapshots, and account lifecycle changes.
 - `CallFrame` tracks address, code address, storage address, caller, call value,
   static context, calldata, stack, memory, and returndata.
-- `SymbolicSolver` is the small internal trait used by the default SMT-LIB
-  subprocess backend, which resolves named solvers (z3, cvc5, yices, bitwuzla,
+- `SmtLibSubprocessSolver` resolves named solvers (z3, cvc5, yices, bitwuzla,
   etc.) into solver-specific argv via `solver_commands_for_config`.
 
 ## EVM And World Semantics
@@ -677,10 +796,13 @@ The executor models byte-precise calldata, memory, returndata, logs, storage,
 and symbolic storage keys. Supported behavior includes:
 
 - arithmetic and bitwise operations, including symbolic-safe `EXP`,
-  `SIGNEXTEND`, `BYTE`, shifts, and checked wrapping behavior
+  `SIGNEXTEND`, `BYTE`, `CLZ`, shifts, and checked wrapping behavior
 - `CALLDATALOAD`, `CALLDATACOPY`, `CODECOPY`, `EXTCODECOPY`,
   `RETURNDATACOPY`, `MCOPY`, `MLOAD`, `MSTORE`, and `MSTORE8`
-- `CALL`, `STATICCALL`, `DELEGATECALL`, `CALLCODE`, `CREATE`, and `CREATE2`
+- `CALL`, `STATICCALL`, `DELEGATECALL`, `CALLCODE`, `CREATE`, and `CREATE2`,
+  including the 1024 call depth limit
+- undefined opcodes and stack underflow and overflow as exceptional halts of the
+  current frame
 - concrete and bounded symbolic call targets over known deployed contracts
 - symbolic calldata and returndata across call frames
 - `SLOAD`, `SSTORE`, `TLOAD`, and `TSTORE` with concrete or symbolic keys
@@ -696,6 +818,49 @@ and symbolic storage keys. Supported behavior includes:
 Unsupported symbolic constructs return an incomplete result with a `Stuck`
 reason instead of silently proving the property.
 
+## Live invariant assistance
+
+`forge test --symbolic-live` (or `[profile.default.symbolic] live = true`) adds
+one solver thread to each concrete invariant campaign. It consumes branch
+comparisons from the first fuzz worker, replays their concrete prefixes, and
+tries to flip the target comparison. Returned sequences execute unmutated from
+setup through the normal campaign: predicate intervals, handler failures,
+shrinking, corpus persistence, and merged suites keep their usual behavior.
+A successful candidate can expose another frontier in the same campaign.
+
+This is opt-in assistance, independent of `--symbolic`, and does not establish
+symbolic safety. `--json` reports work in `symbolic_live` separately from
+verification results. `scheduled` counts candidate sequences handed to the
+campaign, not confirmed coverage gains or proofs.
+
+The worker keeps a backlog of up to 32 frontiers, with one queued request and one
+queued response in addition to active work. Each reached comparison outcome whose
+other side has not been reached is offered once, with the shortest prefix from the
+first run that has room. Outcomes that do not fit are offered again when a later run
+reaches them, and queued first attempts are dropped once fuzzing reaches the other
+side. An outcome the worker has flipped is offered again once from each new storage
+state that a run reaches before it, including the state a run resumes from, since its
+other side may need different arguments there. Outcomes whose attempts all failed are
+not retried.
+Its campaign-wide budgets are `symbolic.timeout` (30 seconds when unset; zero
+disables work), `symbolic.max_solver_queries`, and `symbolic.frontier_limit`.
+Each search has a one-second timeout; shutdown cancels concrete prefix replay and
+joins the worker. An active search or solver availability probe may take its timeout to
+finish after admission stops. At most 1024 calls and 64 KiB of aggregate calldata
+are retained for live assistance per sequence, within `invariant.depth`. Live-only
+recording stops at these bounds or when the worker can no longer accept work;
+independently requested corpus and offline-frontier instrumentation is unaffected.
+Short campaigns may finish before a solver response arrives.
+
+The initial implementation assists ordinary invariant campaigns, excluding
+optimization and `call_override`. It uses setup-known targets and fixed
+senders; it does not symbolize transaction value, sender, warp, or roll. A
+call's warp and roll delays are applied concretely before the search. Calls
+with nonzero value are not solved. Unsupported symbolic operations
+produce no candidate, and concrete fuzzing continues when the worker exhausts
+its budget. Imported-frontier selectors and IDs apply only to the offline
+frontier workflow.
+
 ## Known limitations
 
 Unsupported constructs report `Incomplete` rather than a proof. Some supported
@@ -706,19 +871,21 @@ Known incomplete, bounded, or approximate surfaces include:
 
 | Area | Current behavior |
 |---|---|
-| Gas-dependent behavior | The engine does not use gas to prove properties. A raw `GAS` / `gasleft()` value is tolerated only as the direct gas operand to a CALL-family opcode and is not used to model gas availability. Explicit CALL-family gas caps are not enforced. Branches, arithmetic, call targets/values, calldata/returndata, memory/log offsets or sizes, `expectCall` gas matching, or solver constraints derived from observed gas report incomplete. Non-observable gas metering helpers are accepted as no-ops; observable gas read/snapshot helpers such as `lastCallGas`, `lastFrameGas`, `snapshotGasLastCall`, `snapshotGasLastFrame`, and `stopSnapshotGas` report incomplete and should not be used as symbolic properties. |
+| Call depth limit | Calls and creates beyond the 1024 call depth limit fail, as on a node. As in concrete `forge test`, the depth counts from the first frame of the current transaction: under isolation, a `CALL` or `CREATE` from the test, handler, or invariant frame starts a new one, while any other call or create stays in the current transaction. A `vm.deployCode` constructor always starts a fresh depth budget. Reaching the limit nests 1024 frames, which needs a larger `--symbolic-max-paths` and `--symbolic-max-depth` than the defaults. Concrete replay with the default gas limit runs out of gas first, so a counterexample that depends on reaching the limit can fail replay and report incomplete. |
+| Gas-dependent behavior | The engine does not use gas to prove properties. A raw `GAS` / `gasleft()` value is tolerated only as the direct gas operand to a CALL-family opcode and is not used to model gas availability. Explicit or computed CALL-family gas caps report incomplete, including the caps emitted by Solidity `send` and `transfer`. Branches on observed gas may be explored through local solver witnesses, but they never produce counterexamples: arithmetic, call targets/values, calldata/returndata, memory/log offsets or sizes, `expectCall` gas matching, or counterexample models derived from observed gas report incomplete. Non-observable gas metering helpers are accepted as no-ops; observable gas read/snapshot helpers such as `lastCallGas`, `lastFrameGas`, `snapshotGasLastCall`, `snapshotGasLastFrame`, and `stopSnapshotGas` report incomplete and should not be used as symbolic properties. |
 | `SELFDESTRUCT` | Pre-Cancun deletion is modeled. Cancun/EIP-6780 is modeled for concrete beneficiaries: contracts created in the current top-level symbolic transaction are deleted, while existing contracts transfer balance and halt without deleting code or storage. Unresolved symbolic Cancun beneficiaries report incomplete. |
 | Symbolic account/code queries | `BALANCE`, `EXTCODESIZE`, `EXTCODEHASH`, and `EXTCODECOPY` on symbolic addresses are scoped to the engine's known symbolic/overlay/code-cache candidates plus the documented empty-account fallback. They do not prove quantified properties over every possible fork/backend account. |
-| Symbolic CALL targets | Concrete targets and symbolic targets constrained to known deployed-contract/precompile candidates are supported. By default, a feasible symbolic target outside the known candidate set reports incomplete. With `symbolic_call_targets = true`, the outside-candidate branch is modeled as an empty-account/no-code successful call, including value transfer for `CALL`; it does not model arbitrary unknown external code or custom/future precompiles. Symbolic cheatcode addresses/selectors still report incomplete. |
+| Symbolic CALL targets | Concrete targets and symbolic targets constrained to known deployed contracts or precompiles active on the current hardfork are supported. By default, a feasible symbolic target outside the known candidate set reports incomplete. With `symbolic_call_targets = true`, the outside-candidate branch is modeled as an empty-account/no-code successful call, including value transfer for `CALL`; it does not model arbitrary unknown external code or custom/future precompiles. Symbolic cheatcode addresses/selectors still report incomplete. |
 | Symbolic CREATE / CREATE2 inputs | Concrete initcode and common bounded symbolic CREATE2 address expressions are supported. Symbolic runtime sizes and unsupported symbolic initcode shapes report incomplete. |
 | ABI and calldata shape limits | Primitive ABI types, arrays, tuples, structs, bytes, and strings are supported within configured dynamic length and calldata byte limits. Unsupported ABI types, invalid ABI shapes, or calldata exceeding configured budgets report incomplete or config errors. |
-| Dynamic memory and copy bounds | Many symbolic memory, calldata, returndata, and `MCOPY`/`RETURNDATACOPY` sizes are supported when bounded by configuration or solver-proved limits. Unbounded or out-of-bounds symbolic reads/copies report incomplete. |
+| Dynamic memory and copy bounds | Many symbolic memory, calldata, returndata, and `MCOPY`/`RETURNDATACOPY` sizes are supported when bounded by configuration or solver-proved limits. Accesses beyond the configured `memory_limit`, and `RETURNDATACOPY` ranges beyond the return data, halt exceptionally as in concrete execution. Symbolic sizes that stay within memory but exceed the configured copy bounds report incomplete. |
+| Opcode activation | Implemented opcodes follow the active EVM version. An opcode used before its activation fork causes an exceptional halt, matching concrete execution. |
 | Concrete-required operands and bytecode | Symbolic data can flow through calldata, memory, storage, logs, and returndata, but some control/metadata values must resolve to concrete or solver-constrained values: `JUMP`/`JUMPI` destinations, `BLOBHASH` indices, cheatcode selectors, many cheatcode ABI decodes, fork IDs/block numbers, nonces, and created runtime bytecode opcodes. Symbolic bytecode opcodes, symbolic runtime sizes, or unconstrained control operands report incomplete. |
-| Symbolic hashing and `KECCAK256` | Concrete hashes are computed exactly. Symbolic `KECCAK256` is represented by deterministic opaque terms plus Solidity-storage-layout heuristics for common mapping and dynamic-array keys. Proof obligations that depend on cryptographic facts such as non-zero hashes, collision resistance, or preimage resistance are not proof-grade and may report incomplete or produce replay-filtered candidates. |
+| Symbolic hashing and `KECCAK256` | Concrete hashes are computed exactly. Symbolic `KECCAK256` is represented by deterministic opaque terms plus Solidity-storage-layout heuristics for common mapping and dynamic-array keys. For storage keys `keccak(...) + offset`, offsets below `2^64` are assumed not to alias fixed slots or other hash bases; larger offsets are compared exactly, so an index bounded only by an abstract array length may report incomplete. A constant slot only counts as `keccak(...) + offset` when that hash was computed concretely during the run; other constants are fixed slots. A symbolic hash of constant input length compared with a 32- or 64-byte hash computed concretely during the run, or with a symbolic hash over a different constant input length, is decided by comparing inputs, assuming no collisions. Proof obligations that depend on cryptographic facts such as non-zero hashes, collision resistance, or preimage resistance are not proof-grade and may report incomplete or produce replay-filtered candidates. |
 | Symbolic storage base values | Writes and later reads through symbolic keys are modeled, with Solidity-layout heuristics for common mapping/dynamic-array keys. Reads of previously-unwritten symbolic keys are abstract storage variables by default, or zero under the zero-init storage layout; the engine does not enumerate arbitrary concrete backend storage slots for a symbolic key. Proofs involving unknown existing storage are scoped to the selected `symbolic.storage_layout`. |
-| Precompiles | Canonical precompiles are recognized according to the active EVM version; KZG `0x0a` is Cancun+ only and falls back to normal empty-account behavior on earlier hardforks. Concrete inputs for modeled precompiles execute the corresponding revm precompile with effectively unlimited gas. Symbolic identity is byte-precise; symbolic hash/ecrecover/modexp outputs are deterministic opaque terms or fixed-length symbolic outputs, not full cryptographic/algebraic models. Symbolic BN254 inputs and symbolic BLAKE2f final flags report incomplete because precompile success depends on validity checks the symbolic model does not prove. KZG `0x0a` concrete inputs execute the revm KZG precompile exactly. Symbolic KZG calls model broad exact failures such as invalid input length and version/hash mismatches where known, plus selected replayable success/failure witnesses. Any remaining feasible symbolic KZG space reports incomplete rather than being treated as proved safe. Symbolic length headers, symbolic modexp output lengths, out-of-bounds symbolic inputs, future/custom precompiles, and precompile gas/OOG behavior are not fully modeled. |
-| Hard arithmetic | Bit-vector arithmetic is modeled through SMT. Forge canonicalizes small polynomial equalities over the exact 256-bit EVM word ring, including identities that wrap, and proves unsigned monotonic product and same-divisor quotient comparisons when path bounds show that every product fits in 256 bits. Expansion is deliberately bounded; division, unsupported `EXP` base/exponent shapes, larger polynomials, and other solver-intractable nonlinear expressions can report incomplete or timeout. |
-| Cheatcode surface | The common testing cheatcodes listed below are modeled for safe concrete/symbolic forms. Unsupported Foundry/VM compatibility cheatcodes, value-bearing cheatcode calls, delegatecall prank forms, symbolic `expectCall` gas, unsupported symbolic `vm.bound` ranges, and unsupported symbolic `assumeNoRevert` decodes/overlaps report incomplete. |
+| Precompiles | Canonical precompiles are recognized according to the active EVM version, including the Prague BLS12-381 precompiles `0x0b`-`0x11` and Osaka P256VERIFY `0x100`; an address that is not a precompile on the active hardfork, such as KZG `0x0a` before Cancun, falls back to normal empty-account behavior. Precompile addresses use normal account emptiness checks for `EXTCODEHASH`. Concrete inputs for every active precompile execute the corresponding revm precompile for the active hardfork with effectively unlimited gas. Symbolic identity is byte-precise; symbolic hash/modexp outputs are deterministic opaque terms or fixed-length symbolic outputs, not full cryptographic/algebraic models. Symbolic ecrecover returns empty data for invalid recovery IDs and models both empty and 32-byte returndata when recovery is uncertain; the recovered address remains an opaque term. Symbolic BN254 inputs and symbolic BLAKE2f final flags report incomplete because precompile success depends on validity checks the symbolic model does not prove. KZG `0x0a` concrete inputs execute the revm KZG precompile exactly. Symbolic KZG calls model broad exact failures such as invalid input length and version/hash mismatches where known, plus selected replayable success/failure witnesses. Any remaining feasible symbolic KZG space reports incomplete rather than being treated as proved safe. Symbolic inputs to BLS12-381 and P256VERIFY report incomplete. Symbolic length headers, symbolic modexp output lengths, out-of-bounds symbolic inputs, future/custom precompiles, and precompile gas/OOG behavior are not fully modeled. |
+| Hard arithmetic | Bit-vector arithmetic is modeled through SMT. Forge canonicalizes small polynomial equalities over the exact 256-bit EVM word ring, including identities that wrap, and proves unsigned monotonic product and same-divisor quotient comparisons when path bounds show that every product fits in 256 bits. It first explores branches decided by those local checks and bounded concrete witnesses, then sends the remaining hard-arithmetic branches to the configured SMT solver. Expansion and fallback time are deliberately bounded; division, unsupported `EXP` base/exponent shapes, larger polynomials, and other solver-intractable nonlinear expressions can report incomplete or timeout. |
+| Cheatcode surface | The common testing cheatcodes listed below are modeled for safe concrete/symbolic forms. Unsupported Foundry/VM compatibility cheatcodes, value-bearing cheatcode calls, delegatecall prank forms, symbolic `expectCall` gas, unsupported symbolic `vm.bound` ranges, and unsupported symbolic `assumeNoRevert` decodes/overlaps or ambiguous matches report incomplete. |
 | Approximate/no-op cheatcodes | Some recognized Foundry helpers are accepted but not semantically checked under symbolic execution, including non-observable gas metering helpers, access-list/warm/cool helpers, `allowCheatcodes`, `sleep`, and breakpoints. Observable EVM-version helpers, gas snapshot/read helpers, and safe-memory expectation helpers report incomplete instead of fabricating results or silently accepting assertions. |
 | Fork mutation during symbolic execution | Fork-backed setup is allowed before symbolic execution. Creating forks, selecting a different fork, or rolling/mutating fork blocks during symbolic execution is restricted and reports incomplete unless it stays on the already active fork in the supported form. |
 | Filesystem, JSON/TOML, and prompt-shaped inputs | Environment reads and `ffi` are supported for concrete values and commands, with `ffi` gated by Forge's existing `--ffi` setting. Missing or unparsable env values, disabled or failing FFI, non-UTF8 stdout, artifact lookup failures, filesystem access, JSON/TOML parsing or serialization, and interactive prompt cheatcodes report incomplete. |
@@ -740,7 +907,7 @@ be modeled safely. The supported surface includes:
 
 - `vm.assume`, `vm.bound`, `vm.skip`, `vm.assumeNoRevert`
 - forge-std and DSTest assertion/failure signals
-- `warp`, `roll`, `fee`, `chainId`, `difficulty`, `coinbase`, blockhash helpers
+- `warp`, `roll`, `rollSlot`, `fee`, `chainId`, `difficulty`, `coinbase`, blockhash helpers
 - `deal`, `store`, `load`, `etch`, `getCode`, `getDeployedCode`
 - `prank`, `startPrank`, `stopPrank`
 - `addr`, `sign`, `deriveKey`, `rememberKey`, `rememberKeys`
@@ -793,6 +960,10 @@ counterexample within the modeled surface, reduce the example and try raising
 `symbolic.max_paths`, `symbolic.max_depth`, `symbolic.max_solver_queries`, or
 the relevant dynamic length / invariant depth settings.
 
+In `check*` and `prove*` tests, checked-arithmetic and other non-`assert` panics
+prune paths like `require`, so a property that only fails through an overflow
+can pass unless the arithmetic is `unchecked`.
+
 ### `Incomplete` is not a proof
 
 An incomplete run means the executor stopped before establishing safety or
@@ -830,6 +1001,7 @@ SYMBOLIC_LIMITS=1 cargo test -p forge --test cli symbolic_limits -- --nocapture
 ```
 
 The conformance and limits suites are gated because they require Z3 and exercise
-broader, slower symbolic behavior. The limits suite intentionally checks resource
-boundaries such as path width, execution depth, calldata budgets, hard arithmetic,
-and invariant sequence depth.
+broader, slower symbolic behavior; PR CI skips them and the nightly `test-flaky`
+workflow runs them with both variables set. The limits suite checks resource
+boundaries such as execution depth, calldata budgets and invariant sequence
+depth.
