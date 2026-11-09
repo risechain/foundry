@@ -52,7 +52,7 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
         workflow = self.workflow()
 
         self.assertIn(
-            "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
+            "dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8",
             workflow,
         )
         self.assertIn("toolchain: 1.98", workflow)
