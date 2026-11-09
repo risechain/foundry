@@ -55,7 +55,7 @@ class RiseLinuxReleaseWorkflowTest(unittest.TestCase):
             "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
             workflow,
         )
-        self.assertIn("toolchain: 1.96", workflow)
+        self.assertIn("toolchain: 1.98", workflow)
         self.assertIn("test_cmd::cpu_trace::", workflow)
         self.assertIn(
             'run: "cargo test --locked -p forge --test cli '
