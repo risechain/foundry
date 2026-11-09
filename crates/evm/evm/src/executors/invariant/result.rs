@@ -21,7 +21,6 @@ use foundry_evm_fuzz::{
 use foundry_evm_traces::CallTraceArena;
 use proptest::test_runner::TestError;
 use revm::interpreter::InstructionResult;
-use revm_inspectors::tracing::CallTraceArena;
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},

@@ -1000,6 +1000,7 @@ mod tests {
             arena: arena.clone(),
             ignored: Default::default(),
             diagnostics: Default::default(),
+            debug_steps: None,
             cpu: Default::default(),
         };
 
@@ -1012,6 +1013,7 @@ mod tests {
             arena: CallTraceArena::default(),
             ignored: Default::default(),
             diagnostics: Default::default(),
+            debug_steps: None,
             cpu: BTreeMap::from([
                 (7, CallTraceCpuMetrics::default()),
                 (2, CallTraceCpuMetrics::default()),

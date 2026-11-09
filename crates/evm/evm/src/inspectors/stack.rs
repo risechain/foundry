@@ -2835,21 +2835,13 @@ fn apply_mocked_function<FEN: FoundryEvmNetwork>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use foundry_evm_core::{backend::DatabaseError, evm::EthEvmNetwork};
-    use foundry_evm_traces::{
-        CpuClock, CpuClockError, CpuRecorderError, CpuTraceRecorder, SystemThreadCpuClock,
-    };
+    use foundry_evm_traces::CpuClockError;
     use revm::{
-        Context, Database, MainContext, bytecode::Bytecode, context::ContextTr,
-        context_interface::CreateScheme, database::EmptyDB, interpreter::CreateInputs,
-        primitives::B256, state::AccountInfo,
+        Context, Database, MainContext, bytecode::Bytecode, database::EmptyDB, state::AccountInfo,
     };
     use std::{
         collections::VecDeque,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::atomic::{AtomicUsize, Ordering},
     };
 
     struct PanicClock;

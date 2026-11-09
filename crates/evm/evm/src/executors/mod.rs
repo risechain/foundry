@@ -2674,6 +2674,7 @@ mod tests {
                 EvmEnvFor::<EthEvmNetwork>::default(),
                 TxEnvFor::<EthEvmNetwork>::default(),
                 backend,
+                NetworkConfigs::default(),
             );
         executor.evm_env_mut().cfg_env.disable_nonce_check = true;
 
@@ -2723,6 +2724,7 @@ mod tests {
                 EvmEnvFor::<EthEvmNetwork>::default(),
                 TxEnvFor::<EthEvmNetwork>::default(),
                 backend,
+                NetworkConfigs::default(),
             );
 
         let result =
@@ -2744,6 +2746,7 @@ mod tests {
                 EvmEnvFor::<EthEvmNetwork>::default(),
                 TxEnvFor::<EthEvmNetwork>::default(),
                 backend,
+                NetworkConfigs::default(),
             );
         let target = Address::repeat_byte(0x11);
         executor.set_code(target, Bytecode::new_raw(Bytes::from_static(&[0x00]))).unwrap();
@@ -2770,6 +2773,7 @@ mod tests {
                 EvmEnvFor::<EthEvmNetwork>::default(),
                 TxEnvFor::<EthEvmNetwork>::default(),
                 backend,
+                NetworkConfigs::default(),
             );
         executor.inspector_mut().inner.cpu_profiler.as_mut().unwrap().enter(99).unwrap();
 

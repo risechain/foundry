@@ -2996,7 +2996,8 @@ Error: Snapshots differ from previous run
     assert_eq!(fs::read(&snapshot_path).unwrap(), previous_snapshot);
 }
 
-forgetest_init!(test_cpu_snapshot_emit_default, |prj, cmd| {
+#[forgetest_init]
+fn test_cpu_snapshot_emit_default(prj: _, cmd: _) {
     prj.initialize_default_contracts();
     cmd.forge_fuse().args(["config"]).assert_success().stdout_eq(str![[r#"
 ...
@@ -3051,9 +3052,10 @@ contract CpuSnapshotEmitTest is DSTest {
 
     cmd.forge_fuse().args(["test", "--cpu-snapshot-emit=true"]).assert_success();
     assert!(snapshot.exists());
-});
+}
 
-forgetest_init!(test_cpu_snapshot_check_config, |prj, cmd| {
+#[forgetest_init]
+fn test_cpu_snapshot_check_config(prj: _, cmd: _) {
     prj.initialize_default_contracts();
     cmd.forge_fuse().args(["config"]).assert_success().stdout_eq(str![[r#"
 ...
@@ -3116,9 +3118,10 @@ Error: CPU snapshots differ from previous run
     cmd.forge_fuse();
     cmd.env("FORGE_CPU_SNAPSHOT_CHECK", "true");
     cmd.args(["test", "--cpu-snapshot-check=false"]).assert_success();
-});
+}
 
-forgetest_init!(test_cpu_snapshot_named_overloads, |prj, cmd| {
+#[forgetest_init]
+fn test_cpu_snapshot_named_overloads(prj: _, cmd: _) {
     prj.initialize_default_contracts();
     prj.insert_ds_test();
 
@@ -3183,9 +3186,10 @@ contract CpuSnapshotOverloadTest is DSTest {
     assert!(implicit.get("implicit").and_then(Value::as_str).is_some());
     assert!(implicit.get("fuzz").and_then(Value::as_str).is_some());
     assert!(implicit.get("table").and_then(Value::as_str).is_some());
-});
+}
 
-forgetest_init!(test_cpu_snapshot_invariant_results, |prj, cmd| {
+#[forgetest_init]
+fn test_cpu_snapshot_invariant_results(prj: _, cmd: _) {
     prj.initialize_default_contracts();
     prj.insert_ds_test();
 
@@ -3246,9 +3250,10 @@ contract CpuSnapshotInvariantTest is DSTest {
     )
     .unwrap();
     assert!(handler_snapshots.get("handler").and_then(Value::as_str).is_some());
-});
+}
 
-forgetest_init!(test_cpu_snapshot_rejects_escaping_group, |prj, cmd| {
+#[forgetest_init]
+fn test_cpu_snapshot_rejects_escaping_group(prj: _, cmd: _) {
     prj.initialize_default_contracts();
     prj.insert_ds_test();
 
@@ -3278,9 +3283,10 @@ Error: invalid CPU snapshot group "../escaped": group must be a single path comp
 
 "#]]);
     assert!(!prj.root().join("snapshots/escaped.json").exists());
-});
+}
 
-forgetest_init!(test_cpu_snapshot_checks_all_suites_before_emitting, |prj, cmd| {
+#[forgetest_init]
+fn test_cpu_snapshot_checks_all_suites_before_emitting(prj: _, cmd: _) {
     prj.initialize_default_contracts();
     prj.insert_ds_test();
 
@@ -3330,7 +3336,7 @@ contract CpuSnapshot{contract} is DSTest {{
 Error: CPU snapshots differ from previous run
 ...
 "#]]);
-});
+}
 
 // Tests compilation restrictions enables optimizer if optimizer runs set to a value higher than 0.
 #[forgetest_init]
